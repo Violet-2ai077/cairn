@@ -1,0 +1,22 @@
+{
+  "name": "cairn",
+  "version": "0.1.0",
+  "description": "Git for Agent Work States — lightweight task continuity, asynchronous state staging, deterministic Host ledger folding, and anti-regression handoff",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": "./src/kernel/index.mjs",
+    "./kernel": "./src/kernel/index.mjs",
+    "./kernel/ledger": "./src/kernel/ledger.mjs",
+    "./kernel/marker": "./src/kernel/marker.mjs",
+    "./kernel/contracts": "./src/kernel/contracts.mjs",
+    "./workers": "./src/workers/index.mjs",
+    "./hosts/dsh": "./src/hosts/dsh/index.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/kernel.node-test.mjs"
+  }
+}
