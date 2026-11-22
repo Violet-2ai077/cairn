@@ -23,17 +23,20 @@ cairn/
 │   │   ├── contracts.mjs#   buildAntiRecencyContract, buildStagingExtractorPrompt, buildStrictCompactorPrompt, buildAuthorityCheckoutContract
 │   │   ├── store.mjs    #   .cairn/ persistence, replayLedger verification, batch optimistic concurrency
 │   │   └── index.mjs    #   Kernel barrel export
-│   ├── workers/         # Layer 2: Out-of-band async LLM workers
+│   ├── workers/         # Layer 2: Out-of-band async LLM workers (llm-client, distill, staging-extractor, strict-compactor, cold-router)
 │   └── hosts/
 │       └── dsh/         # Layer 3: Thin runtime host adapter for DeepSeek Harness (dsh 0.2.2-rc.1 / Cordis 4.1.0)
 ├── docs/
 │   ├── architecture.md               # .cairn/ disk model & 3-layer design
-│   ├── dsh-host-interface.md         # Factual dsh Cordis hooks & verification checklist
+│   ├── dsh-host-interface.md         # Factual dsh Cordis hooks & verified integration surface
+│   ├── cairn.patch.example.yml       # Example Cordis --patch config for dsh
 │   └── reference/
 │       └── acmi-path1-synthesis.md   # Read-only empirical proof of the 5 primitives
 └── test/
-    ├── kernel.node-test.mjs          # Millisecond unit tests via `node --test`
-    └── store-cli.node-test.mjs       # .cairn/ persistence & CLI integration tests via `node --test`
+    ├── kernel.node-test.mjs          # Millisecond kernel unit tests via `node --test`
+    ├── store-cli.node-test.mjs       # .cairn/ persistence & CLI integration tests via `node --test`
+    ├── workers.node-test.mjs         # Out-of-band workers & trajectory distiller unit tests
+    └── dsh-host.node-test.mjs        # Offline end-to-end dsh Cordis host adapter tests
 ```
 
 ---

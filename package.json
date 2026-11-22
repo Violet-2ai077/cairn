@@ -18,9 +18,10 @@
     "./kernel/contracts": "./src/kernel/contracts.mjs",
     "./kernel/store": "./src/kernel/store.mjs",
     "./workers": "./src/workers/index.mjs",
-    "./hosts/dsh": "./src/hosts/dsh/index.mjs"
+    "./hosts/dsh": "./src/hosts/dsh/index.mjs",
+    "./hosts/dsh/turn-accumulator": "./src/hosts/dsh/turn-accumulator.mjs"
   },
   "scripts": {
-    "test": "node --test test/kernel.node-test.mjs test/store-cli.node-test.mjs test/workers.node-test.mjs"
+    "test": "node --test test/kernel.node-test.mjs test/store-cli.node-test.mjs test/workers.node-test.mjs test/dsh-host.node-test.mjs"
   }
 }

@@ -97,17 +97,17 @@ dsh --profile web --patch /absolute/path/to/cairn.patch.yml --dump-config
 - **Behavior**: Persists custom typed metadata records inside the native `dsh` v4 session journal and folds them deterministically on session load.
 
 ### 2.5 Tool Registry — **CONFIRMED**
-- **API**: `ctx.tools.register(defineTool({ name, description, parameters, execute(args, runCtx) }))` (`@deepseek-ai/dsh-tools`)
-- **Behavior**: Registers callable tools in the host tool registry.
+- **API**: `ctx.tools.register(defineTool({ name, description, parameters, output: { schema, render }, execute(args, runCtx) }))` (`@deepseek-ai/dsh-tools`)
+- **Behavior**: Registers callable tools in the host tool registry. Note that `@deepseek-ai/dsh-tools` strictly requires `output: { schema, render(args, value) }` on every registered tool definition.
 
 ---
 
-## 3. Surface Items Requiring Verification on Interactive `dsh` Profiles
+## 3. Verified Surface Items (Confirmed in `dsh 0.2.2-rc.1` Package Source)
 
-The following three integration details were not exercised by the headless `dsh-quickstart` harness and **must be verified against the live `dsh` TUI/Web profile during Phase 1 host adapter implementation**:
+All three integration details previously flagged for verification have been confirmed against the `@deepseek-ai/dsh-*` `0.2.2-rc.1` packages (`dsh-llm`, `dsh-agent-loop`, `dsh-commands`, `dsh-compaction-basic`, `dsh-tools`):
 
-| Item to Verify | Question for Live `dsh` Verification | Fallback if Native Hook Is Absent |
+| Surface Item | Verified `dsh 0.2.2-rc.1` Source Fact | Cairn Implementation in `src/hosts/dsh/` |
 | --- | --- | --- |
-| **1. UI Display Stripping of `<\|task:N\|>`** | Does `dsh` TUI/Web expose a presentation-only message formatter hook, or does modifying yielded text chunks in `ctx.on('llm/stream')` cleanly strip `<\|task:N\|>` via `stripTaskMarker()` before terminal rendering? | Strip the trailing `<\|task:N\|>` token in the `llm/stream` generator wrapper while recording the extracted marker in `.cairn/tasks/` metadata. |
-| **2. Interactive `/slash` Commands** | Does the target `dsh` profile expose a public Cordis service for user slash commands (e.g., `/cairn stage`, `/cairn commit`, `/cairn ledger`, `/cairn tasks`)? | Expose a lightweight `cairn` CLI command (`npx cairn status / commit / tasks`) reading `.cairn/` directly alongside registered `cairn_*` host tools. |
-| **3. Native Compaction Prompt Override** | When `ctx.on('llm/stream')` intercepts `request.purpose === 'compaction'`, does mutating `request.messages` in-place work cleanly with `dsh`'s compaction consumer? | Run Cairn's own `strict-compactor` worker out-of-band into `.cairn/tasks/<id>/compact.md` and inject it via `ctx.systemPrompt.context`. |
+| **1. `llm/stream` Chunks & `session/event` Propagation** | **CONFIRMED**: `ReactLoopAgent.step` (`@deepseek-ai/dsh-agent-loop`) feeds every `StreamChunk` (`block-start`, `text-delta`, `reasoning-delta`, `tool-call-delta`, `block-end`, `usage`, `finish`) yielded by `llm/stream` simultaneously into `agent/assistant-stream`, `AssistantStreamAccumulator`, and `BlockAssembler` (`assistant/message`). Modifying chunks in `llm/stream` directly alters the committed `assistant/message`. | `src/hosts/dsh/index.mjs` maintains a 64-character trailing window per text block `index`, stashes the unstripped `rawText` and parsed `<\|task:N\|>` into `accumulator.stashStreamMarker(sessionId, ...)` **before** yielding stripped `text-delta` and shallow-cloned `block-end` chunks, and bypasses `request.purpose === 'cairn-worker'` to prevent reentrancy. |
+| **2. Interactive `/slash` Commands & Tools** | **CONFIRMED**: `@deepseek-ai/dsh-commands` exposes `ctx.commands.register({ name, description, input: { hint }, handler })` returning `{ kind: 'success' \| 'error', text }` in Web/TUI profiles, while `@deepseek-ai/dsh-tools` requires `output: { schema, render }` on `ctx.tools.register(...)`. | Registers `cairn_status`, `cairn_tasks`, `cairn_commit`, and `cairn_drop` (with explicit human-authority red lines) on `ctx.tools.register`, conditionally registers `/cairn` on `ctx.commands` when mounted, and provides the standalone `bin/cairn.mjs` CLI. |
+| **3. Native Compaction (`request.purpose === 'compaction'`)** | **CONFIRMED**: `summarizeWithLlm` in `@deepseek-ai/dsh-compaction-basic` constructs `request.messages` with `deepFreeze`-d `Message` objects (`[system, ...regionMessages, finalUserInstructionMessage]`) and calls `ctx.llm.stream(options)` directly without `prepareCall`. Mutating a frozen message in-place throws `TypeError`, while replacing `request.messages` with a shallow-cloned array and a cloned final `user` message is completely safe and preserves prefix KV-cache reuse. | `injectStrictBoundaryIntoCompactionMessages()` clones `request.messages` and appends `buildStrictCompactorPrompt()` + `buildGlobalExclusionWatchlistSection(head)` to the final `user` compaction directive message without mutating frozen objects. |
