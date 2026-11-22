@@ -14,13 +14,16 @@ Our goal is to deliver a **fast, lightweight, local-first (`.cairn/`) task-conti
 
 ```text
 cairn/
+├── bin/
+│   └── cairn.mjs        # Minimal zero-dependency CLI (init / status / log / commit / drop / tasks)
 ├── src/
-│   ├── kernel/          # Layer 1: Pure deterministic functions (ZERO LLM calls, ZERO disk I/O, ZERO host imports)
+│   ├── kernel/          # Layer 1: Deterministic core (ZERO LLM calls, ZERO network, ZERO host imports)
 │   │   ├── ledger.mjs   #   createEmptyLedger, foldLedger (D1../Q1.., actor_id, base_revision), projectReadOnlyLedger
 │   │   ├── marker.mjs   #   parseTaskMarker (closed-fence aware), stripTaskMarker, buildLightTaskCatalog
 │   │   ├── contracts.mjs#   buildAntiRecencyContract, buildStagingExtractorPrompt, buildStrictCompactorPrompt, buildAuthorityCheckoutContract
+│   │   ├── store.mjs    #   .cairn/ persistence, replayLedger verification, batch optimistic concurrency
 │   │   └── index.mjs    #   Kernel barrel export
-│   ├── workers/         # Layer 2: Out-of-band async LLM workers + .cairn/ disk store
+│   ├── workers/         # Layer 2: Out-of-band async LLM workers
 │   └── hosts/
 │       └── dsh/         # Layer 3: Thin runtime host adapter for DeepSeek Harness (dsh 0.2.2-rc.1 / Cordis 4.1.0)
 ├── docs/
@@ -29,7 +32,8 @@ cairn/
 │   └── reference/
 │       └── acmi-path1-synthesis.md   # Read-only empirical proof of the 5 primitives
 └── test/
-    └── kernel.node-test.mjs          # Millisecond unit tests via `node --test`
+    ├── kernel.node-test.mjs          # Millisecond unit tests via `node --test`
+    └── store-cli.node-test.mjs       # .cairn/ persistence & CLI integration tests via `node --test`
 ```
 
 ---

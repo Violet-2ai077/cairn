@@ -21,3 +21,26 @@ export {
   buildStrictCompactorPrompt,
   buildAuthorityCheckoutContract
 } from './contracts.mjs';
+
+export {
+  writeTextAtomic,
+  writeJsonAtomic,
+  resolveCairnPaths,
+  normalizeTaskId,
+  isCairnInitialized,
+  initCairnStore,
+  readHead,
+  readLedgerLog,
+  replayLedger,
+  readStaged,
+  stageOperators,
+  commitStaged,
+  dropStaged,
+  readTasksIndex,
+  upsertTask,
+  appendTaskTurn,
+  readTaskThread,
+  writeTaskCompaction,
+  readTaskCompaction,
+  getStoreStatus
+} from './store.mjs';

@@ -30,10 +30,10 @@ Every workspace managed by Cairn stores its state in a human-inspectable, plain-
 .cairn/
 ├── head.json                   # Materialized read-only Workspace State Ledger snapshot (revision, active, tombstones, open_questions)
 ├── ledger.jsonl                # Append-only audit log of accepted foldLedger commits (with actor_id, source_step, base_revision)
-├── staged.json                 # Pending candidate delta operators ({"ops":[...]}) extracted asynchronously from recent turns
+├── staged.json                 # Pending candidate delta proposals (next_proposal_seq, proposals: [{ proposal_id: "stg_<n>", base_revision, ops }])
 └── tasks/
-    ├── index.json              # Deterministic Task Catalog (id, title, birth_turn, status) -> compiles 1-line-per-task header
-    ├── 1/
+    ├── index.json              # Deterministic Task Catalog (id in 1..999, title, birth_turn, status) -> compiles 1-line-per-task header
+    ├── 1/                      # Numeric task directory matching <|task:N|> from parseTaskMarker
     │   ├── thread.jsonl        # Task 1 scoped turns & causal tool call/result records
     │   └── compact.md          # Task 1 local-only compaction summary (strictly free of workspace-global rules)
     └── 2/
@@ -45,23 +45,28 @@ Every workspace managed by Cairn stores its state in a human-inspectable, plain-
 1. **Host-Exclusive IDs**: Models never invent `D1` or `Q1` handles. Only `foldLedger()` in `src/kernel/ledger.mjs` allocates `D<n>` and `Q<n>` upon commit.
 2. **Tombstone Provenance**: When an active decision `D1` is superseded by `D2`, `D1` is never deleted; it moves to `tombstones` with `superseded_by: "D2"` and the objective falsification `reason`.
 3. **Optimistic Concurrency (`actor_id` + `base_revision`)**: Every fold accepts an optional `actor_id` (default `"default"`) and `base_revision`. If `base_revision !== currentLedger.revision`, `foldLedger` rejects the commit with `conflict: true` rather than silently overwriting a concurrent worker's state.
+4. **Crash-Safe Commit Write Ordering**: `commitStaged()` in `src/kernel/store.mjs` persists each accepted proposal strictly in order: (1) append commit record to `ledger.jsonl`, (2) atomically overwrite `head.json`, (3) atomically update `staged.json` (preserving monotonic `next_proposal_seq`).
 
 ---
 
 ## 3. Three-Layer Decoupling Principle (`kernel` -> `workers` -> `hosts`)
 
 ```text
-src/
-├── kernel/                     # Layer 1: Pure deterministic, zero-LLM, zero-host-dependency core
-│   ├── ledger.mjs              #   createEmptyLedger, foldLedger, projectReadOnlyLedger
-│   ├── marker.mjs              #   parseTaskMarker (closed-fence fix), stripTaskMarker, buildLightTaskCatalog
-│   ├── contracts.mjs           #   4 empirically validated prompt contract builders
-│   └── index.mjs               #   Unified kernel barrel export
-├── workers/                    # Layer 2: Low-frequency asynchronous LLM workers
-│   └── index.mjs               #   staging-extractor, strict-compactor, cold-router
-└── hosts/                      # Layer 3: Thin runtime host adapters
-    └── dsh/                    #   Reference Host #1: DeepSeek Harness (dsh 0.2.2-rc.1 / Cordis 4.1.0)
-        └── index.mjs
+cairn/
+├── bin/
+│   └── cairn.mjs               # Minimal zero-dependency CLI (init / status / log / commit / drop / tasks)
+└── src/
+    ├── kernel/                 # Layer 1: Pure deterministic, zero-LLM, zero-host-dependency core
+    │   ├── ledger.mjs          #   createEmptyLedger, foldLedger, projectReadOnlyLedger
+    │   ├── marker.mjs          #   parseTaskMarker (closed-fence fix), stripTaskMarker, buildLightTaskCatalog
+    │   ├── contracts.mjs       #   4 empirically validated prompt contract builders
+    │   ├── store.mjs           #   .cairn/ persistence, replayLedger verification, batch optimistic concurrency
+    │   └── index.mjs           #   Unified kernel barrel export
+    ├── workers/                # Layer 2: Low-frequency asynchronous LLM workers
+    │   └── index.mjs           #   staging-extractor, strict-compactor, cold-router
+    └── hosts/                  # Layer 3: Thin runtime host adapters
+        └── dsh/                #   Reference Host #1: DeepSeek Harness (dsh 0.2.2-rc.1 / Cordis 4.1.0)
+            └── index.mjs
 ```
 
 - **Layer 1 (`src/kernel/`)** has **zero network calls, zero file I/O, zero LLM calls, and zero host runtime imports**. It can be unit-tested in milliseconds via `node --test`.

@@ -7,16 +7,20 @@
   "engines": {
     "node": ">=22.0.0"
   },
+  "bin": {
+    "cairn": "./bin/cairn.mjs"
+  },
   "exports": {
     ".": "./src/kernel/index.mjs",
     "./kernel": "./src/kernel/index.mjs",
     "./kernel/ledger": "./src/kernel/ledger.mjs",
     "./kernel/marker": "./src/kernel/marker.mjs",
     "./kernel/contracts": "./src/kernel/contracts.mjs",
+    "./kernel/store": "./src/kernel/store.mjs",
     "./workers": "./src/workers/index.mjs",
     "./hosts/dsh": "./src/hosts/dsh/index.mjs"
   },
   "scripts": {
-    "test": "node --test test/kernel.node-test.mjs"
+    "test": "node --test test/kernel.node-test.mjs test/store-cli.node-test.mjs"
   }
 }
