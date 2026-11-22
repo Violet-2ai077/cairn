@@ -247,7 +247,7 @@ function createDshToolDefinition({ name: toolName, description, parameters, exec
   };
 }
 
-export async function apply(ctx, rawConfig = {}) {
+export async function createCairnDshHost(ctx, rawConfig = {}) {
   const config = resolveDshHostConfig(rawConfig);
   const { workspaceRoot } = config;
 
@@ -648,19 +648,6 @@ export async function apply(ctx, rawConfig = {}) {
     if (typeof disposeCommand === 'function') disposers.push(disposeCommand);
   }
 
-  // Register unified cleanup effect if running inside a Cordis fiber
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => {
-      for (const dispose of disposers) {
-        try {
-          dispose();
-        } catch {
-          // Ignore individual teardown errors
-        }
-      }
-    }, 'cairn-dsh-host.dispose()');
-  }
-
   return Object.freeze({
     config,
     accumulator,
@@ -675,4 +662,15 @@ export async function apply(ctx, rawConfig = {}) {
       }
     }
   });
+}
+
+/**
+ * Cordis plugin entry. Cordis treats the value returned by `apply` as an *effect*
+ * (a disposer function, a Promise of one, an iterable of them, or nullish) and throws
+ * `TypeError: Invalid effect` for any other object. Therefore `apply` returns only the
+ * disposer function; programmatic callers/tests that need the handle use `createCairnDshHost`.
+ */
+export async function apply(ctx, rawConfig = {}) {
+  const host = await createCairnDshHost(ctx, rawConfig);
+  return () => host.dispose();
 }

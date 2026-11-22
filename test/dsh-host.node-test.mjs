@@ -13,7 +13,10 @@ import {
   upsertTask,
   writeTaskCompaction
 } from '../src/kernel/index.mjs';
-import { apply as applyCairnDshHost } from '../src/hosts/dsh/index.mjs';
+import {
+  apply as cordisApplyCairnDshHost,
+  createCairnDshHost as applyCairnDshHost
+} from '../src/hosts/dsh/index.mjs';
 
 async function withTempWorkspace(fn) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-m1-dsh-host-'));
@@ -605,6 +608,35 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
         )
       );
       assert.ok(updatedFinalText.includes('COMPRESSOR_STRICT'));
+    });
+  });
+
+  test('5. Cordis plugin contract (real-dsh regression): apply() must return only a disposer effect, never a handle object', async () => {
+    await withTempWorkspace(async tmpDir => {
+      const ctx = createMockDshContext();
+
+      // Mirrors @deepseek-ai/cordis Fiber._execute: functions and nullish are valid effects,
+      // any other non-thenable/non-iterable object throws `TypeError: Invalid effect`.
+      const effect = await cordisApplyCairnDshHost(ctx, { workspaceRoot: tmpDir });
+      const isValidCordisEffect =
+        effect === null ||
+        effect === undefined ||
+        typeof effect === 'function';
+      assert.equal(isValidCordisEffect, true, 'apply() returned a non-effect value');
+      assert.equal(typeof effect, 'function');
+
+      // Everything must be registered before the disposer runs...
+      assert.ok(ctx._registry.tools.has('cairn_commit'));
+      assert.ok(ctx._registry.commands.has('cairn'));
+      assert.ok(ctx._registry.contexts.has('cairn:task-continuity'));
+      assert.ok((ctx._registry.listeners.get('llm/stream') ?? []).length === 1);
+
+      // ...and the returned disposer must unregister all of it.
+      effect();
+      assert.equal(ctx._registry.tools.size, 0);
+      assert.equal(ctx._registry.commands.size, 0);
+      assert.equal(ctx._registry.contexts.size, 0);
+      assert.equal((ctx._registry.listeners.get('llm/stream') ?? []).length, 0);
     });
   });
 });
