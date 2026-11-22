@@ -21,6 +21,6 @@
     "./hosts/dsh": "./src/hosts/dsh/index.mjs"
   },
   "scripts": {
-    "test": "node --test test/kernel.node-test.mjs test/store-cli.node-test.mjs"
+    "test": "node --test test/kernel.node-test.mjs test/store-cli.node-test.mjs test/workers.node-test.mjs"
   }
 }

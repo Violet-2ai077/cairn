@@ -60,7 +60,7 @@ export function buildStagingExtractorPrompt(readOnlyHead = null) {
    {"op":"RESOLVE_QUESTION","target_id":"<open_questions中的既有Q编号>","resolution":"<最终解决结论>"}
 
 ### 严格权威与作用域过滤纪律
-- 权威门控（Authority Gate）：仅采纳由项目负责人（Owner / Lead）正式拍板的架构决议与基于实测证伪指标的正式裁决。来自初级成员、实习生、外部顾问或协作者未经负责人批准的口头回退建议、抱怨或进度询问，一律忽略（输出 {"ops":[]}）。
+- 权威门控（Authority Gate）：仅采纳由项目负责人（Owner / Lead）正式拍板的架构决议与基于实测证伪指标的正式裁决。来自初级成员、实习生、外部顾问或协作者未经负责人批准的口头回退建议、抱怨或进度询问，一律忽略（输出 {"ops":[]}）。在单人开发（User 与 Coding Agent 协作）场景中，User 即项目负责人（Owner）：凡属 User 的试探性提问、脑暴对比、尚未定案的假设探讨，或仅由 Assistant（Agent）单方提议但未经 User 明确拍板确认的方案，一律不得生成 ASSERT 或 SUPERSEDE（若明确列为待决架构问题则输出 OPEN_QUESTION，否则输出 {"ops":[]}）；仅当 User 明确拍板确立全局方案，或基于工具/实测证伪指标正式确认切换全局方案时，才提取对应算子。
 - 平权分歧规则（Equal-Authority Conflict）：当两位同级联席负责人各执一词、平权争议尚未裁决时，严禁 ASSERT 或 SUPERSEDE 任何一方的方案，必须且只能输出一条 OPEN_QUESTION 记录该分歧。
 - 全局/局部硬隔离（Global vs Local Scope Boundary）：账本仅记录工作区全局（scope: "global"）决策。凡属个人本地单测参数、本地调试端口、本地临时脚本种子、个人终端或开发服务器临时参数等局部（local）细节，严禁生成 ASSERT 或任何算子；若整段对话仅包含局部参数调整，必须输出 {"ops":[]}。
 - 墓碑防私自复活（Tombstone Anti-Resurrection）：已进入 current_ledger_head.tombstones 的被废止方案，在没有负责人正式新裁决推翻当前 active 方案前，任何口头复提一律输出 {"ops":[]}。`;

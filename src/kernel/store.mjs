@@ -653,6 +653,8 @@ export function readTasksIndex(workspaceRoot = process.cwd()) {
           birth_turn: typeof t.birth_turn === 'number' ? t.birth_turn : 1,
           status: typeof t.status === 'string' && t.status.trim() ? t.status.trim() : 'active',
           turn_count: typeof t.turn_count === 'number' ? t.turn_count : 0,
+          compacted_record_count:
+            typeof t.compacted_record_count === 'number' ? t.compacted_record_count : 0,
           has_compact: Boolean(t.has_compact),
           updated_at: t.updated_at ?? null
         }))
@@ -696,6 +698,7 @@ export function upsertTask(
         birth_turn: typeof birth_turn === 'number' ? birth_turn : 1,
         status: typeof status === 'string' && status.trim() ? status.trim() : 'active',
         turn_count: 0,
+        compacted_record_count: 0,
         has_compact: hasCompactFile,
         updated_at: now
       };
@@ -790,6 +793,7 @@ export function appendTaskTurn(
       birth_turn: effectiveTurn,
       status: 'active',
       turn_count: seq,
+      compacted_record_count: 0,
       has_compact: hasCompactFile,
       updated_at: now
     };
@@ -834,7 +838,12 @@ export function readTaskThread(workspaceRoot = process.cwd(), taskId) {
     .map(line => JSON.parse(line));
 }
 
-export function writeTaskCompaction(workspaceRoot = process.cwd(), taskId, compactMarkdown) {
+export function writeTaskCompaction(
+  workspaceRoot = process.cwd(),
+  taskId,
+  compactMarkdown,
+  { compactedRecordCount } = {}
+) {
   if (!isCairnInitialized(workspaceRoot)) {
     initCairnStore(workspaceRoot);
   }
@@ -843,6 +852,10 @@ export function writeTaskCompaction(workspaceRoot = process.cwd(), taskId, compa
   fs.mkdirSync(paths.taskDir(id), { recursive: true });
   const text = `${String(compactMarkdown ?? '').trim()}\n`;
   writeTextAtomic(paths.taskCompactFile(id), text);
+
+  const threadLen = readTaskThread(workspaceRoot, id).length;
+  const effectiveCompactedCount =
+    typeof compactedRecordCount === 'number' ? compactedRecordCount : threadLen;
 
   const index = readTasksIndex(workspaceRoot);
   const existingIdx = index.tasks.findIndex(t => t.id === id);
@@ -853,7 +866,8 @@ export function writeTaskCompaction(workspaceRoot = process.cwd(), taskId, compa
       title: `Task ${id}`,
       birth_turn: 1,
       status: 'active',
-      turn_count: readTaskThread(workspaceRoot, id).length,
+      turn_count: threadLen,
+      compacted_record_count: effectiveCompactedCount,
       has_compact: true,
       updated_at: now
     });
@@ -861,6 +875,7 @@ export function writeTaskCompaction(workspaceRoot = process.cwd(), taskId, compa
   } else {
     index.tasks[existingIdx] = {
       ...index.tasks[existingIdx],
+      compacted_record_count: effectiveCompactedCount,
       has_compact: true,
       updated_at: now
     };
@@ -870,6 +885,7 @@ export function writeTaskCompaction(workspaceRoot = process.cwd(), taskId, compa
   return {
     task_id: id,
     compact_file: paths.taskCompactFile(id),
+    compacted_record_count: effectiveCompactedCount,
     content: text
   };
 }
