@@ -103,6 +103,7 @@ export function createDshHostLlmClient(ctx, config, getLastObservedRoute) {
         temperature,
         maxTokens,
         purpose: 'cairn-worker',
+        ...(observed?.sessionId ? { sessionId: observed.sessionId } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
         ...(signal ? { signal } : {})
       };
@@ -368,7 +369,10 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
         ) {
           lastObservedRoute = {
             provider: request.provider,
-            model: request.model
+            model: request.model,
+            ...(typeof request.sessionId === 'string' && request.sessionId
+              ? { sessionId: request.sessionId }
+              : {})
           };
         }
 
@@ -652,7 +656,8 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
     config,
     accumulator,
     getLastObservedRoute: () => lastObservedRoute,
-    dispose() {
+    async dispose() {
+      await accumulator.flushPendingJobs();
       for (const dispose of disposers) {
         try {
           dispose();

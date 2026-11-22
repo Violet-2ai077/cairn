@@ -228,7 +228,8 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       // Verify observed primary conversation route was recorded
       assert.deepEqual(host.getLastObservedRoute(), {
         provider: 'deepseek',
-        model: 'deepseek-v4.1-flash'
+        model: 'deepseek-v4.1-flash',
+        sessionId: 'sess-alpha'
       });
 
       // (b) Anti-reentrancy: `purpose: 'cairn-worker'` passes through untouched without stashing or overwriting route
@@ -246,7 +247,8 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       assert.equal(host.accumulator.consumeStashedMarker('sess-alpha'), null);
       assert.deepEqual(host.getLastObservedRoute(), {
         provider: 'deepseek',
-        model: 'deepseek-v4.1-flash'
+        model: 'deepseek-v4.1-flash',
+        sessionId: 'sess-alpha'
       });
     });
   });
@@ -431,6 +433,7 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       assert.equal(workerStreamCalls.length, 1);
       assert.equal(workerStreamCalls[0].provider, 'deepseek');
       assert.equal(workerStreamCalls[0].model, 'deepseek-v4.1-flash');
+      assert.equal(workerStreamCalls[0].sessionId, session.id);
       assert.equal(workerStreamCalls[0].purpose, 'cairn-worker');
 
       const staged = readStaged(tmpDir);
@@ -613,7 +616,30 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
 
   test('5. Cordis plugin contract (real-dsh regression): apply() must return only a disposer effect, never a handle object', async () => {
     await withTempWorkspace(async tmpDir => {
-      const ctx = createMockDshContext();
+      const workerCalls = [];
+      const ctx = createMockDshContext({
+        adapterStream: async function* (request) {
+          if (request.purpose === 'cairn-worker') {
+            workerCalls.push(request);
+            yield {
+              type: 'text-delta',
+              index: 0,
+              text: JSON.stringify({
+                ops: [
+                  {
+                    op: 'ASSERT',
+                    scope: 'global',
+                    key: 'state_authority',
+                    option_code: 'local_ledger',
+                    summary: 'Use the local ledger as the only state authority'
+                  }
+                ]
+              })
+            };
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        }
+      });
 
       // Mirrors @deepseek-ai/cordis Fiber._execute: functions and nullish are valid effects,
       // any other non-thenable/non-iterable object throws `TypeError: Invalid effect`.
@@ -631,8 +657,36 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       assert.ok(ctx._registry.contexts.has('cairn:task-continuity'));
       assert.ok((ctx._registry.listeners.get('llm/stream') ?? []).length === 1);
 
-      // ...and the returned disposer must unregister all of it.
-      effect();
+      const session = { id: 'sess-dispose-flush' };
+      ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+      ctx.emit('session/event', session, {
+        type: 'user/message',
+        data: {
+          message: {
+            source: { kind: 'user' },
+            content: [{ type: 'text', text: 'Establish the local ledger as the only global state authority.' }]
+          }
+        }
+      });
+      ctx.emit('session/event', session, {
+        type: 'assistant/message',
+        data: {
+          turn: 1,
+          message: { content: [{ type: 'text', text: 'Confirmed.\n<|task:1|>' }] }
+        }
+      });
+      ctx.emit('session/event', session, {
+        type: 'turn/end',
+        data: { turn: 1, reason: { kind: 'completed' } }
+      });
+
+      // Cordis awaits Promise-returning disposers, so pending workers must drain first.
+      await effect();
+      assert.equal(workerCalls.length, 1);
+      assert.equal(workerCalls[0].purpose, 'cairn-worker');
+      assert.equal(readStaged(tmpDir).proposals[0].ops[0].op, 'ASSERT');
+
+      // The returned disposer unregisters all of the plugin's effects after the drain.
       assert.equal(ctx._registry.tools.size, 0);
       assert.equal(ctx._registry.commands.size, 0);
       assert.equal(ctx._registry.contexts.size, 0);
