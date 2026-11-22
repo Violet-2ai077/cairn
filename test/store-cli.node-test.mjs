@@ -25,7 +25,7 @@ import {
   getStoreStatus,
   writeJsonAtomic
 } from '../src/kernel/index.mjs';
-import { runCairnCli } from '../bin/cairn.mjs';
+import { runCairnCli, runCairnCliAsync } from '../bin/cairn.mjs';
 
 const CLI_BIN_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -42,6 +42,59 @@ function withTempWorkspace(fn) {
 }
 
 describe('Cairn Milestone 1 Slice 1: .cairn/ Store Persistence & Replay Engine (src/kernel/store.mjs)', () => {
+  test('async CLI compact dispatches incremental/full modes and rejects invalid task IDs', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-compact-cli-'));
+    try {
+      initCairnStore(tmpDir);
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'compact me' });
+      const modes = [];
+      const io = { cwd: tmpDir, stdout() {}, stderr() {}, llmClient: { async complete(input) { modes.push(input.messages[0].content); return { ok: true, content: '- local compact summary' }; } } };
+      assert.equal(await runCairnCliAsync(['compact', '1'], io), 0);
+      assert.equal(readTasksIndex(tmpDir).tasks[0].compacted_record_count, 1);
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 2, role: 'user', content: 'full compact me' });
+      assert.equal(await runCairnCliAsync(['compact', '1', '--full'], io), 0);
+      assert.equal(readTasksIndex(tmpDir).tasks[0].compacted_record_count, 2);
+      assert.equal(modes.length, 2);
+      assert.equal(await runCairnCliAsync(['compact', 'bad'], io), 1);
+      assert.equal(await runCairnCliAsync(['compact', '0'], io), 1);
+      assert.equal(await runCairnCliAsync(['compact', '99'], io), 1);
+    } finally { fs.rmSync(tmpDir, { recursive: true, force: true }); }
+  });
+
+  test('CLI checkout previews without mutation and sets or clears a validated workspace anchor', () => {
+    withTempWorkspace(tmpDir => {
+      initCairnStore(tmpDir);
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'Checkout task history' });
+      const callCli = args => {
+        const out = [];
+        const err = [];
+        const code = runCairnCli([...args, '--cwd', tmpDir], {
+          cwd: tmpDir,
+          stdout: line => out.push(line),
+          stderr: line => err.push(line)
+        });
+        return { code, stdout: out.join('\n'), stderr: err.join('\n') };
+      };
+
+      const preview = callCli(['checkout', '1', '--preview']);
+      assert.equal(preview.code, 0);
+      assert.ok(preview.stdout.includes('Checkout task history'));
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, null);
+
+      const checkout = callCli(['checkout', '1']);
+      assert.equal(checkout.code, 0);
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, 1);
+
+      const clear = callCli(['checkout', '--clear']);
+      assert.equal(clear.code, 0);
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, null);
+
+      const missing = callCli(['checkout', '9', '--preview']);
+      assert.equal(missing.code, 1);
+      assert.ok(missing.stderr.includes('Task not found: 9'));
+    });
+  });
+
   test('idempotently initializes .cairn/ layout and preserves monotonic next_proposal_seq across drop and commit', () => {
     withTempWorkspace(tmpDir => {
       const init1 = initCairnStore(tmpDir);

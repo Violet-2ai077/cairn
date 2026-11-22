@@ -375,12 +375,13 @@ export function createTurnAccumulator({
     stashedMarkersBySession.delete(sessionId);
   }
 
-  function getLastTaskId(sessionOrId) {
+  function getLastTaskId(sessionOrId, { allowFallback = true } = {}) {
     const sessionId =
       typeof sessionOrId === 'string' ? sessionOrId : String(sessionOrId?.id ?? '');
     if (sessionId && lastTaskIdBySession.has(sessionId)) {
       return lastTaskIdBySession.get(sessionId);
     }
+    if (!allowFallback) return null;
     // Fallback to the most recently recorded session's task id in single-agent mode
     let fallback = null;
     for (const val of lastTaskIdBySession.values()) {

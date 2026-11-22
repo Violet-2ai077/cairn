@@ -10,7 +10,7 @@ This document records **only verified factual capabilities** of the DeepSeek Har
 
 | Dimension | Verified Fact |
 | --- | --- |
-| **Target `dsh` Baseline** | `@deepseek-ai/dsh` `0.2.2-rc.1` (upstream baseline `fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159`) |
+| **Target `dsh` Baseline** | `@deepseek-ai/dsh` `0.2.2-rc.5` |
 | **Plugin Framework** | `@deepseek-ai/cordis` `4.1.0` (dependency injection & lifecycle container) |
 | **Node.js Engine** | Node.js `>=24.16.0 <25` (for stock `dsh` binary / packages); Cairn `src/kernel/` runs on Node `>=22.0.0` |
 | **Module Format** | Standard ES Module (`.mjs` or compiled `.js` from `.ts`), loadable via `file:///absolute/path/to/index.mjs` |
@@ -58,7 +58,7 @@ dsh --profile web --patch /absolute/path/to/cairn.patch.yml --dump-config
 
 ---
 
-## 2. Confirmed Lifecycle Hooks & Host Services (Verified in `dsh 0.2.2-rc.1`)
+## 2. Confirmed Lifecycle Hooks & Host Services (Verified in `dsh 0.2.2-rc.5`)
 
 ### 2.1 Dynamic System Prompt & Context Injection (Pre-Request) — **CONFIRMED**
 - **API**: `ctx.systemPrompt.context({ name, order, interpolate: false, text({ agent, signal }) })` (from `@deepseek-ai/dsh-system-prompt`)
@@ -102,11 +102,24 @@ dsh --profile web --patch /absolute/path/to/cairn.patch.yml --dump-config
 
 ---
 
-## 3. Verified Surface Items (Confirmed in `dsh 0.2.2-rc.1` Package Source)
+### 2.6 Milestone 2: Pre-Step Routing and Dynamic Checkout Context — **CONFIRMED (`0.2.2-rc.5`)**
+- `agent/pre-step` payload contains `{ agent, messages, turn, step, signal, modelSelection }`; `modelSelection` is the captured step selection. `PreStepDecision` is `{ kind: 'reject' }` or `{ kind: 'enter', messages, startsRequestSeries? }`. Treat `messages` as an immutable identified batch and return a shallow-cloned decision if replacing its array.
+- The host uses the pre-step waterfall to bind a cold-routed task, then relies on `ctx.systemPrompt.context({ order, text })` being synchronously re-evaluated by `refreshContext()` after pre-step. This avoids mutating frozen histories and keeps task checkout snapshots stable. Runtime context is a sourced user-message snapshot; system sections remain ordered prompt-prefix content.
+- Context providers are synchronous and ordered ascending by finite `order`, then name. Identical rendered prefixes preserve reuse; route capability `systemPromptUpdate: 'in-history'` appends a changed prompt in history rather than rewriting the cached prefix. Dynamic task history is deliberately isolated in runtime context rather than static system sections.
+- `session/disposed` is the cleanup hook for session-scoped routing/cache state. `ctx.commands.register()` and `ctx.tools.register()` retain the confirmed command/tool shape described below. Worker calls go through `ctx.llm.stream()` using the selected provider/model and `purpose: 'cairn-worker'`; the guard prevents re-entry.
+- The loaded profile resolves `dsh-agent`, `dsh-agent-loop`, `dsh-system-prompt`, `dsh-commands`, and `dsh-tools` from the same global `0.2.2-rc.5` package tree. Use a clean temporary profile for smoke tests to avoid old custom bundle dependencies.
 
-All three integration details previously flagged for verification have been confirmed against the `@deepseek-ai/dsh-*` `0.2.2-rc.1` packages (`dsh-llm`, `dsh-agent-loop`, `dsh-commands`, `dsh-compaction-basic`, `dsh-tools`):
+**Version comparison:** the previously checked `0.2.2-rc.1` and installed `0.2.2-rc.5` share the same pre-step decision union and model-selection-bearing waterfall contract; rc.5 adds no breaking field or lifecycle change for Cairn. The behavior is different from `0.2.1-rc.2`, which lacks `modelSelection` in pre-step and is therefore unsuitable for deterministic zero-config routing. Cairn's rc.5 adapter uses the same post-pre-step context refresh seam and does not depend on internal agent-loop imports.
 
-| Surface Item | Verified `dsh 0.2.2-rc.1` Source Fact | Cairn Implementation in `src/hosts/dsh/` |
+**Known limitations observed in the three-session smoke test:**
+- A model may occasionally omit the trailing task marker; that assistant turn is consequently not archived to a task thread. Marker enforcement/recovery is deferred to a follow-up slice.
+- The first manual compaction attempt returned `empty_compaction_output`; retrying succeeded without advancing the cursor or writing a partial compact file on the failed attempt.
+
+## 3. Verified Surface Items (Confirmed in `dsh 0.2.2-rc.5` Package Source)
+
+The integration details below were confirmed against the installed `@deepseek-ai/dsh-*` `0.2.2-rc.5` packages (`dsh-llm`, `dsh-agent`, `dsh-agent-loop`, `dsh-system-prompt`, `dsh-commands`, `dsh-compaction-basic`, `dsh-tools`):
+
+| Surface Item | Verified `dsh 0.2.2-rc.5` Source Fact | Cairn Implementation in `src/hosts/dsh/` |
 | --- | --- | --- |
 | **1. `llm/stream` Chunks & `session/event` Propagation** | **CONFIRMED**: `ReactLoopAgent.step` (`@deepseek-ai/dsh-agent-loop`) feeds every `StreamChunk` (`block-start`, `text-delta`, `reasoning-delta`, `tool-call-delta`, `block-end`, `usage`, `finish`) yielded by `llm/stream` simultaneously into `agent/assistant-stream`, `AssistantStreamAccumulator`, and `BlockAssembler` (`assistant/message`). Modifying chunks in `llm/stream` directly alters the committed `assistant/message`. | `src/hosts/dsh/index.mjs` maintains a 64-character trailing window per text block `index`, stashes the unstripped `rawText` and parsed `<\|task:N\|>` into `accumulator.stashStreamMarker(sessionId, ...)` **before** yielding stripped `text-delta` and shallow-cloned `block-end` chunks, and bypasses `request.purpose === 'cairn-worker'` to prevent reentrancy. |
 | **2. Interactive `/slash` Commands & Tools** | **CONFIRMED**: `@deepseek-ai/dsh-commands` exposes `ctx.commands.register({ name, description, input: { hint }, handler })` returning `{ kind: 'success' \| 'error', text }` in Web/TUI profiles, while `@deepseek-ai/dsh-tools` requires `output: { schema, render }` on `ctx.tools.register(...)`. | Registers `cairn_status`, `cairn_tasks`, `cairn_commit`, and `cairn_drop` (with explicit human-authority red lines) on `ctx.tools.register`, conditionally registers `/cairn` on `ctx.commands` when mounted, and provides the standalone `bin/cairn.mjs` CLI. |

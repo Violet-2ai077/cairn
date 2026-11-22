@@ -28,3 +28,5 @@ export {
   buildColdRouterPrompt,
   runColdRouter
 } from './cold-router.mjs';
+
+export { compileTaskCheckout } from './task-checkout.mjs';

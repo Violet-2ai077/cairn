@@ -14,7 +14,6 @@ import {
   projectReadOnlyLedger,
   readStaged,
   readTasksIndex,
-  readTaskCompaction,
   parseTaskMarker,
   buildAntiRecencyContract,
   buildAuthorityCheckoutContract,
@@ -22,7 +21,10 @@ import {
 } from '../../kernel/index.mjs';
 import {
   createOpenAICompatibleClient,
-  buildGlobalExclusionWatchlistSection
+  buildGlobalExclusionWatchlistSection,
+  compileTaskCheckout,
+  runColdRouter,
+  runStrictCompactor
 } from '../../workers/index.mjs';
 import { runCairnCli } from '../../../bin/cairn.mjs';
 import { createTurnAccumulator } from './turn-accumulator.mjs';
@@ -32,6 +34,7 @@ export const name = 'cairn-dsh-host';
 export const inject = ['systemPrompt', 'llm', 'tools'];
 
 const TAIL_BUFFER_CHARS = 64;
+
 
 export function resolveDshHostConfig(rawConfig = {}) {
   return Object.freeze({
@@ -55,6 +58,10 @@ export function resolveDshHostConfig(rawConfig = {}) {
     workerApiKey: rawConfig.workerApiKey ?? process.env.CAIRN_API_KEY ?? '',
     autoCompactEveryTurns:
       typeof rawConfig.autoCompactEveryTurns === 'number' ? rawConfig.autoCompactEveryTurns : 0,
+    coldRouterTimeoutMs:
+      Number.isSafeInteger(rawConfig.coldRouterTimeoutMs) && rawConfig.coldRouterTimeoutMs > 0
+        ? rawConfig.coldRouterTimeoutMs
+        : 5000,
     llmClient: rawConfig.llmClient ?? null,
     onWorkerLog: typeof rawConfig.onWorkerLog === 'function' ? rawConfig.onWorkerLog : null
   });
@@ -258,8 +265,12 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
 
   let lastObservedRoute = null;
   const disposers = [];
+  const routesBySession = new Map();
+  const routeStates = new Map();
+  const checkoutSnapshots = new Map();
+  const activeSnapshotTaskBySession = new Map();
 
-  function resolveWorkerLlmClient() {
+  function resolveWorkerLlmClient(sessionId = null) {
     if (config.llmClient) {
       return config.llmClient;
     }
@@ -271,7 +282,7 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
       });
     }
     if (ctx.llm && typeof ctx.llm.stream === 'function') {
-      return createDshHostLlmClient(ctx, config, () => lastObservedRoute);
+      return createDshHostLlmClient(ctx, config, () => routesBySession.get(sessionId) ?? lastObservedRoute);
     }
     return createOpenAICompatibleClient();
   }
@@ -284,6 +295,28 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
     onWorkerLog: config.onWorkerLog
   });
 
+  function snapshotFor(sessionId, taskId, refresh = false) {
+    const key = `${sessionId ?? 'default'}:${taskId}`;
+    if (!refresh && checkoutSnapshots.has(key)) return checkoutSnapshots.get(key);
+    const value = compileTaskCheckout({ workspaceRoot, taskId });
+    checkoutSnapshots.set(key, value);
+    return value;
+  }
+
+  function checkoutFor(sessionId, taskId) {
+    const switched = activeSnapshotTaskBySession.has(sessionId) && activeSnapshotTaskBySession.get(sessionId) !== taskId;
+    activeSnapshotTaskBySession.set(sessionId, taskId);
+    return snapshotFor(sessionId, taskId, switched);
+  }
+
+  function resolveActiveTaskId(explicitTaskId, sessionOrId) {
+    if (Number.isSafeInteger(explicitTaskId) && explicitTaskId > 0) return explicitTaskId;
+    const currentTask = sessionOrId
+      ? accumulator.getLastTaskId(sessionOrId, { allowFallback: false })
+      : null;
+    return currentTask ?? readTasksIndex(workspaceRoot).work_anchor_task_id;
+  }
+
   // 1. Dynamic Context Injection: Task Continuity + Light Task Catalog + Active Task Compact Note
   if (ctx.systemPrompt && typeof ctx.systemPrompt.context === 'function') {
     const disposeTaskCtx = ctx.systemPrompt.context({
@@ -294,27 +327,18 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
         if (!isCairnInitialized(workspaceRoot)) return '';
         const tasksIndex = readTasksIndex(workspaceRoot);
         const sessionId = contextArg?.agent?.session?.id ?? null;
-        const activeTaskId =
-          tasksIndex.work_anchor_task_id ?? accumulator.getLastTaskId(sessionId) ?? null;
+        const activeTaskId = tasksIndex.work_anchor_task_id ?? accumulator.getLastTaskId(sessionId) ?? routeStates.get(sessionId)?.taskId ?? null;
 
         const baseContract = buildAntiRecencyContract({
           tasks: tasksIndex.tasks,
           workAnchorTaskId: tasksIndex.work_anchor_task_id
         });
 
-        if (activeTaskId === null) {
-          return baseContract;
-        }
+        const routingNotice = routeStates.get(sessionId)?.clarification ?? '';
+        if (activeTaskId === null) return [baseContract, routingNotice].filter(Boolean).join('\n\n');
 
-        const compactNote = readTaskCompaction(workspaceRoot, activeTaskId);
-        if (!compactNote || !compactNote.trim()) {
-          return baseContract;
-        }
-
-        return [
-          baseContract,
-          `### 当前任务局部交接摘要（compact_note for <|task:${activeTaskId}|>）\n<cairn_task_compact_note task_id="${activeTaskId}">\n${compactNote.trim()}\n</cairn_task_compact_note>`
-        ].join('\n\n');
+        const compiled = checkoutFor(sessionId, activeTaskId);
+        return [baseContract, compiled.ok && compiled.status !== 'empty' ? `<cairn_task_checkout task_id="${activeTaskId}">\n${compiled.text}\n</cairn_task_checkout>` : '', routingNotice].filter(Boolean).join('\n\n');
       }
     });
     if (typeof disposeTaskCtx === 'function') disposers.push(disposeTaskCtx);
@@ -349,6 +373,65 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
   //    - Immutable compaction prompt injection for `purpose === 'compaction'`
   //    - 64-char sliding-window tail marker stripping + synchronous `block-end` stripping
   if (typeof ctx.on === 'function') {
+    const disposePreStep = ctx.on('agent/pre-step', async (payload, next) => {
+      const sessionId = payload?.agent?.session?.id ?? payload?.sessionId;
+      if (!sessionId || payload?.signal?.aborted) {
+        if (payload?.signal?.aborted) throw payload.signal.reason ?? new Error('Aborted');
+        return next();
+      }
+      const decision = await next();
+      if (payload?.signal?.aborted) throw payload.signal.reason ?? new Error('Aborted');
+      if (decision?.kind !== 'enter') return decision;
+      const tasks = readTasksIndex(workspaceRoot);
+      const state = routeStates.get(sessionId);
+      const anchor = tasks.work_anchor_task_id;
+      if (anchor !== null) { snapshotFor(sessionId, anchor); activeSnapshotTaskBySession.set(sessionId, anchor); return decision; }
+      if (state?.terminal) return decision;
+      if (tasks.tasks.length === 0) { routeStates.set(sessionId, { terminal: true, result: 'new' }); return decision; }
+      const selected = payload?.modelSelection;
+      if (!selected?.provider || !selected?.model) { routeStates.set(sessionId, { terminal: true, result: 'error' }); return decision; }
+      const userText = (payload.messages ?? []).filter(m => m?.source?.kind === 'user').map(m => Array.isArray(m.content) ? m.content.map(b => b.text ?? '').join('') : String(m.content ?? '')).join('\n');
+      const opening = state?.result === 'ambiguous' ? `${state.opening}\n${userText}` : userText;
+      if (state?.result === 'ambiguous' && (state.retried || state.lastTurn === payload.turn)) return decision;
+      const client = config.llmClient ?? createDshHostLlmClient(ctx, config, () => ({ ...selected, sessionId }));
+      const controller = new AbortController();
+      let timer;
+      let result;
+      let removeAbortListener = () => {};
+      try {
+        const timeout = new Promise(resolve => {
+          timer = setTimeout(() => {
+            controller.abort(new Error('cold_router_timeout'));
+            resolve({ ok: false, decision: null, error_code: 'timeout', error: 'Cold router timed out' });
+          }, config.coldRouterTimeoutMs);
+        });
+        const externalAbort = new Promise((_, reject) => {
+          if (!payload.signal) return;
+          const onAbort = () => reject(payload.signal.reason ?? new Error('Aborted'));
+          payload.signal.addEventListener('abort', onAbort, { once: true });
+          removeAbortListener = () => payload.signal.removeEventListener('abort', onAbort);
+        });
+        result = await Promise.race([
+          runColdRouter({ workspaceRoot, userPrompt: opening, applyWorkAnchor: false, llmClient: client, signal: AbortSignal.any([payload.signal, controller.signal].filter(Boolean)) }),
+          timeout,
+          externalAbort
+        ]);
+      } catch (err) {
+        if (payload.signal?.aborted) throw payload.signal.reason ?? err;
+        result = { ok: false, decision: null, error: err.message };
+      } finally { clearTimeout(timer); removeAbortListener(); }
+      if (payload.signal?.aborted) throw payload.signal.reason ?? new Error('Aborted');
+      if (!result.ok) { routeStates.set(sessionId, { terminal: true, result: 'error' }); return decision; }
+      if (result.decision === 'ambiguous') {
+        routeStates.set(sessionId, { result: 'ambiguous', opening: state?.opening ?? userText, retried: Boolean(state), lastTurn: payload.turn });
+        routeStates.get(sessionId).clarification = 'Cairn 找到多个可能的既有任务。请用户说明当前请求对应哪个任务；在澄清前不注入任何任务历史。';
+        return decision;
+      }
+      routeStates.set(sessionId, { terminal: true, result: result.decision, taskId: result.decision === 'match' ? result.task_id : null });
+      return decision;
+    }, { global: true });
+    if (typeof disposePreStep === 'function') disposers.push(disposePreStep);
+
     const disposeStream = ctx.on(
       'llm/stream',
       async function* (request, next) {
@@ -374,6 +457,7 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
               ? { sessionId: request.sessionId }
               : {})
           };
+          if (request.sessionId) routesBySession.set(request.sessionId, lastObservedRoute);
         }
 
         // (b) Native compaction interception (`request.purpose === 'compaction'`)
@@ -536,6 +620,13 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
       'session/disposed',
       session => {
         accumulator.disposeSession(session);
+        const sessionId = String(session?.id ?? '');
+        routeStates.delete(sessionId);
+        activeSnapshotTaskBySession.delete(sessionId);
+        routesBySession.delete(sessionId);
+        for (const key of checkoutSnapshots.keys()) {
+          if (key.startsWith(`${sessionId}:`)) checkoutSnapshots.delete(key);
+        }
       },
       { global: true }
     );
@@ -619,6 +710,8 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
           return executeCairnCliCommand(workspaceRoot, cliArgs).text;
         }
       })
+      ,createDshToolDefinition({ name: 'cairn_checkout', description: 'Set or clear task checkout. HUMAN AUTHORITY RED LINE: NEVER change checkout autonomously; ONLY invoke when explicitly instructed by the user.', parameters: { type:'object', properties:{ task_id:{type:'integer'}, clear:{type:'boolean'} } }, async execute(args={}) { const result = args.clear ? executeCairnCliCommand(workspaceRoot,['checkout','--clear']) : executeCairnCliCommand(workspaceRoot,['checkout',String(args.task_id)]); routeStates.clear(); checkoutSnapshots.clear(); activeSnapshotTaskBySession.clear(); return result.text; } })
+      ,createDshToolDefinition({ name: 'cairn_compact', description: 'Compact a task-local history. HUMAN AUTHORITY RED LINE: NEVER compact autonomously; ONLY invoke when explicitly instructed by the user.', parameters: { type:'object', properties:{ task_id:{type:'integer'}, full:{type:'boolean'} } }, async execute(args={}, runCtx={}) { const sessionId=runCtx.agent?.session?.id ?? lastObservedRoute?.sessionId; const taskId=resolveActiveTaskId(args.task_id,sessionId); if (!taskId) return 'No task selected.'; const result=await runStrictCompactor({workspaceRoot,taskId,mode:args.full?'full':'incremental',llmClient:resolveWorkerLlmClient(sessionId)}); if(sessionId) { snapshotFor(sessionId,taskId,true); activeSnapshotTaskBySession.set(sessionId,taskId); } return JSON.stringify(result); } })
     ];
 
     for (const def of toolDefs) {
@@ -633,16 +726,18 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
     const disposeCommand = commandsService.register({
       name: 'cairn',
       description:
-        'Manage Cairn workspace state ledger and task continuity (status | log | commit | drop | tasks)',
+          'Manage Cairn workspace state and task continuity (checkout | compact | status | log | commit | drop | tasks)',
       input: {
-        hint: 'status | log | commit [proposal_id] [--rebase] | drop [proposal_id] | tasks'
+        hint: 'checkout <id|--clear> [--preview] | compact [id] [--full] | status | log | commit | drop | tasks'
       },
-      async handler({ rawInput }) {
+      async handler({ rawInput, agent }) {
         const tokens = String(rawInput ?? '')
           .trim()
           .split(/\s+/)
           .filter(Boolean);
         const cliArgs = tokens.length > 0 ? tokens : ['status'];
+        if (cliArgs[0] === 'checkout') { const out=executeCairnCliCommand(workspaceRoot,cliArgs); routeStates.clear(); checkoutSnapshots.clear(); activeSnapshotTaskBySession.clear(); return {kind:out.code===0?'success':'error',text:out.text}; }
+        if (cliArgs[0] === 'compact') { const sessionId=agent?.session?.id ?? null; const taskId=resolveActiveTaskId(Number(cliArgs[1]) || null,sessionId); if(!taskId)return {kind:'error',text:'No task selected.'}; const res=await runStrictCompactor({workspaceRoot,taskId,mode:cliArgs.includes('--full')?'full':'incremental',llmClient:resolveWorkerLlmClient(sessionId)}); if(sessionId) { snapshotFor(sessionId,taskId,true); activeSnapshotTaskBySession.set(sessionId,taskId); } return {kind:res.ok?'success':'error',text:JSON.stringify(res)}; }
         const { code, text } = executeCairnCliCommand(workspaceRoot, cliArgs);
         return code === 0
           ? { kind: 'success', text }
@@ -665,6 +760,7 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
           // Ignore individual teardown errors
         }
       }
+      checkoutSnapshots.clear(); routeStates.clear(); activeSnapshotTaskBySession.clear(); routesBySession.clear();
     }
   });
 }

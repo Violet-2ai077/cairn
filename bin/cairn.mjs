@@ -15,8 +15,10 @@ import {
   commitStaged,
   dropStaged,
   readTasksIndex,
-  buildLightTaskCatalog
+  buildLightTaskCatalog,
+  upsertTask
 } from '../src/kernel/index.mjs';
+import { compileTaskCheckout, runStrictCompactor, createOpenAICompatibleClient } from '../src/workers/index.mjs';
 
 function printUsage(writeOut) {
   writeOut(
@@ -30,6 +32,8 @@ function printUsage(writeOut) {
       '  cairn commit [proposal_id] [--rebase] [--actor <id>] [--step <step>] [--cwd <dir>] [--json]',
       '  cairn drop   [proposal_id] [--cwd <dir>] [--json]',
       '  cairn tasks  [--cwd <dir>] [--json]'
+      ,'  cairn checkout <id|--clear> [--preview] [--cwd <dir>]'
+      ,'  cairn compact <id> [--full] [--cwd <dir>]'
     ].join('\n')
   );
 }
@@ -53,6 +57,9 @@ export function runCairnCli(
         rebase: { type: 'boolean', default: false },
         actor: { type: 'string' },
         step: { type: 'string' },
+        preview: { type: 'boolean', default: false },
+        full: { type: 'boolean', default: false },
+        clear: { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false }
       }
     });
@@ -245,6 +252,29 @@ export function runCairnCli(
       return 0;
     }
 
+    if (subcommand === 'checkout') {
+      if ((targetArg === '--clear' || values.clear) && !values.preview) {
+        const result = upsertTask(workspaceRoot, { work_anchor_task_id: null });
+        stdout(asJson ? JSON.stringify(result, null, 2) : 'Cleared work anchor.');
+        return 0;
+      }
+      if (!targetArg || targetArg === '--clear') throw new Error('Use checkout <id|--clear> [--preview]');
+      const id = Number(targetArg);
+      const checkout = compileTaskCheckout({ workspaceRoot, taskId: id });
+      if (!checkout.ok) throw new Error(`Task not found: ${targetArg}`);
+      if (values.preview) {
+        stdout(asJson ? JSON.stringify(checkout, null, 2) : checkout.text);
+        return 0;
+      }
+      upsertTask(workspaceRoot, { work_anchor_task_id: id });
+      stdout(asJson ? JSON.stringify({ work_anchor_task_id: id, checkout }, null, 2) : `Checked out task ${id}.`);
+      return 0;
+    }
+
+    if (subcommand === 'compact') {
+      throw new Error('compact is asynchronous; use runCairnCliAsync()');
+    }
+
     stderr(`Unknown subcommand: ${subcommand}`);
     printUsage(stderr);
     return 1;
@@ -254,10 +284,27 @@ export function runCairnCli(
   }
 }
 
+export async function runCairnCliAsync(argv = process.argv.slice(2), io = {}) {
+  if (argv[0] !== 'compact') return runCairnCli(argv, io);
+  const { stdout = msg => process.stdout.write(`${msg}\n`), stderr = msg => process.stderr.write(`${msg}\n`), cwd = process.cwd(), llmClient = createOpenAICompatibleClient() } = io;
+  const args = argv.slice(1).filter((arg, index, all) => !['--full', '--json', '--cwd'].includes(arg) && (index === 0 || all[index - 1] !== '--cwd'));
+  const id = Number(args[0]);
+  const full = argv.includes('--full');
+  const cwdIndex = argv.indexOf('--cwd');
+  const root = path.resolve(cwdIndex >= 0 ? argv[cwdIndex + 1] : cwd);
+  try {
+    if (!Number.isSafeInteger(id) || id < 1 || args.length !== 1 || (cwdIndex >= 0 && !argv[cwdIndex + 1])) throw new Error('Use compact <id> [--full] [--cwd <dir>]');
+    if (!isCairnInitialized(root) || !readTasksIndex(root).tasks.some(task => task.id === id)) throw new Error(`Task not found: ${id}`);
+    const result = await runStrictCompactor({ workspaceRoot: root, taskId: id, mode: full ? 'full' : 'incremental', llmClient });
+    stdout(JSON.stringify(result));
+    return result.ok ? 0 : 1;
+  } catch (err) { stderr(`Cairn CLI error: ${err.message}`); return 1; }
+}
+
 const isDirectEntry =
   process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 
 if (isDirectEntry) {
-  const code = runCairnCli();
+  const code = await runCairnCliAsync();
   process.exitCode = code;
 }

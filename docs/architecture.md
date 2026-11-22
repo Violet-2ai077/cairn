@@ -65,7 +65,7 @@ cairn/
     ├── workers/                # Layer 2: Low-frequency asynchronous LLM workers
     │   └── index.mjs           #   staging-extractor, strict-compactor, cold-router
     └── hosts/                  # Layer 3: Thin runtime host adapters
-        └── dsh/                #   Reference Host #1: DeepSeek Harness (dsh 0.2.2-rc.1 / Cordis 4.1.0)
+        └── dsh/                #   Reference Host #1: DeepSeek Harness (dsh 0.2.2-rc.5)
             └── index.mjs
 ```
 
@@ -81,6 +81,12 @@ cairn/
 1. **Task Continuity & Display Hygiene**: Inject `buildAntiRecencyContract` into `dsh` via `ctx.systemPrompt.context`, parse `<|task:N|UNRESOLVED|>` on committed assistant turns via `parseTaskMarker`, route turns to `.cairn/tasks/<id>/thread.jsonl`, and strip the trailing marker from display via `stripTaskMarker`.
 2. **Asynchronous Stage & Commit Loop**: Trigger the background Staging Extractor after committed turns to write candidate operators into `.cairn/staged.json`, fold accepted operators via `foldLedger` into `.cairn/head.json` and `.cairn/ledger.jsonl`.
 3. **Tombstone Anti-Regression & Strict Compaction**: Inject `buildAuthorityCheckoutContract(head)` on session handoff and enforce `buildStrictCompactorPrompt()` on task compaction so superseded decisions never resurrect.
+
+### Milestone 2: Cross-Session Task Checkout
+- `compileTaskCheckout()` deterministically combines task-local `compact.md` and records after `compacted_record_count`; bounded distillation retains the newest tail and never promotes task-local prose above global Ledger/Tombstone authority.
+- The dsh adapter binds a cold-routed task at `agent/pre-step`. Its stable checkout snapshot is cached per `(sessionId, taskId)` and injected by the synchronous dynamic-context provider refreshed after pre-step. Empty catalogs short-circuit to `new`; ambiguous routing gets one natural-language clarification retry without task-history disclosure.
+- `/cairn checkout <id|--clear> [--preview]` changes an explicit workspace anchor; `/cairn compact [id] [--full]` is a user-directed task-local compaction. Both host tools retain explicit human-authorization red lines.
+- The host contract targets `dsh 0.2.2-rc.5`; kernel, workers, and host remain separate layers.
 
 ### Phase 2: Single-Window Multi-Agent Orchestration (Next)
 - Once the single-agent `dsh` loop is rock-solid, leverage `actor_id` and `base_revision` optimistic concurrency in `foldLedger` so multiple subagents or parallel workers in a single workspace can check out `.cairn/head.json`, propose staged state operators, and deterministically detect/resolve state conflicts.

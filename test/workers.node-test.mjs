@@ -10,7 +10,9 @@ import {
   commitStaged,
   readTasksIndex,
   appendTaskTurn,
-  readTaskCompaction
+  readTaskCompaction,
+  writeTaskCompaction,
+  upsertTask
 } from '../src/kernel/index.mjs';
 
 import {
@@ -19,6 +21,7 @@ import {
   distillTurnTrajectory,
   runStagingExtractor,
   runStrictCompactor,
+  compileTaskCheckout,
   buildColdRouterPrompt,
   runColdRouter
 } from '../src/workers/index.mjs';
@@ -33,6 +36,46 @@ async function withTempWorkspace(fn) {
 }
 
 describe('Cairn Milestone 1 Slice 2: Asynchronous Workers Layer (src/workers/)', () => {
+  test('6. task checkout compiles compact plus uncaptured tail, retains newest text, clamps stale cursors, and stays read-only', async () => {
+    await withTempWorkspace(async tmpDir => {
+      initCairnStore(tmpDir);
+      upsertTask(tmpDir, { id: 1, title: 'Task one' });
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'old request' });
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'assistant', content: 'old answer' });
+      writeTaskCompaction(tmpDir, 1, 'task-local compact summary', { compactedRecordCount: 2 });
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 2, role: 'user', content: 'recent request' });
+      appendTaskTurn(tmpDir, {
+        task_id: 1,
+        turn: 2,
+        role: 'assistant',
+        content: `${'routine '.repeat(100)}LATEST_TAIL_MARKER`
+      });
+
+      const result = compileTaskCheckout({ workspaceRoot: tmpDir, taskId: 1, maxTailChars: 180 });
+      assert.equal(result.ok, true);
+      assert.equal(result.status, 'ready');
+      assert.equal(result.compacted_record_count, 2);
+      assert.equal(result.total_record_count, 4);
+      assert.equal(result.included_tail_record_count, 2);
+      assert.ok(result.text.includes('task-local compact summary'));
+      assert.ok(result.text.includes('LATEST_TAIL_MARKER'));
+      assert.ok(result.text.includes('全局 Ledger / Tombstone'));
+      assert.equal(result.text.includes('old request'), false);
+
+      writeTaskCompaction(tmpDir, 1, 'cursor ahead summary', { compactedRecordCount: 99 });
+      const clamped = compileTaskCheckout({ workspaceRoot: tmpDir, taskId: 1 });
+      assert.equal(clamped.status, 'compact_only');
+      assert.equal(clamped.included_tail_record_count, 0);
+
+      const before = readTasksIndex(tmpDir);
+      const missing = compileTaskCheckout({ workspaceRoot: tmpDir, taskId: 9 });
+      assert.equal(missing.ok, false);
+      assert.equal(missing.status, 'not_found');
+      assert.equal(missing.text, '');
+      assert.deepEqual(readTasksIndex(tmpDir), before);
+    });
+  });
+
   test('1. llm-client: defaults to stream:false, redacts Authorization, combines timeout & caller signal, and retries only transport errors', async () => {
     const logs = [];
     let fetchAttempts = 0;
@@ -450,6 +493,16 @@ describe('Cairn Milestone 1 Slice 2: Asynchronous Workers Layer (src/workers/)',
       });
       assert.equal(badMatchRes.ok, false);
       assert.equal(badMatchRes.error_code, 'invalid_routed_task_id');
+
+      const newClient = createMockLlmClient(JSON.stringify({ decision: 'new', task_id: null, candidates: [], reason: 'unrelated objective' }));
+      const newRes = await runColdRouter({ workspaceRoot: tmpDir, userPrompt: 'A distinct new task', llmClient: newClient });
+      assert.equal(newRes.ok, true);
+      assert.equal(newRes.decision, 'new');
+
+      const failedClient = { async complete() { return { ok: false, error_code: 'offline', error_message: 'offline' }; } };
+      const failedRes = await runColdRouter({ workspaceRoot: tmpDir, userPrompt: 'Continuation', llmClient: failedClient });
+      assert.equal(failedRes.ok, false);
+      assert.equal(failedRes.error_code, 'offline');
     });
   });
 });

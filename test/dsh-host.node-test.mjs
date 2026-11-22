@@ -11,6 +11,7 @@ import {
   readTasksIndex,
   readTaskThread,
   upsertTask,
+  appendTaskTurn,
   writeTaskCompaction
 } from '../src/kernel/index.mjs';
 import {
@@ -62,6 +63,11 @@ function createMockDshContext({ adapterStream } = {}) {
   const ctx = {
     on,
     emit,
+    async runPreStep(payload, base = { kind: 'enter', messages: payload.messages }) {
+      const chain = [...(listeners.get('agent/pre-step') ?? [])];
+      const dispatch = async index => index >= chain.length ? (typeof base === 'function' ? base() : base) : chain[index](payload, () => dispatch(index + 1));
+      return dispatch(0);
+    },
     effect(fn, label) {
       const teardown = fn();
       effects.push({ label, teardown });
@@ -451,8 +457,12 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       // Verify registered tools include HUMAN AUTHORITY RED LINE and valid output.render
       const commitTool = ctx._registry.tools.get('cairn_commit');
       const dropTool = ctx._registry.tools.get('cairn_drop');
+      const checkoutTool = ctx._registry.tools.get('cairn_checkout');
+      const compactTool = ctx._registry.tools.get('cairn_compact');
       assert.ok(commitTool.description.includes('HUMAN AUTHORITY RED LINE'));
       assert.ok(dropTool.description.includes('HUMAN AUTHORITY RED LINE'));
+      assert.ok(checkoutTool.description.includes('HUMAN AUTHORITY RED LINE'));
+      assert.ok(compactTool.description.includes('HUMAN AUTHORITY RED LINE'));
       assert.deepEqual(commitTool.output.render({}, 'Committed 1'), [
         { type: 'text', text: 'Committed 1' }
       ]);
@@ -471,6 +481,19 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       assert.ok(cmdRes.text.includes('HEAD is now at revision 1'));
       assert.equal(readHead(tmpDir).active[0].id, 'D1');
       assert.equal(readHead(tmpDir).active[0].option_code, 'redis_ttl');
+
+      const checkoutRes = await cairnCmd.handler({ rawInput: 'checkout 1', signal: new AbortController().signal });
+      assert.equal(checkoutRes.kind, 'success');
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, 1);
+      await checkoutTool.execute({ clear: true });
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, null);
+
+      const compactRes = await cairnCmd.handler({ rawInput: 'compact', agent: { session }, signal: new AbortController().signal });
+      assert.equal(compactRes.kind, 'success');
+      assert.match(compactRes.text, /"task_id":1/);
+      assert.ok(readTasksIndex(tmpDir).tasks[0].has_compact);
+      const compactToolRes = await compactTool.execute({}, { agent: { session } });
+      assert.match(compactToolRes, /"task_id":1/);
     });
   });
 
@@ -614,7 +637,122 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
     });
   });
 
-  test('5. Cordis plugin contract (real-dsh regression): apply() must return only a disposer effect, never a handle object', async () => {
+  test('5. pre-step cold routing binds once, injects refreshed context from a cached snapshot, and bypasses empty/anchored catalogs', async () => {
+    await withTempWorkspace(async tmpDir => {
+      const calls = [];
+      upsertTask(tmpDir, { id: 1, title: 'Router task' });
+      upsertTask(tmpDir, { id: 2, title: 'Switched task' });
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'Initial task history' });
+      appendTaskTurn(tmpDir, { task_id: 2, turn: 1, role: 'user', content: 'SWITCHED_TASK_HISTORY' });
+      const ctx = createMockDshContext({ adapterStream: async function* (request) { calls.push(request); yield { type: 'text-delta', index: 0, text: JSON.stringify({ decision: 'match', task_id: 1, candidates: [1], reason: 'unique' }) }; yield { type: 'finish', reason: { kind: 'stop' } }; } });
+      const host = await applyCairnDshHost(ctx, { workspaceRoot: tmpDir });
+      const session = { id: 'cold-session' };
+      const payload = { agent: { session }, sessionId: session.id, turn: 1, step: 1, signal: new AbortController().signal, modelSelection: { provider: 'deepseek', model: 'deepseek-chat' }, messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Continue router task' }] }] };
+      const frozenInput = freezeDeep(payload.messages);
+      await ctx.runPreStep(payload);
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].provider, 'deepseek');
+      assert.equal(calls[0].model, 'deepseek-chat');
+      assert.equal(calls[0].sessionId, 'cold-session');
+      assert.equal(calls[0].purpose, 'cairn-worker');
+      assert.match(ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text, /Initial task history/);
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 2, role: 'user', content: 'A new turn that must not echo' });
+      const after = ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text;
+      assert.match(after, /Initial task history/);
+      assert.doesNotMatch(after, /A new turn that must not echo/);
+      assert.deepEqual(payload.messages, frozenInput);
+
+      ctx.emit('session/disposed', session);
+      await ctx.runPreStep({ ...payload, turn: 2 });
+      assert.equal(calls.length, 2, 'disposed session routing binding is discarded');
+      const refreshed = ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text;
+      assert.match(refreshed, /A new turn that must not echo/, 'disposed session checkout snapshot is discarded');
+
+      const command = ctx._registry.commands.get('cairn');
+      const switched = await command.handler({ rawInput: 'checkout 2' });
+      assert.equal(switched.kind, 'success');
+      const taskTwo = ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text;
+      assert.match(taskTwo, /SWITCHED_TASK_HISTORY/);
+      assert.doesNotMatch(taskTwo, /Initial task history/);
+
+      await host.dispose();
+    });
+    await withTempWorkspace(async tmpDir => {
+      let calls = 0;
+      const ctx = createMockDshContext();
+      const host = await applyCairnDshHost(ctx, { workspaceRoot: tmpDir, llmClient: { async complete() { calls++; throw new Error('should short circuit'); } } });
+      const base = { agent: { session: { id: 'empty' } }, turn: 1, step: 1, signal: new AbortController().signal, modelSelection: { provider: 'deepseek', model: 'm' }, messages: [] };
+      await ctx.runPreStep(base);
+      assert.equal(calls, 0);
+      upsertTask(tmpDir, { id: 1, work_anchor_task_id: 1 });
+      await ctx.runPreStep({ ...base, agent: { session: { id: 'anchored' } }, sessionId: 'anchored', turn: 1 });
+      assert.equal(calls, 0);
+      await host.dispose();
+    });
+  });
+
+  test('6. ambiguous routing exposes no task history, then retries once with the natural-language clarification', async () => {
+    await withTempWorkspace(async tmpDir => {
+      upsertTask(tmpDir, { id: 1, title: 'one' });
+      upsertTask(tmpDir, { id: 2, title: 'two' });
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'PRIVATE_TASK_ONE' });
+      appendTaskTurn(tmpDir, { task_id: 2, turn: 1, role: 'user', content: 'PRIVATE_TASK_TWO' });
+      const calls = [];
+      const outputs = [
+        { decision: 'ambiguous', task_id: null, candidates: [1, 2], reason: 'unclear' },
+        { decision: 'match', task_id: 2, candidates: [2], reason: 'clarified' }
+      ];
+      const ctx = createMockDshContext();
+      const host = await applyCairnDshHost(ctx, { workspaceRoot: tmpDir, llmClient: { async complete(input) { calls.push(input.messages[0].content); return { ok: true, content: JSON.stringify(outputs.shift()) }; } } });
+      const session = { id: 'ambiguous-session' };
+      const signal = new AbortController().signal;
+      const payload = prompt => ({ agent: { session }, turn: calls.length + 1, step: 1, signal, modelSelection: { provider: 'deepseek', model: 'deepseek-chat' }, messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: prompt }] }] });
+      await ctx.runPreStep(payload('Continue the previous work'));
+      const firstContext = ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text;
+      assert.doesNotMatch(firstContext, /PRIVATE_TASK_ONE|PRIVATE_TASK_TWO/);
+      await ctx.runPreStep(payload('It is the webhook-signature task, task 2'));
+      assert.match(calls[1], /Continue the previous work/);
+      assert.match(calls[1], /task 2/);
+      const nextContext = ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text;
+      assert.match(nextContext, /PRIVATE_TASK_TWO/);
+      assert.doesNotMatch(nextContext, /PRIVATE_TASK_ONE/);
+      await host.dispose();
+    });
+  });
+
+  test('7. router errors/timeouts fail open, while caller abort propagates before admitting the main request', async () => {
+    await withTempWorkspace(async tmpDir => {
+      upsertTask(tmpDir, { id: 1, title: 'Router task' });
+      const errorCtx = createMockDshContext();
+      let errorCalls = 0;
+      const errorHost = await applyCairnDshHost(errorCtx, { workspaceRoot: tmpDir, llmClient: { async complete() { errorCalls++; return { ok: false, error_code: 'offline', error_message: 'offline' }; } } });
+      const makePayload = (id, signal) => ({ agent: { session: { id } }, turn: 1, step: 1, signal, modelSelection: { provider: 'deepseek', model: 'deepseek-chat' }, messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'resume the router task' }] }] });
+      const failOpen = await errorCtx.runPreStep(makePayload('router-error', new AbortController().signal));
+      assert.equal(failOpen.kind, 'enter');
+      assert.equal(errorCalls, 1);
+      await errorCtx.runPreStep(makePayload('router-error', new AbortController().signal));
+      assert.equal(errorCalls, 1, 'error is terminal for this session');
+      await errorHost.dispose();
+
+      const timeoutCtx = createMockDshContext();
+      const timeoutHost = await applyCairnDshHost(timeoutCtx, { workspaceRoot: tmpDir, coldRouterTimeoutMs: 10, llmClient: { async complete({ signal }) { return await new Promise((resolve, reject) => { const timer = setTimeout(() => resolve({ ok: true, content: '{"decision":"new","task_id":null,"candidates":[],"reason":"late"}' }), 100); signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true }); }); } } });
+      const timed = await timeoutCtx.runPreStep(makePayload('router-timeout', new AbortController().signal));
+      assert.equal(timed.kind, 'enter');
+      assert.equal(timeoutCtx.systemPrompt.renderAll({ agent: { session: { id: 'router-timeout' } } }).find(x => x.name === 'cairn:task-continuity').text.includes('Task Checkout'), false);
+      await timeoutHost.dispose();
+
+      const abortCtx = createMockDshContext();
+      const abortHost = await applyCairnDshHost(abortCtx, { workspaceRoot: tmpDir, llmClient: { async complete({ signal }) { return await new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })); } } });
+      const controller = new AbortController();
+      controller.abort(new Error('caller cancelled'));
+      let enteredNext = false;
+      await assert.rejects(abortCtx.runPreStep(makePayload('router-abort', controller.signal), () => { enteredNext = true; return { kind: 'enter', messages: [] }; }), /caller cancelled/);
+      assert.equal(enteredNext, false);
+      await abortHost.dispose();
+    });
+  });
+
+  test('8. Cordis plugin contract (real-dsh regression): apply() must return only a disposer effect, never a handle object', async () => {
     await withTempWorkspace(async tmpDir => {
       const workerCalls = [];
       const ctx = createMockDshContext({
