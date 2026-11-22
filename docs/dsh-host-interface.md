@@ -111,9 +111,9 @@ dsh --profile web --patch /absolute/path/to/cairn.patch.yml --dump-config
 
 **Version comparison:** the previously checked `0.2.2-rc.1` and installed `0.2.2-rc.5` share the same pre-step decision union and model-selection-bearing waterfall contract; rc.5 adds no breaking field or lifecycle change for Cairn. The behavior is different from `0.2.1-rc.2`, which lacks `modelSelection` in pre-step and is therefore unsuitable for deterministic zero-config routing. Cairn's rc.5 adapter uses the same post-pre-step context refresh seam and does not depend on internal agent-loop imports.
 
-**Known limitations observed in the three-session smoke test:**
-- A model may occasionally omit the trailing task marker; that assistant turn is consequently not archived to a task thread. Marker enforcement/recovery is deferred to a follow-up slice.
-- The first manual compaction attempt returned `empty_compaction_output`; retrying succeeded without advancing the cursor or writing a partial compact file on the failed attempt.
+**M2.1 recovery behavior for the three-session smoke-test boundaries:**
+- If a reply omits the task marker entirely, Cairn archives it with `meta.attribution: "session_fallback"` only when the session has an explicit workspace anchor/checkout, a cold-router match, or a prior valid task marker. Unbound and ambiguous sessions, and any malformed or unknown-task marker, do not inherit a task by fallback.
+- `runStrictCompactor()` retries `empty_compaction_output` once by default (configurable with `maxEmptyRetries`). Abort signals are honored between and during attempts; exhausted retries report attempt count and safe response metadata while leaving `compact.md` and `compacted_record_count` unchanged.
 
 ## 3. Verified Surface Items (Confirmed in `dsh 0.2.2-rc.5` Package Source)
 

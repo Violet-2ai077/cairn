@@ -8,6 +8,7 @@
 import {
   isCairnInitialized,
   initCairnStore,
+  readTasksIndex,
   parseTaskMarker,
   appendTaskTurn
 } from '../../kernel/index.mjs';
@@ -58,6 +59,7 @@ export function createTurnAccumulator({
   actorId = 'dsh-host',
   getLlmClient,
   autoCompactEveryTurns = 0,
+  resolveBoundTaskId = null,
   onWorkerLog = null
 } = {}) {
   const turnStateBySession = new Map();
@@ -295,10 +297,30 @@ export function createTurnAccumulator({
 
       // 1. Archive to .cairn/tasks/<id>/thread.jsonl if resolved to a specific task 1..999
       let resolvedTaskId = null;
+      let attribution = null;
       if (parsedMarker?.valid && !parsedMarker.is_unresolved && typeof parsedMarker.task_number === 'number') {
         resolvedTaskId = parsedMarker.task_number;
         lastTaskIdBySession.set(sessionId, resolvedTaskId);
+      } else if (
+        !parsedMarker &&
+        rawAssistantCombined &&
+        !rawAssistantCombined.includes('<|task')
+      ) {
+        const sessionBoundTaskId = typeof resolveBoundTaskId === 'function'
+          ? resolveBoundTaskId(sessionId)
+          : null;
+        const fallbackTaskId = sessionBoundTaskId ?? lastTaskIdBySession.get(sessionId) ?? null;
+        const tracked = Number.isSafeInteger(fallbackTaskId) && fallbackTaskId > 0 &&
+          readTasksIndex(workspaceRoot).tasks.some(task => Number(task.id) === fallbackTaskId);
+        if (tracked) {
+          resolvedTaskId = fallbackTaskId;
+          attribution = 'session_fallback';
+          lastTaskIdBySession.set(sessionId, resolvedTaskId);
+        }
+      }
 
+      if (resolvedTaskId !== null) {
+        if (parsedMarker?.valid) lastTaskIdBySession.set(sessionId, resolvedTaskId);
         if (userCombined) {
           appendTaskTurn(workspaceRoot, {
             task_id: resolvedTaskId,
@@ -314,7 +336,10 @@ export function createTurnAccumulator({
           role: 'assistant',
           content: assistantCombined,
           raw_content: rawAssistantCombined || assistantCombined,
-          meta: current.completedTools.length > 0 ? { tools: current.completedTools } : {}
+          meta: {
+            ...(current.completedTools.length > 0 ? { tools: current.completedTools } : {}),
+            ...(attribution ? { attribution } : {})
+          }
         });
 
         // Optional out-of-band incremental task compaction when threshold is reached

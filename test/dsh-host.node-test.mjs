@@ -720,6 +720,84 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
     });
   });
 
+  test('bound sessions archive markerless turns with provenance without inheriting for unbound, ambiguous, or marked-invalid turns', async () => {
+    await withTempWorkspace(async tmpDir => {
+      upsertTask(tmpDir, { id: 1, title: 'Anchor task' });
+      upsertTask(tmpDir, { id: 2, title: 'Cold-routed task' });
+      const routeReplies = [
+        JSON.stringify({ decision: 'match', task_id: 2, candidates: [2], reason: 'unique' }),
+        JSON.stringify({ decision: 'ambiguous', task_id: null, candidates: [1, 2], reason: 'unclear' })
+      ];
+      const ctx = createMockDshContext();
+      const host = await applyCairnDshHost(ctx, {
+        workspaceRoot: tmpDir,
+        llmClient: {
+          async complete({ system }) {
+            const content = system.includes('Cold-Start Task Semantic Router')
+              ? routeReplies.shift() ?? '{"decision":"new","task_id":null,"candidates":[],"reason":"default"}'
+              : '{"ops":[]}';
+            return { ok: true, content };
+          }
+        }
+      });
+      const signal = new AbortController().signal;
+      const preStep = (session, prompt) => ctx.runPreStep({
+        agent: { session },
+        turn: 1,
+        step: 1,
+        signal,
+        modelSelection: { provider: 'test', model: 'test-model' },
+        messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: prompt }] }]
+      });
+      let seq = 0;
+      const emitTurn = (session, turn, assistantText) => {
+        ctx.emit('session/event', session, { seq: ++seq, type: 'turn/start', data: { turn } });
+        ctx.emit('session/event', session, { seq: ++seq, type: 'user/message', data: { turn, message: { role: 'user', content: `request ${turn}` } } });
+        ctx.emit('session/event', session, { seq: ++seq, type: 'assistant/message', data: { turn, message: { role: 'assistant', content: assistantText } } });
+        ctx.emit('session/event', session, { seq: ++seq, type: 'turn/end', data: { turn, reason: { kind: 'completed' } } });
+      };
+
+      const coldSession = { id: 'cold-bound' };
+      await preStep(coldSession, 'cold bind prompt');
+      emitTurn(coldSession, 1, 'Cold-routed answer without a marker');
+      emitTurn(coldSession, 2, 'Follow-up without a marker');
+      await host.accumulator.flushPendingJobs();
+      const coldThread = readTaskThread(tmpDir, 2);
+      assert.equal(coldThread.length, 4);
+      assert.equal(coldThread[1].meta.attribution, 'session_fallback');
+      assert.equal(coldThread[3].meta.attribution, 'session_fallback');
+
+      const ambiguousSession = { id: 'ambiguous-unbound' };
+      await preStep(ambiguousSession, 'ambiguous prompt');
+      emitTurn(ambiguousSession, 1, 'Ambiguous answer without a marker');
+      await host.accumulator.flushPendingJobs();
+      assert.equal(readTaskThread(tmpDir, 1).length, 0);
+      assert.equal(readTaskThread(tmpDir, 2).length, 4);
+
+      const unboundSession = { id: 'never-bound' };
+      emitTurn(unboundSession, 1, 'Unbound answer without a marker');
+      await host.accumulator.flushPendingJobs();
+      assert.equal(readTaskThread(tmpDir, 1).length, 0);
+
+      const command = ctx._registry.commands.get('cairn');
+      await command.handler({ rawInput: 'checkout 1' });
+      const anchoredSession = { id: 'explicit-anchor' };
+      emitTurn(anchoredSession, 1, 'Explicitly anchored answer without a marker');
+      await host.accumulator.flushPendingJobs();
+      const anchorThread = readTaskThread(tmpDir, 1);
+      assert.equal(anchorThread.length, 2);
+      assert.equal(anchorThread[1].meta.attribution, 'session_fallback');
+
+      emitTurn(anchoredSession, 2, 'Malformed marker must not inherit <|task:bad|>');
+      emitTurn(anchoredSession, 3, 'Unknown task marker must not inherit <|task:999|>');
+      await host.accumulator.flushPendingJobs();
+      assert.equal(readTaskThread(tmpDir, 1).length, 2);
+      assert.equal(readTaskThread(tmpDir, 2).length, 4);
+      assert.ok(readTaskThread(tmpDir, 999).length > 0, 'valid syntax retains existing direct marker behavior');
+      await host.dispose();
+    });
+  });
+
   test('7. router errors/timeouts fail open, while caller abort propagates before admitting the main request', async () => {
     await withTempWorkspace(async tmpDir => {
       upsertTask(tmpDir, { id: 1, title: 'Router task' });

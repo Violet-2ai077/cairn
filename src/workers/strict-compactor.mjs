@@ -65,7 +65,8 @@ export async function runStrictCompactor({
   llmClient = null,
   distillOptions = {},
   reasoningEffort,
-  signal
+  signal,
+  maxEmptyRetries = 1
 } = {}) {
   if (!isCairnInitialized(workspaceRoot)) {
     initCairnStore(workspaceRoot);
@@ -125,13 +126,83 @@ export async function runStrictCompactor({
   }
 
   const client = llmClient ?? createOpenAICompatibleClient();
-  const llmRes = await client.complete({
-    system: systemPrompt,
-    messages: [{ role: 'user', content: userParts.join('\n\n') }],
-    temperature: 0,
-    reasoningEffort,
-    signal
-  });
+  const retryLimit = Number.isInteger(maxEmptyRetries) ? Math.max(0, maxEmptyRetries) : 1;
+  let llmRes;
+  let attempts = 0;
+  do {
+    if (signal?.aborted) {
+      return {
+        ok: false,
+        skipped: false,
+        reason: 'aborted',
+        llm_called: attempts > 0,
+        attempts,
+        raw_response_length: 0,
+        task_id: id,
+        compacted_record_count: prevCompactedCount,
+        compact_markdown: existingCompact,
+        error_code: 'aborted'
+      };
+    }
+    attempts++;
+    try {
+      llmRes = await client.complete({
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userParts.join('\n\n') }],
+        temperature: 0,
+        reasoningEffort,
+        signal
+      });
+    } catch (error) {
+      if (!signal?.aborted) throw error;
+      return {
+        ok: false,
+        skipped: false,
+        reason: 'aborted',
+        llm_called: true,
+        attempts,
+        raw_response_length: 0,
+        task_id: id,
+        compacted_record_count: prevCompactedCount,
+        compact_markdown: existingCompact,
+        error_code: 'aborted'
+      };
+    }
+    if (!llmRes.ok || String(llmRes.content ?? '').trim()) break;
+  } while (attempts <= retryLimit && !signal?.aborted);
+
+  const rawResponse = llmRes?.raw_response;
+  const finishReason = Array.isArray(rawResponse?.choices)
+    ? rawResponse.choices[0]?.finish_reason ?? null
+    : null;
+  const usage = llmRes?.usage && typeof llmRes.usage === 'object'
+    ? Object.fromEntries(
+        ['prompt_tokens', 'completion_tokens', 'total_tokens']
+          .filter(key => Number.isFinite(llmRes.usage[key]))
+          .map(key => [key, llmRes.usage[key]])
+      )
+    : {};
+  const safeDiagnostics = {
+    attempts,
+    raw_response_length: String(llmRes?.content ?? '').length,
+    ...(typeof finishReason === 'string' ? { finish_reason: finishReason } : {}),
+    ...(typeof llmRes?.model === 'string' ? { model: llmRes.model } : {}),
+    ...(Object.keys(usage).length > 0 ? { usage } : {})
+  };
+
+  if (signal?.aborted || llmRes?.error_code === 'aborted') {
+    return {
+      ok: false,
+      skipped: false,
+      reason: 'aborted',
+      llm_called: true,
+      ...safeDiagnostics,
+      task_id: id,
+      compacted_record_count: prevCompactedCount,
+      compact_markdown: existingCompact,
+      error_code: 'aborted'
+    };
+  }
 
   if (!llmRes.ok) {
     return {
@@ -139,6 +210,7 @@ export async function runStrictCompactor({
       skipped: false,
       reason: 'transport_error',
       llm_called: true,
+      ...safeDiagnostics,
       task_id: id,
       compacted_record_count: prevCompactedCount,
       compact_markdown: existingCompact,
@@ -154,6 +226,7 @@ export async function runStrictCompactor({
       skipped: false,
       reason: 'empty_compaction_output',
       llm_called: true,
+      ...safeDiagnostics,
       task_id: id,
       compacted_record_count: prevCompactedCount,
       compact_markdown: existingCompact,
@@ -171,6 +244,7 @@ export async function runStrictCompactor({
     skipped: false,
     reason: 'compacted',
     llm_called: true,
+    ...safeDiagnostics,
     task_id: id,
     compacted_record_count: writeRes.compacted_record_count,
     compact_markdown: writeRes.content

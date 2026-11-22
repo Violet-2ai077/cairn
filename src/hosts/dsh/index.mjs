@@ -292,6 +292,14 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
     actorId: config.actorId,
     getLlmClient: resolveWorkerLlmClient,
     autoCompactEveryTurns: config.autoCompactEveryTurns,
+    resolveBoundTaskId(sessionId) {
+      const anchor = readTasksIndex(workspaceRoot).work_anchor_task_id;
+      if (Number.isSafeInteger(anchor) && anchor > 0) return anchor;
+      const route = routeStates.get(sessionId);
+      if (route?.result === 'ambiguous') return false;
+      if (route?.result === 'match' && Number.isSafeInteger(route.taskId)) return route.taskId;
+      return null;
+    },
     onWorkerLog: config.onWorkerLog
   });
 

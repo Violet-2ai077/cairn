@@ -391,6 +391,72 @@ describe('Cairn Milestone 1 Slice 2: Asynchronous Workers Layer (src/workers/)',
     });
   });
 
+  test('strict-compactor retries empty output once, preserves state on repeated empties, and stops retrying on abort', async () => {
+    await withTempWorkspace(async tmpDir => {
+      initCairnStore(tmpDir);
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'Initial request' });
+      writeTaskCompaction(tmpDir, 1, 'Existing compact', { compactedRecordCount: 1 });
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 2, role: 'assistant', content: 'New task detail' });
+
+      const retryClient = {
+        calls: [],
+        async complete(request) {
+          this.calls.push(request);
+          return this.calls.length === 1
+            ? { ok: true, content: '', raw_response: { choices: [{ finish_reason: 'length' }] } }
+            : { ok: true, content: 'Updated compact summary' };
+        }
+      };
+      const retried = await runStrictCompactor({ workspaceRoot: tmpDir, taskId: 1, llmClient: retryClient });
+      assert.equal(retryClient.calls.length, 2);
+      assert.equal(retried.ok, true);
+      assert.equal(retried.attempts, 2);
+      assert.equal(retried.compacted_record_count, 2);
+      assert.equal(readTaskCompaction(tmpDir, 1), 'Updated compact summary\n');
+
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 3, role: 'assistant', content: 'Another new detail' });
+      const beforeCompact = readTaskCompaction(tmpDir, 1);
+      const beforeCursor = readTasksIndex(tmpDir).tasks[0].compacted_record_count;
+      const emptyClient = {
+        calls: 0,
+        async complete() {
+          this.calls++;
+          return { ok: true, content: '', raw_response: { choices: [{ finish_reason: 'length' }] } };
+        }
+      };
+      const empty = await runStrictCompactor({ workspaceRoot: tmpDir, taskId: 1, llmClient: emptyClient });
+      assert.equal(emptyClient.calls, 2);
+      assert.equal(empty.ok, false);
+      assert.equal(empty.reason, 'empty_compaction_output');
+      assert.equal(empty.attempts, 2);
+      assert.equal(empty.raw_response_length, 0);
+      assert.equal(empty.finish_reason, 'length');
+      assert.equal(readTaskCompaction(tmpDir, 1), beforeCompact);
+      assert.equal(readTasksIndex(tmpDir).tasks[0].compacted_record_count, beforeCursor);
+
+      const abortController = new AbortController();
+      const abortClient = {
+        calls: 0,
+        async complete() {
+          this.calls++;
+          abortController.abort(new Error('stop compaction'));
+          return { ok: true, content: '' };
+        }
+      };
+      const aborted = await runStrictCompactor({
+        workspaceRoot: tmpDir,
+        taskId: 1,
+        llmClient: abortClient,
+        signal: abortController.signal
+      });
+      assert.equal(abortClient.calls, 1);
+      assert.equal(aborted.reason, 'aborted');
+      assert.equal(aborted.attempts, 1);
+      assert.equal(readTaskCompaction(tmpDir, 1), beforeCompact);
+      assert.equal(readTasksIndex(tmpDir).tasks[0].compacted_record_count, beforeCursor);
+    });
+  });
+
   test('5. cold-router: short-circuits on empty catalog, physically excludes updated_at/turn_count from prompt cards, and validates match/ambiguous/new decisions', async () => {
     await withTempWorkspace(async tmpDir => {
       initCairnStore(tmpDir);
