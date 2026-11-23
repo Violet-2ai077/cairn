@@ -593,4 +593,32 @@ describe('Cairn Milestone 1 Slice 1: .cairn/ Store Persistence & Replay Engine (
       assert.ok(procTasks.stdout.includes('<|task:1|>: Configure Envoy rate limit filter'));
     });
   });
+
+  test('Hub status matches doctor initialization truth without initializing an empty Hub', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-hub-status-cli-'));
+    const hubRoot = path.join(tmpDir, 'hub');
+    const runJson = args => {
+      const output = [];
+      const code = runCairnCli(args, { stdout: value => output.push(value), stderr: value => output.push(value) });
+      const json = output.find(value => value.startsWith('{'));
+      return { code, value: json ? JSON.parse(json) : null };
+    };
+    try {
+      const statusBefore = runJson(['status', '--store', hubRoot, '--json']);
+      const doctorBefore = runJson(['doctor', '--store', hubRoot, '--json']);
+      assert.equal(statusBefore.code, 0);
+      assert.equal(statusBefore.value.initialized, false);
+      assert.equal(doctorBefore.value.hub_initialized, false);
+      assert.equal(fs.existsSync(hubRoot), false);
+
+      assert.equal(runCairnCli(['init', '--store', hubRoot], { stdout: () => {}, stderr: () => {} }), 0);
+      const statusAfter = runJson(['status', '--store', hubRoot, '--json']);
+      const doctorAfter = runJson(['doctor', '--store', hubRoot, '--json']);
+      assert.equal(statusAfter.code, 0);
+      assert.equal(statusAfter.value.initialized, true);
+      assert.equal(doctorAfter.value.hub_initialized, true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

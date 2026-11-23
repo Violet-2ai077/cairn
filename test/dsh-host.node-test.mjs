@@ -20,6 +20,9 @@ import {
   createCairnDshHost as applyCairnDshHost,
   resolveDshHostConfig
 } from '../src/hosts/dsh/index.mjs';
+import { createHubDshHost } from '../src/hosts/dsh/hub-host.mjs';
+import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
+import { runCairnCli } from '../bin/cairn.mjs';
 
 async function withTempWorkspace(fn) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-m1-dsh-host-'));
@@ -1135,5 +1138,79 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       assert.equal(ctx._registry.contexts.size, 0);
       assert.equal((ctx._registry.listeners.get('llm/stream') ?? []).length, 0);
     });
+  });
+});
+
+test('Hub cold start injects task creation markers, archives task 1, and keeps status read-only and truthful', async () => {
+  await withTempWorkspace(async tmpDir => {
+    const hubRoot = path.join(tmpDir, 'hub');
+    const projectRoot = path.join(tmpDir, 'project');
+    fs.mkdirSync(projectRoot);
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['init', '-q'], { cwd: projectRoot });
+
+    const contexts = [];
+    const listeners = new Map();
+    const tools = new Map();
+    const commands = new Map();
+    const ctx = {
+      systemPrompt: { context(definition) { contexts.push(definition); return () => {}; } },
+      on(name, handler) { const entries = listeners.get(name) ?? []; entries.push(handler); listeners.set(name, entries); return () => {}; },
+      tools: { register(definition) { tools.set(definition.name, definition); return () => tools.delete(definition.name); } },
+      commands: { register(definition) { commands.set(definition.name, definition); return () => commands.delete(definition.name); } },
+      llm: { async *stream() { yield { type: 'text-delta', text: '{"ops":[]}' }; } }
+    };
+    const host = await createHubDshHost(ctx, { storeRoot: hubRoot, llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } });
+
+    const readStatuses = async () => {
+      const toolStatus = JSON.parse(await tools.get('cairn_status').execute());
+      const slashResult = await commands.get('cairn').handler({ rawInput: 'status', agent: { session: { id: 'cold-session' } } });
+      const slashStatus = JSON.parse(slashResult.text);
+      const cliOutput = [];
+      const cliCode = runCairnCli(['status', '--store', hubRoot, '--json'], { stdout: value => cliOutput.push(value), stderr: value => cliOutput.push(value) });
+      const cliJson = cliOutput.find(value => value.startsWith('{'));
+      const cliStatus = cliJson ? JSON.parse(cliJson) : null;
+      const doctor = runHubDoctor({ hubRoot });
+      return { toolStatus, slashStatus, cliCode, cliStatus, doctor };
+    };
+
+    try {
+      const promptContext = contexts.find(definition => definition.name === 'cairn:user-and-global-catalog');
+      const projectContext = contexts.find(definition => definition.name === 'cairn:locked-project-context');
+      const prompt = promptContext.text({ agent: { session: { id: 'cold-session', header: { cwd: projectRoot } } } });
+      assert.match(prompt, /<\|task:/u);
+      assert.match(prompt, /<\|task:1\|>/u);
+      assert.match(prompt, /任务 marker 是宿主归档与建档的唯一触发器/iu);
+      assert.doesNotMatch(prompt, /project-a|project-b|当前项目专属账本/u);
+      assert.equal(projectContext.text({ agent: { session: { id: 'cold-session' } } }), '');
+
+      let statuses = await readStatuses();
+      assert.equal(statuses.toolStatus.initialized, false);
+      assert.equal(statuses.slashStatus.initialized, false);
+      assert.equal(statuses.cliCode, 0);
+      assert.equal(statuses.cliStatus.initialized, false);
+      assert.equal(statuses.doctor.hub_initialized, false);
+      assert.equal(fs.existsSync(hubRoot), false);
+
+      const preStep = listeners.get('agent/pre-step')[0];
+      await preStep({ agent: { session: { id: 'cold-session', header: { cwd: projectRoot } } }, messages: [{ source: { kind: 'user' }, content: 'Establish the first project decision' }] }, async () => ({ kind: 'enter' }));
+      const session = { id: 'cold-session', header: { cwd: projectRoot } };
+      const emit = (name, ...args) => { for (const handler of listeners.get(name) ?? []) handler(...args); };
+      emit('session/event', session, { type: 'turn/start', data: { turn: 1 } });
+      emit('session/event', session, { type: 'user/message', data: { message: { content: 'Establish REST/JSON for the Alpha API' } } });
+      emit('session/event', session, { type: 'assistant/message', data: { message: { content: 'The first Alpha API decision is REST/JSON.\n<|task:1|>' } } });
+      emit('session/event', session, { type: 'turn/end', data: { turn: 1 } });
+      await Promise.all((listeners.get('session/flush') ?? []).map(handler => handler(session)));
+
+      statuses = await readStatuses();
+      assert.equal(statuses.toolStatus.initialized, true);
+      assert.equal(statuses.slashStatus.initialized, true);
+      assert.equal(statuses.cliCode, 0);
+      assert.equal(statuses.cliStatus.initialized, true);
+      assert.equal(statuses.doctor.hub_initialized, true);
+      assert.ok(fs.existsSync(path.join(hubRoot, 'tasks', '1', 'thread.jsonl')));
+    } finally {
+      await host.dispose();
+    }
   });
 });

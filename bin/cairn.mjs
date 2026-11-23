@@ -369,6 +369,11 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
       emit(report);
       return report.ok ? 0 : 1;
     }
+    if (command === 'status') {
+      const head = readScopedHead(hubRoot, { scope, projectId });
+      const staged = readScopedStaged(hubRoot, { scope, projectId });
+      emit({ initialized: isHubInitialized(hubRoot), scope, project_id: scope === 'project' ? projectId : null, head, staged }); return 0;
+    }
     if (!isHubInitialized(hubRoot)) { stderr(`Cairn Hub not initialized at ${hubRoot}; run 'cairn init --store <path>' first.`); return 1; }
     if (command === 'tasks') {
       if (values.all && values.status) throw new Error('Use either --all or --status, not both.');
@@ -382,11 +387,6 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
       const id = Number(targetArg);
       if (!Number.isSafeInteger(id) || id < 1 || positionals.length !== 2) throw new Error(`Use ${command} <id>`);
       emit(transitionHubTaskStatus(hubRoot, { taskId: id, action: command })); return 0;
-    }
-    if (command === 'status') {
-      const head = readScopedHead(hubRoot, { scope, projectId });
-      const staged = readScopedStaged(hubRoot, { scope, projectId });
-      emit({ scope, project_id: scope === 'project' ? projectId : null, head, staged }); return 0;
     }
     if (command === 'log') { emit(readScopedLedgerLog(hubRoot, { scope, projectId })); return 0; }
     if (command === 'commit') {

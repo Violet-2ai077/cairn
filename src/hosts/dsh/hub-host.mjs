@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
-  buildHubTaskCatalog, buildScopedAuthorityContract, readHubTasksIndex,
+  buildHubTaskCatalog, buildScopedAuthorityContract, buildAntiRecencyContract, readHubTasksIndex,
   readSessionBinding, writeSessionBinding, clearSessionBinding, isHubInitialized,
   readScopedHead, projectReadOnlyLedger, upsertHubTask, appendHubTaskTurn, initHubStore, parseTaskMarker, readHubTaskThread,
   transitionHubTaskStatus
@@ -71,13 +71,24 @@ export async function createHubDshHost(ctx, config = {}) {
       sessions.set(sessionId, { ...state, taskId: null, bindingSource: null, route: { result: 'task_lifecycle_changed', elapsed_ms: 0 } });
     }
   }
+  function readStatus() {
+    const tasks = readHubTasksIndex(hubRoot).tasks;
+    return {
+      initialized: isHubInitialized(hubRoot),
+      projects: readProjectsIndex(hubRoot).projects.length,
+      tasks: tasks.length,
+      active_tasks: tasks.filter(task => task.status === 'active').length
+    };
+  }
 
   if (ctx.systemPrompt?.context) {
     const stop = ctx.systemPrompt.context({ name: 'cairn:user-and-global-catalog', order: 300, interpolate: false, text: context => {
       const projects = new Map(readProjectsIndex(hubRoot).projects.map(project => [project.project_id, project.name]));
-      const tasks = readHubTasksIndex(hubRoot).tasks.map(task => ({ ...task, project_name: task.project_id ? projects.get(task.project_id) ?? task.project_id : null }));
+      const taskIndex = readHubTasksIndex(hubRoot);
+      const tasks = taskIndex.tasks.map(task => ({ ...task, project_name: task.project_id ? projects.get(task.project_id) ?? task.project_id : null }));
       const userHead = readScopedHead(hubRoot, { scope: 'user' });
-      return [buildScopedAuthorityContract({ userLedgerSnapshot: projectReadOnlyLedger(userHead, { includeTombstones: true }) }), buildHubTaskCatalog(tasks)].filter(Boolean).join('\n\n');
+      const taskMarkerContract = `${buildAntiRecencyContract()}\n\nHub 建档规则：任务 marker 是宿主归档与建档的唯一触发器。继续已有任务时沿用其编号；用户明确开启不同新任务时输出 <|task:${taskIndex.next_task_id}|>（下一个从未使用的 ID）。空 Hub 的首个任务因此输出 <|task:1|>。若无法区分已有任务则输出 <|task:UNRESOLVED|> 并澄清，不得猜测。`;
+      return [taskMarkerContract, buildScopedAuthorityContract({ userLedgerSnapshot: projectReadOnlyLedger(userHead, { includeTombstones: true }) }), buildHubTaskCatalog(tasks)].filter(Boolean).join('\n\n');
     } });
     if (typeof stop === 'function') disposers.push(stop);
     const stopProject = ctx.systemPrompt.context({ name: 'cairn:locked-project-context', order: 310, interpolate: false, text: context => {
@@ -196,7 +207,7 @@ export async function createHubDshHost(ctx, config = {}) {
   const commands = ctx.get?.('commands') ?? ctx.commands;
   if (ctx.tools?.register) {
     const definitions = [
-      { name: 'cairn_status', description: 'Read-only status of the centralized Cairn Hub.', parameters: { type: 'object', properties: {} }, async execute() { return JSON.stringify({ initialized: true, projects: readProjectsIndex(hubRoot).projects.length, tasks: readHubTasksIndex(hubRoot).tasks.length }); } },
+      { name: 'cairn_status', description: 'Read-only status of the centralized Cairn Hub.', parameters: { type: 'object', properties: {} }, async execute() { return JSON.stringify(readStatus()); } },
       { name: 'cairn_tasks', description: 'List active tasks in the centralized Cairn Hub.', parameters: { type: 'object', properties: {} }, async execute() { return JSON.stringify(readHubTasksIndex(hubRoot).tasks.filter(task => task.status === 'active')); } },
       { name: 'cairn_checkout', description: 'Preview or bind a task to this session. HUMAN AUTHORITY RED LINE: only bind when explicitly instructed.', parameters: { type: 'object', properties: { task_id: { type: 'integer' }, preview: { type: 'boolean' }, clear: { type: 'boolean' } } }, async execute(args = {}, runCtx = {}) { const id = runCtx.agent?.session?.id; if (!id) return 'session_id_unavailable'; if (args.clear) { clearSessionBinding(hubRoot, id); sessions.delete(id); return 'Session checkout cleared.'; } const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === args.task_id); if (!task) return `task_not_found:${args.task_id}`; const checkout = compileHubTaskCheckout({ hubRoot, taskId: task.id }); if (args.preview) return checkout.text; if (task.status !== 'active') return `task_not_active:${task.id}; reopen first`; writeSessionBinding(hubRoot, id, { project_id: task.project_id, task_id: task.id, source: 'tool_checkout' }); sessions.set(id, { ...stateFor(id), selectedProjectId: task.project_id, taskId: task.id, bindingSource: 'tool_checkout' }); return `Checked out task ${task.id}.`; } },
       { name: 'cairn_compact', description: 'Compact a task-local Hub history. HUMAN AUTHORITY RED LINE: only compact when explicitly instructed by the user.', parameters: { type: 'object', properties: { task_id: { type: 'integer' }, full: { type: 'boolean' }, confirmed: { type: 'boolean' } }, required: ['confirmed'] }, async execute(args = {}, runCtx = {}) { if (args.confirmed !== true) return 'Explicit confirmation required.'; const sessionId = runCtx.agent?.session?.id; const id = args.task_id ?? stateFor(sessionId).taskId; if (!id) return 'no_active_task'; return JSON.stringify(await workerLlmCallContext.run({ sessionId }, () => compactionCoordinator.run({ taskId: id, source: 'manual', mode: args.full ? 'full' : 'incremental', llmClient }))); } },
@@ -238,6 +249,7 @@ export async function createHubDshHost(ctx, config = {}) {
         return { kind: result.ok ? 'success' : 'error', text: JSON.stringify(result) };
       }
       if (args[0] === 'doctor') return { kind: 'success', text: JSON.stringify(runHubDoctor({ hubRoot }), null, 2) };
+      if (args[0] === 'status') return { kind: 'success', text: JSON.stringify(readStatus(), null, 2) };
       if (args[0] === 'init') return { kind: 'success', text: JSON.stringify(initHubStore(hubRoot)) };
       if (args[0] === 'commit' || args[0] === 'drop') {
         const scope = args[1] === 'project' ? 'project' : 'user';
@@ -258,7 +270,7 @@ export async function createHubDshHost(ctx, config = {}) {
         return { kind: 'success', text: JSON.stringify({ hub_initialized: isHubInitialized(hubRoot), workspace_fingerprint: fingerprint, cwd_hint_mode: state.cwdHint ? 'git_project_hint' : 'general', selected_project_fingerprint: fingerprint, binding_source: state.bindingSource, last_route: state.route, auto_compaction: state.taskId ? compactionCoordinator.getTaskStatus(state.taskId) : { status: 'idle' }, session_id_present: Boolean(sessionId) }, null, 2) };
       }
       if (args[0] === 'tasks') return { kind: 'success', text: JSON.stringify(readHubTasksIndex(hubRoot).tasks.filter(task => task.status === 'active'), null, 2) };
-      return { kind: 'success', text: JSON.stringify({ hub_initialized: true, project_count: readProjectsIndex(hubRoot).projects.length, active_task_count: readHubTasksIndex(hubRoot).tasks.filter(task => task.status === 'active').length }, null, 2) };
+      return { kind: 'success', text: JSON.stringify(readStatus(), null, 2) };
     } });
     if (typeof stop === 'function') disposers.push(stop);
   }
