@@ -75,6 +75,27 @@ export async function runStrictCompactor({
   const id = normalizeTaskId(taskId);
   const tasksIndex = readTasksIndex(workspaceRoot);
   const taskEntry = tasksIndex.tasks.find(t => t.id === id) ?? null;
+  if (!taskEntry) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'task_not_found',
+      llm_called: false,
+      task_id: id
+    };
+  }
+  if (taskEntry.status !== 'active') {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'task_not_active',
+      task_id: id,
+      task_status: taskEntry.status,
+      llm_called: false,
+      compacted_record_count: taskEntry.compacted_record_count,
+      compact_markdown: readTaskCompaction(workspaceRoot, id)
+    };
+  }
   const prevCompactedCount = taskEntry?.compacted_record_count ?? 0;
 
   const allRecords = readTaskThread(workspaceRoot, id);
@@ -232,6 +253,21 @@ export async function runStrictCompactor({
       compact_markdown: existingCompact,
       error_code: 'empty_compaction_output',
       error: 'Compactor model returned an empty summary'
+    };
+  }
+
+  const latestTask = readTasksIndex(workspaceRoot).tasks.find(task => task.id === id);
+  if (!latestTask || latestTask.status !== 'active') {
+    return {
+      ok: false,
+      skipped: true,
+      reason: latestTask ? 'task_not_active' : 'task_not_found',
+      task_id: id,
+      ...(latestTask ? { task_status: latestTask.status } : {}),
+      llm_called: true,
+      ...safeDiagnostics,
+      compacted_record_count: latestTask?.compacted_record_count ?? prevCompactedCount,
+      compact_markdown: readTaskCompaction(workspaceRoot, id)
     };
   }
 

@@ -88,6 +88,7 @@ dsh --profile web --patch /absolute/path/to/cairn.patch.yml --dump-config
   - `'tool/call'` (`event.data.callId`, `event.data.turn`, `event.data.step`) and `'tool/result'` (`event.data.message.toolCallId`, `event.sourceEventSeqs` causal link to the originating `tool/call` sequence number).
 - **Cairn Usage**:
   - On `'assistant/message'` / `'turn/end'`: run `parseTaskMarker(assistantText)` from `src/kernel/marker.mjs` to append the turn to `.cairn/tasks/<id>/thread.jsonl` (or mark unresolved clarification), and trigger the out-of-band **Asynchronous Staging Worker** (`buildStagingExtractorPrompt(head)`) without blocking the user turn.
+  - The awaited `session/flush` checkpoint drains pending staging and compaction jobs before headless completion. A worker's `ctx.llm.stream()` can itself trigger `session/flush`; an `AsyncLocalStorage` session marker skips only that same-session nested drain to avoid waiting on the queue job that is awaiting the nested model request. `session/disposed` clears session state and remains a best-effort drain fallback.
 
 ### 2.4 Custom Plugin Journal Records & Session Projections — **CONFIRMED**
 - **API**:
@@ -114,6 +115,13 @@ dsh --profile web --patch /absolute/path/to/cairn.patch.yml --dump-config
 **M2.1 recovery behavior for the three-session smoke-test boundaries:**
 - If a reply omits the task marker entirely, Cairn archives it with `meta.attribution: "session_fallback"` only when the session has an explicit workspace anchor/checkout, a cold-router match, or a prior valid task marker. Unbound and ambiguous sessions, and any malformed or unknown-task marker, do not inherit a task by fallback.
 - `runStrictCompactor()` retries `empty_compaction_output` once by default (configurable with `maxEmptyRetries`). Abort signals are honored between and during attempts; exhausted retries report attempt count and safe response metadata while leaving `compact.md` and `compacted_record_count` unchanged.
+
+### 2.7 Milestone 3 Runtime Boundaries
+- `/cairn close <id>`, `/cairn archive <id>`, and `/cairn reopen <id>` implement active -> done -> archived and done/archived -> active. `tasks` filters active by default and accepts `--all` / `--status`. Close/archive clears a matching disk anchor and live session binding. Non-active tasks permit checkout preview only; manual compact returns `task_not_active` until reopen.
+- Automatic compaction uses `autoCompactMinRecords` / `autoCompactMinChars` (defaults 12 / 4500; zero disables one dimension, both zero disable scheduling). `autoCompactEveryTurns` is legacy fallback only when neither new setting is present. Auto and manual compaction share a workspace/task mutex keyed by `(workspaceRoot, taskId)`; active status is rechecked inside the lock before the LLM call. Only auto runs observe cooldown; manual runs bypass cooldown and clear cooldown after success. Missing host LLM/model selection skips auto compaction silently. Jobs drain at the awaited dsh `session/flush` checkpoint; the `AsyncLocalStorage` same-session reentrancy guard skips worker-initiated nested flushes, and `session/disposed` is a best-effort cleanup fallback. Cached checkout snapshots are not refreshed after compaction.
+- Invalid/non-active `work_anchor_task_id` is ignored by prompt context and pre-step routing, so it neither injects local history nor bypasses cold routing. `doctor` reports it. `cairn doctor` and `/cairn doctor` are read-only and make no LLM calls; `/cairn inspect` exposes only task id/binding source, route decision/task id/duration/error code, and compaction status metadata. It never returns user prompts, task transcript/compact body, model output, or credentials.
+- `src/workers/doctor.mjs` measures the full distillable uncompressed tail with truncation limits lifted, then classifies risk relative to `maxTailChars`. It remains in the workers layer; the kernel does not import workers.
+- Cairn archives only user-authored `user/message` content. dsh-sourced `runtime-context`, `compact-checkpoint`, and `agent-instructions` events are excluded by source; when dsh appends a trailing `<system-reminder>` block directly to user text, that synthetic block is stripped before task archival and staging so prompt snapshots do not echo into local history or inflate doctor watermarks.
 
 ## 3. Verified Surface Items (Confirmed in `dsh 0.2.2-rc.5` Package Source)
 

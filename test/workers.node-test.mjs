@@ -12,7 +12,9 @@ import {
   appendTaskTurn,
   readTaskCompaction,
   writeTaskCompaction,
-  upsertTask
+  upsertTask,
+  transitionTaskStatus,
+  writeJsonAtomic
 } from '../src/kernel/index.mjs';
 
 import {
@@ -22,8 +24,11 @@ import {
   runStagingExtractor,
   runStrictCompactor,
   compileTaskCheckout,
+  buildSanitizedTaskCards,
   buildColdRouterPrompt,
-  runColdRouter
+  runColdRouter,
+  createTaskCompactionCoordinator,
+  runWorkspaceDoctor
 } from '../src/workers/index.mjs';
 
 async function withTempWorkspace(fn) {
@@ -457,6 +462,111 @@ describe('Cairn Milestone 1 Slice 2: Asynchronous Workers Layer (src/workers/)',
     });
   });
 
+  test('task compaction coordinator shares per-task locks, rechecks lifecycle under lock, and lets manual work pierce cooldown', async () => {
+    await withTempWorkspace(async tmpDir => {
+      initCairnStore(tmpDir);
+      appendTaskTurn(tmpDir, { task_id: 1, role: 'user', content: 'Task one' });
+      appendTaskTurn(tmpDir, { task_id: 2, role: 'user', content: 'Task two' });
+      let now = 1000;
+      let calls = 0;
+      let releaseFirst;
+      let firstStarted;
+      const started = new Promise(resolve => { firstStarted = resolve; });
+      const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+      const coordinator = createTaskCompactionCoordinator({
+        workspaceRoot: tmpDir,
+        cooldownMs: 100,
+        now: () => now,
+        async compactor() {
+          calls++;
+          if (calls === 1) {
+            firstStarted();
+            await firstGate;
+            return { ok: true, reason: 'compacted', compacted_record_count: 1 };
+          }
+          if (calls === 2) return { ok: false, reason: 'empty_compaction_output', attempts: 2 };
+          return { ok: true, reason: 'compacted', compacted_record_count: 1 };
+        }
+      });
+
+      const running = coordinator.run({ taskId: 1, source: 'auto', llmClient: {} });
+      await started;
+      const waiting = coordinator.run({ taskId: 1, source: 'auto', llmClient: {} });
+      transitionTaskStatus(tmpDir, { taskId: 1, action: 'close' });
+      releaseFirst();
+      assert.equal((await running).ok, true);
+      assert.equal((await waiting).reason, 'task_not_active');
+      assert.equal(calls, 1, 'queued run rechecks active status after acquiring the lock');
+
+      const failedAuto = await coordinator.run({ taskId: 2, source: 'auto', llmClient: {} });
+      assert.equal(failedAuto.reason, 'empty_compaction_output');
+      assert.equal(coordinator.getTaskStatus(2).status, 'cooldown');
+      assert.equal((await coordinator.run({ taskId: 2, source: 'auto', llmClient: {} })).reason, 'cooldown');
+      assert.equal(calls, 2, 'automatic retries do not call the model during cooldown');
+      const manual = await coordinator.run({ taskId: 2, source: 'manual', llmClient: {} });
+      assert.equal(manual.ok, true);
+      assert.equal(coordinator.getTaskStatus(2).status, 'succeeded');
+      assert.equal(coordinator.getTaskStatus(2).cooldown_until, undefined);
+      assert.equal(calls, 3, 'manual compaction bypasses and clears cooldown');
+      await coordinator.flush();
+    });
+  });
+
+  test('strict compactor rechecks task status after the model returns and does not write into a closed task', async () => {
+    await withTempWorkspace(async tmpDir => {
+      initCairnStore(tmpDir);
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'Task history' });
+      writeTaskCompaction(tmpDir, 1, 'Existing note', { compactedRecordCount: 0 });
+      const beforeCompact = readTaskCompaction(tmpDir, 1);
+      const beforeCursor = readTasksIndex(tmpDir).tasks[0].compacted_record_count;
+      const client = {
+        calls: 0,
+        async complete() {
+          this.calls++;
+          transitionTaskStatus(tmpDir, { taskId: 1, action: 'close' });
+          return { ok: true, content: 'Must never be persisted' };
+        }
+      };
+      const result = await runStrictCompactor({ workspaceRoot: tmpDir, taskId: 1, llmClient: client });
+      assert.equal(client.calls, 1);
+      assert.equal(result.reason, 'task_not_active');
+      assert.equal(readTaskCompaction(tmpDir, 1), beforeCompact);
+      assert.equal(readTasksIndex(tmpDir).tasks[0].compacted_record_count, beforeCursor);
+    });
+  });
+
+  test('doctor is read-only, reports disk/index defects, and measures full distilled tail length without truncation', async () => {
+    await withTempWorkspace(async tmpDir => {
+      initCairnStore(tmpDir);
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'X'.repeat(9000) });
+      appendTaskTurn(tmpDir, { task_id: 2, turn: 1, role: 'user', content: 'Y'.repeat(9000) });
+      const indexPath = path.join(tmpDir, '.cairn', 'tasks', 'index.json');
+      const index = readTasksIndex(tmpDir);
+      index.work_anchor_task_id = 999;
+      index.tasks[0].compacted_record_count = 2;
+      writeJsonAtomic(indexPath, index);
+      fs.mkdirSync(path.join(tmpDir, '.cairn', 'tasks', '77'), { recursive: true });
+      const filesBefore = {
+        index: fs.readFileSync(indexPath, 'utf8'),
+        ledger: fs.readFileSync(path.join(tmpDir, '.cairn', 'ledger.jsonl'), 'utf8'),
+        head: fs.readFileSync(path.join(tmpDir, '.cairn', 'head.json'), 'utf8')
+      };
+
+      const report = runWorkspaceDoctor({ workspaceRoot: tmpDir, maxTailChars: 6000 });
+      const task = report.tasks.find(entry => entry.id === 2);
+      assert.equal(report.ok, false);
+      assert.ok(report.issues.some(issue => issue.code === 'anchor_task_missing'));
+      assert.ok(report.issues.some(issue => issue.code === 'compaction_cursor_out_of_range'));
+      assert.ok(report.issues.some(issue => issue.code === 'orphan_task_directory' && issue.task_id === 77));
+      assert.ok(task.uncompressed_chars > 9000, 'large user message is not clipped by distillTaskThread defaults');
+      assert.equal(task.truncation_risk.level, 'critical');
+      assert.equal(task.truncation_risk.max_tail_chars, 6000);
+      assert.equal(fs.readFileSync(indexPath, 'utf8'), filesBefore.index);
+      assert.equal(fs.readFileSync(path.join(tmpDir, '.cairn', 'ledger.jsonl'), 'utf8'), filesBefore.ledger);
+      assert.equal(fs.readFileSync(path.join(tmpDir, '.cairn', 'head.json'), 'utf8'), filesBefore.head);
+    });
+  });
+
   test('5. cold-router: short-circuits on empty catalog, physically excludes updated_at/turn_count from prompt cards, and validates match/ambiguous/new decisions', async () => {
     await withTempWorkspace(async tmpDir => {
       initCairnStore(tmpDir);
@@ -569,6 +679,37 @@ describe('Cairn Milestone 1 Slice 2: Asynchronous Workers Layer (src/workers/)',
       const failedRes = await runColdRouter({ workspaceRoot: tmpDir, userPrompt: 'Continuation', llmClient: failedClient });
       assert.equal(failedRes.ok, false);
       assert.equal(failedRes.error_code, 'offline');
+    });
+  });
+
+  test('cold-router only routes active tasks and short-circuits after all tasks close', async () => {
+    await withTempWorkspace(async tmpDir => {
+      initCairnStore(tmpDir);
+      appendTaskTurn(tmpDir, { task_id: 1, role: 'user', content: 'Active candidate' });
+      appendTaskTurn(tmpDir, { task_id: 2, role: 'user', content: 'Closed candidate' });
+      transitionTaskStatus(tmpDir, { taskId: 2, action: 'close' });
+      const cards = buildSanitizedTaskCards(tmpDir, readTasksIndex(tmpDir).tasks);
+      assert.deepEqual(cards.map(card => card.id), [1]);
+
+      const invalidClosedMatch = await runColdRouter({
+        workspaceRoot: tmpDir,
+        userPrompt: 'choose task 2',
+        llmClient: createMockLlmClient(JSON.stringify({ decision: 'match', task_id: 2, candidates: [2], reason: 'closed task' }))
+      });
+      assert.equal(invalidClosedMatch.ok, false);
+      assert.equal(invalidClosedMatch.error_code, 'invalid_routed_task_id');
+
+      transitionTaskStatus(tmpDir, { taskId: 1, action: 'close' });
+      let calls = 0;
+      const noActive = await runColdRouter({
+        workspaceRoot: tmpDir,
+        userPrompt: 'resume something',
+        llmClient: { async complete() { calls++; throw new Error('must short circuit'); } }
+      });
+      assert.equal(noActive.ok, true);
+      assert.equal(noActive.decision, 'new');
+      assert.equal(noActive.reason, 'empty_task_catalog');
+      assert.equal(calls, 0);
     });
   });
 });

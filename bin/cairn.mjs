@@ -16,9 +16,10 @@ import {
   dropStaged,
   readTasksIndex,
   buildLightTaskCatalog,
-  upsertTask
+  upsertTask,
+  transitionTaskStatus
 } from '../src/kernel/index.mjs';
-import { compileTaskCheckout, runStrictCompactor, createOpenAICompatibleClient } from '../src/workers/index.mjs';
+import { compileTaskCheckout, runStrictCompactor, createOpenAICompatibleClient, runWorkspaceDoctor } from '../src/workers/index.mjs';
 
 function printUsage(writeOut) {
   writeOut(
@@ -31,7 +32,9 @@ function printUsage(writeOut) {
       '  cairn log    [--cwd <dir>] [--json]',
       '  cairn commit [proposal_id] [--rebase] [--actor <id>] [--step <step>] [--cwd <dir>] [--json]',
       '  cairn drop   [proposal_id] [--cwd <dir>] [--json]',
-      '  cairn tasks  [--cwd <dir>] [--json]'
+      '  cairn tasks  [--all | --status <active|done|archived>] [--cwd <dir>] [--json]',
+      '  cairn close <id> | archive <id> | reopen <id> [--cwd <dir>] [--json]',
+      '  cairn doctor [--cwd <dir>] [--json]'
       ,'  cairn checkout <id|--clear> [--preview] [--cwd <dir>]'
       ,'  cairn compact <id> [--full] [--cwd <dir>]'
     ].join('\n')
@@ -60,6 +63,8 @@ export function runCairnCli(
         preview: { type: 'boolean', default: false },
         full: { type: 'boolean', default: false },
         clear: { type: 'boolean', default: false },
+        all: { type: 'boolean', default: false },
+        status: { type: 'string' },
         help: { type: 'boolean', short: 'h', default: false }
       }
     });
@@ -77,6 +82,12 @@ export function runCairnCli(
   if (values.help || !subcommand) {
     printUsage(stdout);
     return subcommand ? 0 : 1;
+  }
+
+  if (subcommand === 'doctor') {
+    const report = runWorkspaceDoctor({ workspaceRoot });
+    stdout(asJson ? JSON.stringify(report, null, 2) : formatDoctorReport(report));
+    return report.ok ? 0 : 1;
   }
 
   try {
@@ -229,26 +240,49 @@ export function runCairnCli(
 
     if (subcommand === 'tasks') {
       const index = readTasksIndex(workspaceRoot);
-      const catalog = buildLightTaskCatalog(index.tasks);
+      const validStatuses = new Set(['active', 'done', 'archived']);
+      if (values.all && values.status) throw new Error('Use either --all or --status, not both.');
+      if (values.status && !validStatuses.has(values.status)) {
+        throw new Error(`Invalid task status: ${values.status}`);
+      }
+      const tasks = values.all
+        ? index.tasks
+        : index.tasks.filter(task => task.status === (values.status ?? 'active'));
+      const catalog = buildLightTaskCatalog(tasks);
       if (asJson) {
         stdout(
           JSON.stringify(
             {
               ...index,
+              tasks,
+              filter: values.all ? 'all' : values.status ?? 'active',
               light_task_catalog: catalog
             },
             null,
             2
           )
         );
-      } else if (index.tasks.length === 0) {
+      } else if (tasks.length === 0) {
         stdout('No tasks tracked in .cairn/tasks/index.json yet.');
       } else {
-        stdout(catalog);
+        const listing = values.all || values.status
+          ? tasks.map(task => `- [${task.status.toUpperCase()}] <|task:${task.id}|>: ${task.title}`).join('\n')
+          : catalog;
+        stdout(listing);
         if (index.work_anchor_task_id !== null) {
           stdout(`WorkAnchor: <|task:${index.work_anchor_task_id}|>`);
         }
       }
+      return 0;
+    }
+
+    if (['close', 'archive', 'reopen'].includes(subcommand)) {
+      const id = Number(targetArg);
+      if (!Number.isSafeInteger(id) || id < 1 || id > 999 || positionals.length !== 2) {
+        throw new Error(`Use ${subcommand} <id>`);
+      }
+      const result = transitionTaskStatus(workspaceRoot, { taskId: id, action: subcommand });
+      stdout(asJson ? JSON.stringify(result, null, 2) : `Task ${id}: ${result.previous_status} -> ${result.status}.`);
       return 0;
     }
 
@@ -260,6 +294,11 @@ export function runCairnCli(
       }
       if (!targetArg || targetArg === '--clear') throw new Error('Use checkout <id|--clear> [--preview]');
       const id = Number(targetArg);
+      const task = readTasksIndex(workspaceRoot).tasks.find(entry => entry.id === id);
+      if (!task) throw new Error(`Task not found: ${targetArg}`);
+      if (task.status !== 'active' && !values.preview) {
+        throw new Error(`task_not_active:${id}:${task.status}; run 'cairn reopen ${id}' first`);
+      }
       const checkout = compileTaskCheckout({ workspaceRoot, taskId: id });
       if (!checkout.ok) throw new Error(`Task not found: ${targetArg}`);
       if (values.preview) {
@@ -284,6 +323,20 @@ export function runCairnCli(
   }
 }
 
+function formatDoctorReport(report) {
+  const lines = [
+    `Cairn doctor: ${report.ok ? 'OK' : 'ISSUES'}`,
+    `Ledger replay: ${report.integrity?.valid ? 'VALID' : 'INVALID'}`
+  ];
+  for (const issue of report.issues ?? []) {
+    lines.push(`  [${issue.severity.toUpperCase()}] ${issue.code}${issue.task_id ? ` task=${issue.task_id}` : ''}${issue.path ? ` path=${issue.path}` : ''}`);
+  }
+  for (const task of report.tasks ?? []) {
+    lines.push(`  task ${task.id} ${task.status}: ${task.uncompressed_record_count} records / ${task.uncompressed_chars} chars; truncation=${task.truncation_risk.level}`);
+  }
+  return lines.join('\n');
+}
+
 export async function runCairnCliAsync(argv = process.argv.slice(2), io = {}) {
   if (argv[0] !== 'compact') return runCairnCli(argv, io);
   const { stdout = msg => process.stdout.write(`${msg}\n`), stderr = msg => process.stderr.write(`${msg}\n`), cwd = process.cwd(), llmClient = createOpenAICompatibleClient() } = io;
@@ -294,7 +347,12 @@ export async function runCairnCliAsync(argv = process.argv.slice(2), io = {}) {
   const root = path.resolve(cwdIndex >= 0 ? argv[cwdIndex + 1] : cwd);
   try {
     if (!Number.isSafeInteger(id) || id < 1 || args.length !== 1 || (cwdIndex >= 0 && !argv[cwdIndex + 1])) throw new Error('Use compact <id> [--full] [--cwd <dir>]');
-    if (!isCairnInitialized(root) || !readTasksIndex(root).tasks.some(task => task.id === id)) throw new Error(`Task not found: ${id}`);
+    const task = isCairnInitialized(root) ? readTasksIndex(root).tasks.find(entry => entry.id === id) : null;
+    if (!task) throw new Error(`Task not found: ${id}`);
+    if (task.status !== 'active') {
+      stderr(`task_not_active:${id}:${task.status}; run 'cairn reopen ${id}' first`);
+      return 1;
+    }
     const result = await runStrictCompactor({ workspaceRoot: root, taskId: id, mode: full ? 'full' : 'incremental', llmClient });
     stdout(JSON.stringify(result));
     return result.ok ? 0 : 1;

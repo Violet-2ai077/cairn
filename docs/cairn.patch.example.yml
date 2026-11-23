@@ -10,7 +10,10 @@
         actorId: 'dsh-main'
         stripMarkerInStream: true
         useHostLlm: true
-        autoCompactEveryTurns: 0
+        autoCompactMinRecords: 12
+        autoCompactMinChars: 4500
+        maxTailChars: 6000
+        autoCompactCooldownMs: 300000
         # Optional explicit out-of-band worker model overrides:
         # workerProvider: 'deepseek'
         # workerModel: 'deepseek-chat'

@@ -54,7 +54,7 @@ Every workspace managed by Cairn stores its state in a human-inspectable, plain-
 ```text
 cairn/
 ├── bin/
-│   └── cairn.mjs               # Minimal zero-dependency CLI (init / status / log / commit / drop / tasks)
+│   └── cairn.mjs               # Minimal zero-dependency CLI (tasks / close / archive / reopen / compact / doctor)
 └── src/
     ├── kernel/                 # Layer 1: Pure deterministic, zero-LLM, zero-host-dependency core
     │   ├── ledger.mjs          #   createEmptyLedger, foldLedger, projectReadOnlyLedger
@@ -63,7 +63,9 @@ cairn/
     │   ├── store.mjs           #   .cairn/ persistence, replayLedger verification, batch optimistic concurrency
     │   └── index.mjs           #   Unified kernel barrel export
     ├── workers/                # Layer 2: Low-frequency asynchronous LLM workers
-    │   └── index.mjs           #   staging-extractor, strict-compactor, cold-router
+    │   ├── task-compaction-coordinator.mjs # shared per-workspace/task lock, cooldown, drain
+    │   ├── doctor.mjs           # read-only integrity, catalog, anchor, and tail-watermark diagnostics
+    │   └── index.mjs           # staging-extractor, strict-compactor, cold-router, compactor, doctor
     └── hosts/                  # Layer 3: Thin runtime host adapters
         └── dsh/                #   Reference Host #1: DeepSeek Harness (dsh 0.2.2-rc.5)
             └── index.mjs
@@ -87,6 +89,12 @@ cairn/
 - The dsh adapter binds a cold-routed task at `agent/pre-step`. Its stable checkout snapshot is cached per `(sessionId, taskId)` and injected by the synchronous dynamic-context provider refreshed after pre-step. Empty catalogs short-circuit to `new`; ambiguous routing gets one natural-language clarification retry without task-history disclosure.
 - `/cairn checkout <id|--clear> [--preview]` changes an explicit workspace anchor; `/cairn compact [id] [--full]` is a user-directed task-local compaction. Both host tools retain explicit human-authorization red lines.
 - The host contract targets `dsh 0.2.2-rc.5`; kernel, workers, and host remain separate layers.
+
+### Milestone 3: Long-Horizon Autonomy and Anti-Entropy
+- Tasks have `status: "active" | "done" | "archived"`; legacy records without status read as `active`. `close` marks done, `archive` marks done tasks archived, and `reopen` restores active status. The light catalog and cold router include active tasks only. Closing or archiving clears a matching workspace anchor and live session bindings. Non-active tasks are read-only until reopened; checkout preview remains available.
+- Automatic compaction is a low-priority, out-of-band worker gated by uncompressed-tail watermarks. `autoCompactMinRecords` and `autoCompactMinChars` are independent OR dimensions (zero disables a dimension); if both are zero, auto-compaction is disabled. The legacy `autoCompactEveryTurns` is consulted only when neither new threshold is configured. A per-`(workspaceRoot, taskId)` coordinator lock serializes automatic and manual compaction; manual runs bypass cooldown, while automatic failures cool down. The worker rechecks active status after acquiring the lock and before LLM execution. dsh headless drains pending workers at the awaited `session/flush` checkpoint; worker-originated nested flushes for the same session are skipped via `AsyncLocalStorage` to prevent queue self-deadlock. `session/disposed` performs best-effort fallback cleanup, and successful compaction does not refresh a session's checkout snapshot.
+- `cairn doctor` and `/cairn doctor` are read-only and make no LLM calls. They check ledger replay, task index/disk consistency, anchor validity, compaction cursors, orphan directories, and uncompressed tail size/risk relative to `maxTailChars`. `/cairn inspect` exposes only redacted binding/route/compaction metadata (no user prompts, transcript or compact text, model output, or credentials).
+- `doctor.mjs` and the compaction coordinator live under `src/workers/`; the deterministic kernel has no dependency on workers or the host.
 
 ### Phase 2: Single-Window Multi-Agent Orchestration (Next)
 - Once the single-agent `dsh` loop is rock-solid, leverage `actor_id` and `base_revision` optimistic concurrency in `foldLedger` so multiple subagents or parallel workers in a single workspace can check out `.cairn/head.json`, propose staged state operators, and deterministically detect/resolve state conflicts.

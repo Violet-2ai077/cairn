@@ -290,6 +290,13 @@ describe('Cairn Kernel 2: Closed-Fence-Aware Inline Task Marker Parser (src/kern
     ]);
     assert.ok(catalog.includes('- <|task:1|>: Auth middleware refactor (established turn 1)'));
     assert.ok(catalog.includes('- <|task:2|>: Pagination cursor migration (established turn 4)'));
+    const activeOnly = buildLightTaskCatalog([
+      { id: 1, title: 'Active task' },
+      { id: 2, title: 'Done task', status: 'done' },
+      { id: 3, title: 'Archived task', status: 'archived' }
+    ]);
+    assert.match(activeOnly, /Active task/);
+    assert.doesNotMatch(activeOnly, /Done task|Archived task/);
   });
 });
 

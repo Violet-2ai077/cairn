@@ -10,13 +10,15 @@ import {
   readStaged,
   readTasksIndex,
   readTaskThread,
+  readTaskCompaction,
   upsertTask,
   appendTaskTurn,
   writeTaskCompaction
 } from '../src/kernel/index.mjs';
 import {
   apply as cordisApplyCairnDshHost,
-  createCairnDshHost as applyCairnDshHost
+  createCairnDshHost as applyCairnDshHost,
+  resolveDshHostConfig
 } from '../src/hosts/dsh/index.mjs';
 
 async function withTempWorkspace(fn) {
@@ -324,9 +326,21 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
         }
       });
 
-      // Real user message
+      // Workspace instructions are injected into user-message history for the LLM but are not user-authored task history.
       ctx.emit('session/event', session, {
         seq: 3,
+        type: 'user/message',
+        surfaceOp: 'append',
+        data: {
+          role: 'user',
+          source: { kind: 'agent-instructions', form: 'instructions', changes: [] },
+          content: [{ type: 'text', text: '<system-reminder>workspace-only instructions</system-reminder>' }]
+        }
+      });
+
+      // Real user message
+      ctx.emit('session/event', session, {
+        seq: 4,
         type: 'user/message',
         surfaceOp: 'append',
         data: {
@@ -335,7 +349,7 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
           content: [
             {
               type: 'text',
-              text: '运行缓存压测，确认脏读后我们正式拍板把全局 cache_strategy 设为 redis_ttl。'
+              text: '运行缓存压测，确认脏读后我们正式拍板把全局 cache_strategy 设为 redis_ttl。\n\n<system-reminder>Injected workspace instructions are not user task history.</system-reminder>'
             }
           ]
         }
@@ -343,7 +357,7 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
 
       // Step 1: intermediate tool-calling assistant message (NO task marker)
       ctx.emit('session/event', session, {
-        seq: 4,
+        seq: 5,
         type: 'assistant/message',
         surfaceOp: 'append',
         data: {
@@ -364,12 +378,12 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
         }
       });
 
-      // Tool result linked via sourceEventSeqs: [4]
+      // Tool result linked via sourceEventSeqs: [5]
       ctx.emit('session/event', session, {
-        seq: 5,
+        seq: 6,
         type: 'tool/result',
         surfaceOp: 'append',
-        sourceEventSeqs: [4],
+        sourceEventSeqs: [5],
         data: {
           message: {
             role: 'tool',
@@ -403,7 +417,7 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
 
       // Step 2 committed assistant/message receives the already-stripped text from BlockAssembler
       ctx.emit('session/event', session, {
-        seq: 6,
+        seq: 7,
         type: 'assistant/message',
         surfaceOp: 'append',
         data: {
@@ -418,7 +432,7 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
 
       // Turn end -> archives to .cairn/tasks/1/thread.jsonl & triggers serial async staging extractor
       ctx.emit('session/event', session, {
-        seq: 7,
+        seq: 8,
         type: 'turn/end',
         data: { turn: 1, reason: { kind: 'completed' } }
       });
@@ -429,6 +443,7 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       const thread1 = readTaskThread(tmpDir, 1);
       assert.equal(thread1.length, 2);
       assert.equal(thread1[0].role, 'user');
+      assert.equal(thread1[0].content, '运行缓存压测，确认脏读后我们正式拍板把全局 cache_strategy 设为 redis_ttl。');
       assert.equal(thread1[1].role, 'assistant');
       assert.equal(thread1[1].content.includes('<|task:1|>'), false);
       assert.ok(thread1[1].raw_content.endsWith('<|task:1|>'));
@@ -794,6 +809,218 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       assert.equal(readTaskThread(tmpDir, 1).length, 2);
       assert.equal(readTaskThread(tmpDir, 2).length, 4);
       assert.ok(readTaskThread(tmpDir, 999).length > 0, 'valid syntax retains existing direct marker behavior');
+      await host.dispose();
+    });
+  });
+
+  test('invalid anchors are ignored, lifecycle commands clear bindings, and runtime inspect stays safe', async () => {
+    await withTempWorkspace(async tmpDir => {
+      upsertTask(tmpDir, { id: 1, title: 'First task' });
+      upsertTask(tmpDir, { id: 2, title: 'Second task' });
+      upsertTask(tmpDir, { work_anchor_task_id: 999 });
+      const routeResults = [
+        JSON.stringify({ decision: 'match', task_id: 1, candidates: [1], reason: 'first' }),
+        JSON.stringify({ decision: 'match', task_id: 2, candidates: [2], reason: 'second' })
+      ];
+      let routeCalls = 0;
+      const ctx = createMockDshContext();
+      const host = await applyCairnDshHost(ctx, {
+        workspaceRoot: tmpDir,
+        autoCompactMinRecords: 0,
+        autoCompactMinChars: 0,
+        llmClient: {
+          async complete({ system }) {
+            if (system.includes('Cold-Start Task Semantic Router')) {
+              routeCalls++;
+              return { ok: true, content: routeResults.shift() ?? '{"decision":"new","task_id":null,"candidates":[],"reason":"default"}' };
+            }
+            return { ok: true, content: '{"ops":[]}' };
+          }
+        }
+      });
+      const command = ctx._registry.commands.get('cairn');
+      const payload = session => ({
+        agent: { session },
+        turn: 1,
+        step: 1,
+        signal: new AbortController().signal,
+        modelSelection: { provider: 'test-provider', model: 'test-model' },
+        messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'continue a specific task' }] }]
+      });
+      const firstSession = { id: 'invalid-anchor-first' };
+      const before = ctx.systemPrompt.renderAll({ agent: { session: firstSession } }).find(x => x.name === 'cairn:task-continuity').text;
+      assert.doesNotMatch(before, /Task Checkout 999|Host-verified WorkAnchor:.*999/);
+      await ctx.runPreStep(payload(firstSession));
+      assert.equal(routeCalls, 1, 'invalid anchor must not bypass cold routing');
+      const firstInspect = JSON.parse((await command.handler({ rawInput: 'inspect', agent: { session: firstSession } })).text);
+      assert.deepEqual(firstInspect.session_binding, { task_id: 1, source: 'cold_router_match' });
+
+      const checkout = await command.handler({ rawInput: 'checkout 1', agent: { session: firstSession } });
+      assert.equal(checkout.kind, 'success');
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, 1);
+      const closed = await command.handler({ rawInput: 'close 1', agent: { session: firstSession } });
+      assert.equal(closed.kind, 'success');
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, null);
+      const afterCloseInspect = JSON.parse((await command.handler({ rawInput: 'inspect', agent: { session: firstSession } })).text);
+      assert.equal(afterCloseInspect.session_binding.task_id, null);
+
+      let seq = 0;
+      ctx.emit('session/event', firstSession, { seq: ++seq, type: 'turn/start', data: { turn: 2 } });
+      ctx.emit('session/event', firstSession, { seq: ++seq, type: 'user/message', data: { turn: 2, message: { role: 'user', content: 'post-close' } } });
+      ctx.emit('session/event', firstSession, { seq: ++seq, type: 'assistant/message', data: { turn: 2, message: { role: 'assistant', content: 'No inherited close-task marker' } } });
+      ctx.emit('session/event', firstSession, { seq: ++seq, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } });
+      await host.accumulator.flushPendingJobs();
+      assert.equal(readTaskThread(tmpDir, 1).length, 0, 'closed task is frozen after binding cleanup');
+
+      upsertTask(tmpDir, { work_anchor_task_id: 1 });
+      const doctor = await command.handler({ rawInput: 'doctor', agent: { session: firstSession } });
+      assert.match(doctor.text, /anchor_task_not_active/);
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, 1, 'doctor does not repair invalid anchors');
+      const secondSession = { id: 'invalid-anchor-second' };
+      await ctx.runPreStep(payload(secondSession));
+      assert.equal(routeCalls, 2, 'non-active anchor does not bypass routing to active task 2');
+      const secondInspect = JSON.parse((await command.handler({ rawInput: 'inspect', agent: { session: secondSession } })).text);
+      assert.deepEqual(secondInspect.session_binding, { task_id: 2, source: 'cold_router_match' });
+
+      const closeTool = ctx._registry.tools.get('cairn_close_task');
+      assert.ok(closeTool.description.includes('HUMAN AUTHORITY RED LINE'));
+      await host.dispose();
+    });
+  });
+
+  test('pre-step modelSelection supports zero-catalog auto-compaction before a primary stream route is observed', async () => {
+    await withTempWorkspace(async tmpDir => {
+      const workerRequests = [];
+      let releaseFirstWorker;
+      let signalFirstWorker;
+      let triggerNestedFlush = async () => {};
+      let nestedFlushCompleted = false;
+      const firstWorkerGate = new Promise(resolve => { releaseFirstWorker = resolve; });
+      const firstWorkerStarted = new Promise(resolve => { signalFirstWorker = resolve; });
+      const ctx = createMockDshContext({
+        adapterStream: async function* (request) {
+          if (request.purpose === 'cairn-worker') {
+            workerRequests.push(request);
+            if (workerRequests.length === 1) {
+              await triggerNestedFlush();
+              nestedFlushCompleted = true;
+              signalFirstWorker();
+              await firstWorkerGate;
+            }
+            yield { type: 'text-delta', index: 0, text: workerRequests.length === 1 ? 'Auto-compacted task-local history.' : '{"ops":[]}' };
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        }
+      });
+      const host = await applyCairnDshHost(ctx, {
+        workspaceRoot: tmpDir,
+        useHostLlm: true,
+        autoCompactMinRecords: 1,
+        autoCompactMinChars: 0
+      });
+      const session = { id: 'auto-zero-catalog' };
+      const flushListener = ctx._registry.listeners.get('session/flush')?.[0];
+      assert.equal(typeof flushListener, 'function');
+      triggerNestedFlush = () => flushListener(session);
+      const message = { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Create the first task and preserve its short local note.' }] };
+      const preStep = await ctx.runPreStep({
+        agent: { session }, turn: 1, step: 1,
+        modelSelection: { provider: 'opencode-go', model: 'deepseek-v4.1-flash' },
+        messages: [message]
+      });
+      assert.equal(preStep.kind, 'enter');
+      ctx.emit('session/event', session, { seq: 1, type: 'turn/start', data: { turn: 1 } });
+      ctx.emit('session/event', session, { seq: 2, type: 'user/message', data: { turn: 1, message } });
+      ctx.emit('session/event', session, { seq: 3, type: 'assistant/message', data: { turn: 1, message: { role: 'assistant', content: 'Created the local note.\n<|task:1|>' } } });
+      ctx.emit('session/event', session, { seq: 4, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+      await firstWorkerStarted;
+      const disposeListener = ctx._registry.listeners.get('session/disposed')?.[0];
+      assert.equal(typeof disposeListener, 'function');
+      let drained = false;
+      assert.equal(nestedFlushCompleted, true, 'worker-initiated model calls bypass recursive session drain');
+      const disposeDrain = flushListener(session).then(() => { drained = true; });
+      await Promise.resolve();
+      assert.equal(drained, false, 'the awaited session/flush checkpoint waits for pending workers');
+      releaseFirstWorker();
+      await disposeDrain;
+      assert.equal(drained, true);
+      disposeListener(session);
+      await host.dispose();
+      assert.equal(workerRequests.length, 2, 'auto compaction runs before the staging extractor without a primary llm/stream observation');
+      assert.equal(workerRequests[0].provider, 'opencode-go');
+      assert.equal(workerRequests[0].model, 'deepseek-v4.1-flash');
+      assert.equal(workerRequests[0].sessionId, session.id);
+      assert.equal(workerRequests[1].provider, 'opencode-go');
+      assert.equal(workerRequests[1].model, 'deepseek-v4.1-flash');
+      assert.equal(workerRequests[1].sessionId, session.id, 'staging receives the active session route too');
+      assert.equal(readTaskCompaction(tmpDir, 1), 'Auto-compacted task-local history.\n');
+      assert.equal(readTasksIndex(tmpDir).tasks[0].compacted_record_count, 2);
+    });
+  });
+
+  test('threshold auto-compaction is out-of-band, uses configurable dimensions, and preserves cached checkout prefix', async () => {
+    assert.deepEqual(
+      [resolveDshHostConfig({ autoCompactMinRecords: 0, autoCompactMinChars: 0 }).autoCompactMinRecords,
+        resolveDshHostConfig({ autoCompactMinRecords: 0, autoCompactMinChars: 0 }).autoCompactMinChars],
+      [0, 0]
+    );
+    assert.deepEqual(
+      [resolveDshHostConfig({ autoCompactEveryTurns: 2 }).autoCompactMinRecords,
+        resolveDshHostConfig({ autoCompactEveryTurns: 2 }).autoCompactMinChars],
+      [2, 0],
+      'legacy threshold maps only to the record dimension'
+    );
+    assert.deepEqual(
+      [resolveDshHostConfig({ autoCompactEveryTurns: 0 }).autoCompactMinRecords,
+        resolveDshHostConfig({ autoCompactEveryTurns: 0 }).autoCompactMinChars],
+      [0, 0],
+      'legacy zero disables both dimensions when no new threshold was supplied'
+    );
+
+    await withTempWorkspace(async tmpDir => {
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'Cached prefix history' });
+      upsertTask(tmpDir, { work_anchor_task_id: 1 });
+      let releaseCompaction;
+      const compactionGate = new Promise(resolve => { releaseCompaction = resolve; });
+      let compactCalls = 0;
+      let stagingCalls = 0;
+      const ctx = createMockDshContext();
+      const host = await applyCairnDshHost(ctx, {
+        workspaceRoot: tmpDir,
+        useHostLlm: false,
+        autoCompactMinRecords: 2,
+        autoCompactMinChars: 0,
+        llmClient: {
+          async complete({ system }) {
+            if (system.includes('COMPRESSOR_STRICT')) {
+              compactCalls++;
+              await compactionGate;
+              return { ok: true, content: 'Auto compacted local history' };
+            }
+            stagingCalls++;
+            return { ok: true, content: '{"ops":[]}' };
+          }
+        }
+      });
+      const session = { id: 'auto-compact-session' };
+      const contextBefore = ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text;
+      let seq = 0;
+      ctx.emit('session/event', session, { seq: ++seq, type: 'turn/start', data: { turn: 2 } });
+      ctx.emit('session/event', session, { seq: ++seq, type: 'user/message', data: { turn: 2, message: { role: 'user', content: 'Add one bounded detail' } } });
+      ctx.emit('session/event', session, { seq: ++seq, type: 'assistant/message', data: { turn: 2, message: { role: 'assistant', content: 'Recorded the bounded detail.\n<|task:1|>' } } });
+      ctx.emit('session/event', session, { seq: ++seq, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } });
+      assert.equal(readTaskThread(tmpDir, 1).length, 3, 'turn commits before background compaction finishes');
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(compactCalls, 1);
+      const stillRunningContext = ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text;
+      assert.equal(stillRunningContext, contextBefore, 'auto compaction does not refresh cached checkout context');
+      releaseCompaction();
+      await host.accumulator.flushPendingJobs();
+      assert.equal(stagingCalls, 1);
+      assert.equal(readTaskCompaction(tmpDir, 1), 'Auto compacted local history\n');
+      assert.equal(readTasksIndex(tmpDir).tasks[0].compacted_record_count, 3);
+      const afterContext = ctx.systemPrompt.renderAll({ agent: { session } }).find(x => x.name === 'cairn:task-continuity').text;
+      assert.equal(afterContext, contextBefore, 'completed auto compaction retains the stable cached prefix');
       await host.dispose();
     });
   });

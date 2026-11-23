@@ -1,4 +1,4 @@
-// Cairn Reference Host #1: DeepSeek Harness (dsh 0.2.2-rc.1 / Cordis 4.1.0) Plugin Adapter
+// Cairn Reference Host #1: DeepSeek Harness (dsh 0.2.2-rc.5 / Cordis 4.1.0) Plugin Adapter
 // (src/hosts/dsh/index.mjs)
 // Bridges Cairn Kernel & Workers into dsh lifecycle hooks:
 // - ctx.systemPrompt.context: Anti-Recency contract, Light Task Catalog, Task compact.md, and Authority Checkout Ledger
@@ -7,6 +7,7 @@
 // - ctx.on('session/event') & ctx.on('session/disposed'): multi-step ReAct turn accumulation & serial async worker queue
 // - ctx.tools.register & optional ctx.commands.register('/cairn'): human-authority-gated state management
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   isCairnInitialized,
   initCairnStore,
@@ -24,7 +25,7 @@ import {
   buildGlobalExclusionWatchlistSection,
   compileTaskCheckout,
   runColdRouter,
-  runStrictCompactor
+  createTaskCompactionCoordinator
 } from '../../workers/index.mjs';
 import { runCairnCli } from '../../../bin/cairn.mjs';
 import { createTurnAccumulator } from './turn-accumulator.mjs';
@@ -37,6 +38,12 @@ const TAIL_BUFFER_CHARS = 64;
 
 
 export function resolveDshHostConfig(rawConfig = {}) {
+  const hasNewAutoCompactThreshold =
+    rawConfig.autoCompactMinRecords !== undefined || rawConfig.autoCompactMinChars !== undefined;
+  const hasLegacyAutoCompactThreshold = rawConfig.autoCompactEveryTurns !== undefined;
+  const legacyRecords = Number.isSafeInteger(rawConfig.autoCompactEveryTurns) && rawConfig.autoCompactEveryTurns > 0
+    ? rawConfig.autoCompactEveryTurns
+    : 0;
   return Object.freeze({
     workspaceRoot: rawConfig.workspaceRoot ?? process.cwd(),
     actorId:
@@ -56,8 +63,18 @@ export function resolveDshHostConfig(rawConfig = {}) {
         : '',
     workerApiBase: rawConfig.workerApiBase ?? process.env.CAIRN_API_BASE ?? '',
     workerApiKey: rawConfig.workerApiKey ?? process.env.CAIRN_API_KEY ?? '',
-    autoCompactEveryTurns:
-      typeof rawConfig.autoCompactEveryTurns === 'number' ? rawConfig.autoCompactEveryTurns : 0,
+    autoCompactMinRecords: Number.isSafeInteger(rawConfig.autoCompactMinRecords) && rawConfig.autoCompactMinRecords >= 0
+      ? rawConfig.autoCompactMinRecords
+      : hasNewAutoCompactThreshold ? 12 : hasLegacyAutoCompactThreshold ? legacyRecords : 12,
+    autoCompactMinChars: Number.isSafeInteger(rawConfig.autoCompactMinChars) && rawConfig.autoCompactMinChars >= 0
+      ? rawConfig.autoCompactMinChars
+      : hasNewAutoCompactThreshold ? 4500 : hasLegacyAutoCompactThreshold ? 0 : 4500,
+    maxTailChars: Number.isSafeInteger(rawConfig.maxTailChars) && rawConfig.maxTailChars >= 0
+      ? rawConfig.maxTailChars
+      : 6000,
+    autoCompactCooldownMs: Number.isSafeInteger(rawConfig.autoCompactCooldownMs) && rawConfig.autoCompactCooldownMs >= 0
+      ? rawConfig.autoCompactCooldownMs
+      : 300000,
     coldRouterTimeoutMs:
       Number.isSafeInteger(rawConfig.coldRouterTimeoutMs) && rawConfig.coldRouterTimeoutMs > 0
         ? rawConfig.coldRouterTimeoutMs
@@ -266,9 +283,33 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
   let lastObservedRoute = null;
   const disposers = [];
   const routesBySession = new Map();
+  const workerLlmCallContext = new AsyncLocalStorage();
   const routeStates = new Map();
   const checkoutSnapshots = new Map();
   const activeSnapshotTaskBySession = new Map();
+  const sessionBindingSources = new Map();
+  const compactionCoordinator = createTaskCompactionCoordinator({
+    workspaceRoot,
+    cooldownMs: config.autoCompactCooldownMs
+  });
+
+  function isActiveTask(tasksIndex, taskId) {
+    return Number.isSafeInteger(taskId) && taskId > 0 &&
+      tasksIndex.tasks.some(task => task.id === taskId && task.status === 'active');
+  }
+
+  function activeWorkAnchor(tasksIndex) {
+    return isActiveTask(tasksIndex, tasksIndex.work_anchor_task_id)
+      ? tasksIndex.work_anchor_task_id
+      : null;
+  }
+
+  function canAutoCompact(sessionId) {
+    if (config.llmClient || config.workerApiKey) return true;
+    const route = routesBySession.get(sessionId) ??
+      (lastObservedRoute?.sessionId === sessionId ? lastObservedRoute : null);
+    return Boolean(config.useHostLlm && ctx.llm?.stream && route?.provider && route?.model);
+  }
 
   function resolveWorkerLlmClient(sessionId = null) {
     if (config.llmClient) {
@@ -282,7 +323,14 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
       });
     }
     if (ctx.llm && typeof ctx.llm.stream === 'function') {
-      return createDshHostLlmClient(ctx, config, () => routesBySession.get(sessionId) ?? lastObservedRoute);
+      const route = routesBySession.get(sessionId) ??
+        (lastObservedRoute?.sessionId === sessionId ? lastObservedRoute : null);
+      const client = createDshHostLlmClient(ctx, config, () => route);
+      return Object.freeze({
+        complete(options) {
+          return workerLlmCallContext.run(sessionId, () => client.complete(options));
+        }
+      });
     }
     return createOpenAICompatibleClient();
   }
@@ -291,13 +339,18 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
     workspaceRoot,
     actorId: config.actorId,
     getLlmClient: resolveWorkerLlmClient,
-    autoCompactEveryTurns: config.autoCompactEveryTurns,
+    autoCompactMinRecords: config.autoCompactMinRecords,
+    autoCompactMinChars: config.autoCompactMinChars,
+    maxTailChars: config.maxTailChars,
+    compactionCoordinator,
+    canAutoCompact,
     resolveBoundTaskId(sessionId) {
-      const anchor = readTasksIndex(workspaceRoot).work_anchor_task_id;
-      if (Number.isSafeInteger(anchor) && anchor > 0) return anchor;
+      const tasks = readTasksIndex(workspaceRoot);
+      const anchor = activeWorkAnchor(tasks);
+      if (anchor !== null) return anchor;
       const route = routeStates.get(sessionId);
       if (route?.result === 'ambiguous') return false;
-      if (route?.result === 'match' && Number.isSafeInteger(route.taskId)) return route.taskId;
+      if (route?.result === 'match' && isActiveTask(tasks, route.taskId)) return route.taskId;
       return null;
     },
     onWorkerLog: config.onWorkerLog
@@ -318,11 +371,91 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
   }
 
   function resolveActiveTaskId(explicitTaskId, sessionOrId) {
-    if (Number.isSafeInteger(explicitTaskId) && explicitTaskId > 0) return explicitTaskId;
+    const tasks = readTasksIndex(workspaceRoot);
+    if (Number.isSafeInteger(explicitTaskId) && explicitTaskId > 0) {
+      return isActiveTask(tasks, explicitTaskId) ? explicitTaskId : null;
+    }
     const currentTask = sessionOrId
       ? accumulator.getLastTaskId(sessionOrId, { allowFallback: false })
       : null;
-    return currentTask ?? readTasksIndex(workspaceRoot).work_anchor_task_id;
+    if (isActiveTask(tasks, currentTask)) return currentTask;
+    const anchor = activeWorkAnchor(tasks);
+    return anchor ?? (routeStates.get(sessionOrId)?.result === 'match' && isActiveTask(tasks, routeStates.get(sessionOrId).taskId)
+      ? routeStates.get(sessionOrId).taskId
+      : null);
+  }
+
+  function clearTaskRuntime(taskId) {
+    accumulator.clearTaskBindings(taskId);
+    for (const [sessionId, route] of routeStates) {
+      if (route.taskId === taskId) {
+        routeStates.delete(sessionId);
+        sessionBindingSources.delete(sessionId);
+      }
+    }
+    for (const [sessionId, binding] of sessionBindingSources) {
+      if (binding.taskId === taskId) {
+        sessionBindingSources.delete(sessionId);
+        routeStates.delete(sessionId);
+      }
+    }
+    for (const [sessionId, boundTaskId] of activeSnapshotTaskBySession) {
+      if (boundTaskId === taskId) activeSnapshotTaskBySession.delete(sessionId);
+    }
+    for (const key of checkoutSnapshots.keys()) {
+      if (key.endsWith(`:${taskId}`)) checkoutSnapshots.delete(key);
+    }
+    compactionCoordinator.clearTask(taskId);
+  }
+
+  function runtimeSnapshot(sessionId) {
+    const tasks = readTasksIndex(workspaceRoot);
+    const anchor = activeWorkAnchor(tasks);
+    const sessionTask = accumulator.getLastTaskId(sessionId, { allowFallback: false });
+    const route = routeStates.get(sessionId) ?? null;
+    const routeTask = route?.taskId ?? null;
+    const taskId = anchor ?? (isActiveTask(tasks, sessionTask) ? sessionTask : null) ??
+      (isActiveTask(tasks, routeTask) ? routeTask : null);
+    const existingBinding = sessionBindingSources.get(sessionId);
+    const source = taskId === null
+      ? 'none'
+      : existingBinding?.taskId === taskId
+        ? existingBinding.source
+        : anchor === taskId ? 'workspace_anchor'
+          : route?.result === 'match' && routeTask === taskId ? 'cold_router_match'
+            : accumulator.getBindingSource(sessionId) ?? 'task_marker';
+    return {
+      session_binding: { task_id: taskId, source },
+      last_cold_route: route
+        ? {
+            decision: route.result,
+            ...(route.taskId ? { task_id: route.taskId } : {}),
+            elapsed_ms: route.elapsed_ms ?? 0,
+            ...(route.error_code ? { error_code: route.error_code } : {})
+          }
+        : null,
+      auto_compaction: taskId !== null ? compactionCoordinator.getTaskStatus(taskId) : { status: 'idle', task_id: null }
+    };
+  }
+
+  async function runManualCompaction(taskId, sessionId, mode) {
+    const tasks = readTasksIndex(workspaceRoot);
+    const task = tasks.tasks.find(entry => entry.id === taskId);
+    if (!task) return { ok: false, skipped: true, reason: 'task_not_found', task_id: taskId };
+    if (task.status !== 'active') {
+      return { ok: false, skipped: true, reason: 'task_not_active', task_id: taskId, task_status: task.status };
+    }
+    const result = await compactionCoordinator.run({
+      taskId,
+      mode,
+      source: 'manual',
+      llmClient: resolveWorkerLlmClient(sessionId)
+    });
+    if (result.ok && sessionId && isActiveTask(readTasksIndex(workspaceRoot), taskId)) {
+      snapshotFor(sessionId, taskId, true);
+      activeSnapshotTaskBySession.set(sessionId, taskId);
+    }
+    return result;
   }
 
   // 1. Dynamic Context Injection: Task Continuity + Light Task Catalog + Active Task Compact Note
@@ -335,11 +468,15 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
         if (!isCairnInitialized(workspaceRoot)) return '';
         const tasksIndex = readTasksIndex(workspaceRoot);
         const sessionId = contextArg?.agent?.session?.id ?? null;
-        const activeTaskId = tasksIndex.work_anchor_task_id ?? accumulator.getLastTaskId(sessionId) ?? routeStates.get(sessionId)?.taskId ?? null;
+        const anchor = activeWorkAnchor(tasksIndex);
+        const sessionTaskId = accumulator.getLastTaskId(sessionId, { allowFallback: false });
+        const routedTaskId = routeStates.get(sessionId)?.taskId ?? null;
+        const activeTaskId = anchor ?? (isActiveTask(tasksIndex, sessionTaskId) ? sessionTaskId : null) ??
+          (isActiveTask(tasksIndex, routedTaskId) ? routedTaskId : null);
 
         const baseContract = buildAntiRecencyContract({
           tasks: tasksIndex.tasks,
-          workAnchorTaskId: tasksIndex.work_anchor_task_id
+          workAnchorTaskId: anchor
         });
 
         const routingNotice = routeStates.get(sessionId)?.clarification ?? '';
@@ -390,18 +527,42 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
       const decision = await next();
       if (payload?.signal?.aborted) throw payload.signal.reason ?? new Error('Aborted');
       if (decision?.kind !== 'enter') return decision;
-      const tasks = readTasksIndex(workspaceRoot);
-      const state = routeStates.get(sessionId);
-      const anchor = tasks.work_anchor_task_id;
-      if (anchor !== null) { snapshotFor(sessionId, anchor); activeSnapshotTaskBySession.set(sessionId, anchor); return decision; }
-      if (state?.terminal) return decision;
-      if (tasks.tasks.length === 0) { routeStates.set(sessionId, { terminal: true, result: 'new' }); return decision; }
       const selected = payload?.modelSelection;
+      if (selected?.provider && selected?.model) {
+        routesBySession.set(sessionId, { provider: selected.provider, model: selected.model, sessionId });
+      }
+      const tasks = readTasksIndex(workspaceRoot);
+      let state = routeStates.get(sessionId);
+      const anchor = activeWorkAnchor(tasks);
+      if (anchor !== null) {
+        snapshotFor(sessionId, anchor);
+        activeSnapshotTaskBySession.set(sessionId, anchor);
+        sessionBindingSources.set(sessionId, { taskId: anchor, source: 'workspace_anchor' });
+        routeStates.set(sessionId, { terminal: true, result: 'anchor_bypass', taskId: anchor, elapsed_ms: 0 });
+        return decision;
+      }
+      if (state?.result === 'anchor_bypass') {
+        routeStates.delete(sessionId);
+        sessionBindingSources.delete(sessionId);
+        state = null;
+      }
+      if (state?.result === 'match' && !isActiveTask(tasks, state.taskId)) {
+        routeStates.delete(sessionId);
+        sessionBindingSources.delete(sessionId);
+        state = null;
+      }
+      if (state?.terminal) return decision;
+      const activeTaskCount = tasks.tasks.filter(task => task.status === 'active').length;
+      if (activeTaskCount === 0) {
+        routeStates.set(sessionId, { terminal: true, result: 'new', reason: 'empty_active_task_catalog', elapsed_ms: 0 });
+        return decision;
+      }
       if (!selected?.provider || !selected?.model) { routeStates.set(sessionId, { terminal: true, result: 'error' }); return decision; }
       const userText = (payload.messages ?? []).filter(m => m?.source?.kind === 'user').map(m => Array.isArray(m.content) ? m.content.map(b => b.text ?? '').join('') : String(m.content ?? '')).join('\n');
       const opening = state?.result === 'ambiguous' ? `${state.opening}\n${userText}` : userText;
       if (state?.result === 'ambiguous' && (state.retried || state.lastTurn === payload.turn)) return decision;
       const client = config.llmClient ?? createDshHostLlmClient(ctx, config, () => ({ ...selected, sessionId }));
+      const routeStartedAt = Date.now();
       const controller = new AbortController();
       let timer;
       let result;
@@ -429,13 +590,15 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
         result = { ok: false, decision: null, error: err.message };
       } finally { clearTimeout(timer); removeAbortListener(); }
       if (payload.signal?.aborted) throw payload.signal.reason ?? new Error('Aborted');
-      if (!result.ok) { routeStates.set(sessionId, { terminal: true, result: 'error' }); return decision; }
+      const elapsedMs = Date.now() - routeStartedAt;
+      if (!result.ok) { routeStates.set(sessionId, { terminal: true, result: 'error', error_code: result.error_code ?? 'router_error', elapsed_ms: elapsedMs }); return decision; }
       if (result.decision === 'ambiguous') {
-        routeStates.set(sessionId, { result: 'ambiguous', opening: state?.opening ?? userText, retried: Boolean(state), lastTurn: payload.turn });
+        routeStates.set(sessionId, { result: 'ambiguous', opening: state?.opening ?? userText, retried: Boolean(state), lastTurn: payload.turn, elapsed_ms: elapsedMs });
         routeStates.get(sessionId).clarification = 'Cairn 找到多个可能的既有任务。请用户说明当前请求对应哪个任务；在澄清前不注入任何任务历史。';
         return decision;
       }
-      routeStates.set(sessionId, { terminal: true, result: result.decision, taskId: result.decision === 'match' ? result.task_id : null });
+      routeStates.set(sessionId, { terminal: true, result: result.decision, taskId: result.decision === 'match' ? result.task_id : null, elapsed_ms: elapsedMs });
+      if (result.decision === 'match') sessionBindingSources.set(sessionId, { taskId: result.task_id, source: 'cold_router_match' });
       return decision;
     }, { global: true });
     if (typeof disposePreStep === 'function') disposers.push(disposePreStep);
@@ -624,17 +787,30 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
     );
     if (typeof disposeSessionEvent === 'function') disposers.push(disposeSessionEvent);
 
+    const disposeSessionFlush = ctx.on(
+      'session/flush',
+      async session => {
+        if (workerLlmCallContext.getStore() === String(session?.id ?? '')) return;
+        await Promise.all([accumulator.flushPendingJobs(), compactionCoordinator.flush()]);
+      },
+      { global: true }
+    );
+    if (typeof disposeSessionFlush === 'function') disposers.push(disposeSessionFlush);
+
     const disposeSessionDisposed = ctx.on(
       'session/disposed',
       session => {
-        accumulator.disposeSession(session);
         const sessionId = String(session?.id ?? '');
+        const drain = Promise.all([accumulator.flushPendingJobs(), compactionCoordinator.flush()]);
+        accumulator.disposeSession(session);
         routeStates.delete(sessionId);
+        sessionBindingSources.delete(sessionId);
         activeSnapshotTaskBySession.delete(sessionId);
         routesBySession.delete(sessionId);
         for (const key of checkoutSnapshots.keys()) {
           if (key.startsWith(`${sessionId}:`)) checkoutSnapshots.delete(key);
         }
+        return drain;
       },
       { global: true }
     );
@@ -718,8 +894,46 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
           return executeCairnCliCommand(workspaceRoot, cliArgs).text;
         }
       })
-      ,createDshToolDefinition({ name: 'cairn_checkout', description: 'Set or clear task checkout. HUMAN AUTHORITY RED LINE: NEVER change checkout autonomously; ONLY invoke when explicitly instructed by the user.', parameters: { type:'object', properties:{ task_id:{type:'integer'}, clear:{type:'boolean'} } }, async execute(args={}) { const result = args.clear ? executeCairnCliCommand(workspaceRoot,['checkout','--clear']) : executeCairnCliCommand(workspaceRoot,['checkout',String(args.task_id)]); routeStates.clear(); checkoutSnapshots.clear(); activeSnapshotTaskBySession.clear(); return result.text; } })
-      ,createDshToolDefinition({ name: 'cairn_compact', description: 'Compact a task-local history. HUMAN AUTHORITY RED LINE: NEVER compact autonomously; ONLY invoke when explicitly instructed by the user.', parameters: { type:'object', properties:{ task_id:{type:'integer'}, full:{type:'boolean'} } }, async execute(args={}, runCtx={}) { const sessionId=runCtx.agent?.session?.id ?? lastObservedRoute?.sessionId; const taskId=resolveActiveTaskId(args.task_id,sessionId); if (!taskId) return 'No task selected.'; const result=await runStrictCompactor({workspaceRoot,taskId,mode:args.full?'full':'incremental',llmClient:resolveWorkerLlmClient(sessionId)}); if(sessionId) { snapshotFor(sessionId,taskId,true); activeSnapshotTaskBySession.set(sessionId,taskId); } return JSON.stringify(result); } })
+      ,createDshToolDefinition({
+        name: 'cairn_checkout',
+        description: 'Set or clear task checkout. HUMAN AUTHORITY RED LINE: NEVER change checkout autonomously; ONLY invoke when explicitly instructed by the user.',
+        parameters: { type: 'object', properties: { task_id: { type: 'integer' }, clear: { type: 'boolean' } } },
+        async execute(args = {}, runCtx = {}) {
+          const sessionId = runCtx.agent?.session?.id ?? null;
+          const result = args.clear
+            ? executeCairnCliCommand(workspaceRoot, ['checkout', '--clear'])
+            : executeCairnCliCommand(workspaceRoot, ['checkout', String(args.task_id)]);
+          if (result.code === 0) {
+            routeStates.clear();
+            checkoutSnapshots.clear();
+            activeSnapshotTaskBySession.clear();
+            if (sessionId && !args.clear) sessionBindingSources.set(sessionId, { taskId: args.task_id, source: 'slash_checkout' });
+            else if (sessionId) sessionBindingSources.delete(sessionId);
+          }
+          return result.text;
+        }
+      })
+      ,createDshToolDefinition({
+        name: 'cairn_compact',
+        description: 'Compact a task-local history. HUMAN AUTHORITY RED LINE: NEVER compact autonomously; ONLY invoke when explicitly instructed by the user.',
+        parameters: { type: 'object', properties: { task_id: { type: 'integer' }, full: { type: 'boolean' } } },
+        async execute(args = {}, runCtx = {}) {
+          const sessionId = runCtx.agent?.session?.id ?? lastObservedRoute?.sessionId ?? null;
+          const taskId = Number.isSafeInteger(args.task_id) ? args.task_id : resolveActiveTaskId(null, sessionId);
+          if (!taskId) return JSON.stringify({ ok: false, reason: 'no_active_task' });
+          return JSON.stringify(await runManualCompaction(taskId, sessionId, args.full ? 'full' : 'incremental'));
+        }
+      })
+      ,...['close', 'archive', 'reopen'].map(action => createDshToolDefinition({
+        name: `cairn_${action}_task`,
+        description: `Change a task lifecycle state using ${action}. HUMAN AUTHORITY RED LINE: NEVER change task lifecycle autonomously; ONLY invoke when explicitly instructed by the user.`,
+        parameters: { type: 'object', properties: { task_id: { type: 'integer' } }, required: ['task_id'] },
+        async execute(args = {}) {
+          const result = executeCairnCliCommand(workspaceRoot, [action, String(args.task_id)]);
+          if (result.code === 0 && action !== 'reopen') clearTaskRuntime(args.task_id);
+          return result.text;
+        }
+      }))
     ];
 
     for (const def of toolDefs) {
@@ -734,9 +948,9 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
     const disposeCommand = commandsService.register({
       name: 'cairn',
       description:
-          'Manage Cairn workspace state and task continuity (checkout | compact | status | log | commit | drop | tasks)',
+          'Manage Cairn workspace state and task continuity (lifecycle | checkout | compact | status | inspect | doctor | tasks)',
       input: {
-        hint: 'checkout <id|--clear> [--preview] | compact [id] [--full] | status | log | commit | drop | tasks'
+        hint: 'tasks [--all|--status <state>] | close|archive|reopen <id> | checkout <id|--clear> [--preview] | compact [id] [--full] | status | inspect | doctor | log | commit | drop'
       },
       async handler({ rawInput, agent }) {
         const tokens = String(rawInput ?? '')
@@ -744,8 +958,36 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
           .split(/\s+/)
           .filter(Boolean);
         const cliArgs = tokens.length > 0 ? tokens : ['status'];
-        if (cliArgs[0] === 'checkout') { const out=executeCairnCliCommand(workspaceRoot,cliArgs); routeStates.clear(); checkoutSnapshots.clear(); activeSnapshotTaskBySession.clear(); return {kind:out.code===0?'success':'error',text:out.text}; }
-        if (cliArgs[0] === 'compact') { const sessionId=agent?.session?.id ?? null; const taskId=resolveActiveTaskId(Number(cliArgs[1]) || null,sessionId); if(!taskId)return {kind:'error',text:'No task selected.'}; const res=await runStrictCompactor({workspaceRoot,taskId,mode:cliArgs.includes('--full')?'full':'incremental',llmClient:resolveWorkerLlmClient(sessionId)}); if(sessionId) { snapshotFor(sessionId,taskId,true); activeSnapshotTaskBySession.set(sessionId,taskId); } return {kind:res.ok?'success':'error',text:JSON.stringify(res)}; }
+        const sessionId = agent?.session?.id ?? null;
+        if (cliArgs[0] === 'checkout') {
+          const out = executeCairnCliCommand(workspaceRoot, cliArgs);
+          if (out.code === 0) {
+            routeStates.clear();
+            checkoutSnapshots.clear();
+            activeSnapshotTaskBySession.clear();
+            if (sessionId && cliArgs[1] && cliArgs[1] !== '--clear' && !cliArgs.includes('--preview')) {
+              sessionBindingSources.set(sessionId, { taskId: Number(cliArgs[1]), source: 'slash_checkout' });
+            } else if (sessionId) sessionBindingSources.delete(sessionId);
+          }
+          return { kind: out.code === 0 ? 'success' : 'error', text: out.text };
+        }
+        if (cliArgs[0] === 'compact') {
+          const explicitId = cliArgs[1] && !cliArgs[1].startsWith('--') ? Number(cliArgs[1]) : null;
+          const taskId = explicitId ?? resolveActiveTaskId(null, sessionId);
+          if (!taskId) return { kind: 'error', text: 'No active task selected.' };
+          const result = await runManualCompaction(taskId, sessionId, cliArgs.includes('--full') ? 'full' : 'incremental');
+          return { kind: result.ok ? 'success' : 'error', text: JSON.stringify(result) };
+        }
+        if (['close', 'archive', 'reopen'].includes(cliArgs[0])) {
+          const action = cliArgs[0];
+          const id = Number(cliArgs[1]);
+          const out = executeCairnCliCommand(workspaceRoot, cliArgs);
+          if (out.code === 0 && action !== 'reopen') clearTaskRuntime(id);
+          return { kind: out.code === 0 ? 'success' : 'error', text: out.text };
+        }
+        if (cliArgs[0] === 'inspect') {
+          return { kind: 'success', text: JSON.stringify(runtimeSnapshot(sessionId), null, 2) };
+        }
         const { code, text } = executeCairnCliCommand(workspaceRoot, cliArgs);
         return code === 0
           ? { kind: 'success', text }
@@ -761,6 +1003,7 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
     getLastObservedRoute: () => lastObservedRoute,
     async dispose() {
       await accumulator.flushPendingJobs();
+      await compactionCoordinator.flush();
       for (const dispose of disposers) {
         try {
           dispose();
@@ -768,7 +1011,7 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
           // Ignore individual teardown errors
         }
       }
-      checkoutSnapshots.clear(); routeStates.clear(); activeSnapshotTaskBySession.clear(); routesBySession.clear();
+      checkoutSnapshots.clear(); routeStates.clear(); activeSnapshotTaskBySession.clear(); routesBySession.clear(); sessionBindingSources.clear();
     }
   });
 }

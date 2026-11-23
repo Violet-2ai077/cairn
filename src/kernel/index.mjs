@@ -38,6 +38,7 @@ export {
   dropStaged,
   readTasksIndex,
   upsertTask,
+  transitionTaskStatus,
   appendTaskTurn,
   readTaskThread,
   writeTaskCompaction,

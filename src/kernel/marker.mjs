@@ -135,14 +135,14 @@ export function stripTaskMarker(content) {
  * Compiles a deterministic, read-only 1-line-per-task catalog header from confirmed tasks
  * to amortize the long-gap online CoT re-scan tax identified in TC3-B.
  *
- * @param {Array<{ id: string | number, title: string, birth_turn?: number }>} tasks
+ * @param {Array<{ id: string | number, title: string, birth_turn?: number, status?: string }>} tasks
  * @returns {string}
  */
 export function buildLightTaskCatalog(tasks = []) {
   if (!Array.isArray(tasks) || tasks.length === 0) {
     return '';
   }
-  const lines = tasks.map(t => {
+  const lines = tasks.filter(t => (t?.status ?? 'active') === 'active').map(t => {
     const id = String(t.id).trim();
     const title = String(t.title ?? '').trim();
     const birthSuffix =

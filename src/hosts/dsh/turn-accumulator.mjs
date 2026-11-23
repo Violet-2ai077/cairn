@@ -9,15 +9,16 @@ import {
   isCairnInitialized,
   initCairnStore,
   readTasksIndex,
+  readTaskThread,
   parseTaskMarker,
   appendTaskTurn
 } from '../../kernel/index.mjs';
 import {
   runStagingExtractor,
-  runStrictCompactor
 } from '../../workers/index.mjs';
+import { distillTaskThread } from '../../workers/distill.mjs';
 
-const SYNTHETIC_USER_SOURCES = new Set(['runtime-context', 'compact-checkpoint']);
+const SYNTHETIC_USER_SOURCES = new Set(['runtime-context', 'compact-checkpoint', 'agent-instructions']);
 
 export function extractTextFromDshMessage(message) {
   if (!message) return '';
@@ -31,6 +32,13 @@ export function extractTextFromDshMessage(message) {
       .join('\n');
   }
   return '';
+}
+
+function stripTrailingDshSystemReminders(text) {
+  let cleaned = String(text ?? '').trimEnd();
+  const reminder = /(?:\r?\n){0,2}<system-reminder>\s*[\s\S]*?<\/system-reminder>\s*$/iu;
+  while (reminder.test(cleaned)) cleaned = cleaned.replace(reminder, '').trimEnd();
+  return cleaned.trim();
 }
 
 function summarizeToolTarget(name, rawArgs) {
@@ -58,13 +66,19 @@ export function createTurnAccumulator({
   workspaceRoot = process.cwd(),
   actorId = 'dsh-host',
   getLlmClient,
-  autoCompactEveryTurns = 0,
+  autoCompactMinRecords = 0,
+  autoCompactMinChars = 0,
+  maxTailChars = 6000,
+  compactionCoordinator = null,
+  canAutoCompact = null,
   resolveBoundTaskId = null,
   onWorkerLog = null
 } = {}) {
   const turnStateBySession = new Map();
   const lastTaskIdBySession = new Map();
+  const bindingSourceBySession = new Map();
   const stashedMarkersBySession = new Map();
+  const queuedAutoCompactions = new Set();
 
   let workspaceSerialQueue = Promise.resolve();
   const pendingJobs = new Set();
@@ -166,7 +180,7 @@ export function createTurnAccumulator({
       if (SYNTHETIC_USER_SOURCES.has(sourceKind)) {
         return;
       }
-      const text = extractTextFromDshMessage(msg).trim();
+      const text = stripTrailingDshSystemReminders(extractTextFromDshMessage(msg));
       if (!text) return;
       const current = turnStateBySession.get(sessionId) ?? ensureTurnState(sessionId, event.data?.turn ?? 1);
       current.userTexts.push(text);
@@ -241,6 +255,7 @@ export function createTurnAccumulator({
         current.lastMarkedDisplayAssistantText = parsed.display_text;
         if (!parsed.is_unresolved && typeof parsed.task_number === 'number') {
           lastTaskIdBySession.set(sessionId, parsed.task_number);
+          if (!bindingSourceBySession.has(sessionId)) bindingSourceBySession.set(sessionId, 'task_marker');
         }
       }
       return;
@@ -320,6 +335,16 @@ export function createTurnAccumulator({
       }
 
       if (resolvedTaskId !== null) {
+        const taskIndex = readTasksIndex(workspaceRoot);
+        const trackedTask = taskIndex.tasks.find(task => task.id === resolvedTaskId);
+        if (trackedTask && trackedTask.status !== 'active') {
+          logSafe({ level: 'info', job: 'task-archive-skipped', task_id: resolvedTaskId, reason: 'task_not_active' });
+          resolvedTaskId = null;
+          attribution = null;
+        }
+      }
+
+      if (resolvedTaskId !== null) {
         if (parsedMarker?.valid) lastTaskIdBySession.set(sessionId, resolvedTaskId);
         if (userCombined) {
           appendTaskTurn(workspaceRoot, {
@@ -342,31 +367,64 @@ export function createTurnAccumulator({
           }
         });
 
-        // Optional out-of-band incremental task compaction when threshold is reached
-        if (
-          typeof autoCompactEveryTurns === 'number' &&
-          autoCompactEveryTurns > 0 &&
-          appended.task.turn_count - (appended.task.compacted_record_count ?? 0) >=
-            autoCompactEveryTurns
-        ) {
-          const client = typeof getLlmClient === 'function' ? getLlmClient() : null;
-          if (client) {
-            enqueueWorkspaceJob(`strict-compactor:task_${resolvedTaskId}:turn_${turnNum}`, async () => {
-              const res = await runStrictCompactor({
-                workspaceRoot,
-                taskId: resolvedTaskId,
-                mode: 'incremental',
-                llmClient: client
-              });
-              logSafe({ level: 'info', job: 'strict-compactor', task_id: resolvedTaskId, result: res });
-              return res;
-            });
+        if (parsedMarker?.valid && !parsedMarker.is_unresolved && typeof parsedMarker.task_number === 'number') {
+          bindingSourceBySession.set(sessionId, 'task_marker');
+        }
+
+        const thresholdsEnabled = autoCompactMinRecords > 0 || autoCompactMinChars > 0;
+        if (thresholdsEnabled && appended.task.status === 'active' && compactionCoordinator) {
+          const currentIndex = readTasksIndex(workspaceRoot);
+          const currentTask = currentIndex.tasks.find(task => task.id === resolvedTaskId);
+          if (currentTask?.status === 'active') {
+            const records = readTaskThread(workspaceRoot, resolvedTaskId);
+            const cursor = Math.min(Math.max(0, currentTask.compacted_record_count ?? 0), records.length);
+            const tailRecords = records.slice(cursor);
+            const tailChars = distillTaskThread(tailRecords, {
+              maxThreadChars: Number.MAX_SAFE_INTEGER,
+              maxPerRecordChars: Number.MAX_SAFE_INTEGER,
+              maxCodeBlockChars: Number.MAX_SAFE_INTEGER,
+              maxPerToolChars: Number.MAX_SAFE_INTEGER
+            }).distilled_text.length;
+            const reached = (autoCompactMinRecords > 0 && tailRecords.length >= autoCompactMinRecords) ||
+              (autoCompactMinChars > 0 && tailChars >= autoCompactMinChars);
+            if (reached) {
+              if (typeof canAutoCompact === 'function' && !canAutoCompact(sessionId)) {
+                compactionCoordinator.recordSkipped(resolvedTaskId, 'llm_route_unavailable');
+              } else {
+                const autoState = compactionCoordinator.getTaskStatus(resolvedTaskId);
+                const pendingKey = String(resolvedTaskId);
+                if (!(autoState.status === 'cooldown' && autoState.cooldown_until > Date.now()) &&
+                    !queuedAutoCompactions.has(pendingKey)) {
+                  const client = typeof getLlmClient === 'function' ? getLlmClient(sessionId) : null;
+                  if (!client) {
+                    compactionCoordinator.recordSkipped(resolvedTaskId, 'llm_route_unavailable');
+                  } else {
+                    queuedAutoCompactions.add(pendingKey);
+                    compactionCoordinator.recordQueued(resolvedTaskId);
+                    enqueueWorkspaceJob(`strict-compactor:task_${resolvedTaskId}:turn_${turnNum}`, async () => {
+                      try {
+                        const res = await compactionCoordinator.run({
+                          taskId: resolvedTaskId,
+                          mode: 'incremental',
+                          source: 'auto',
+                          llmClient: client
+                        });
+                        logSafe({ level: 'info', job: 'strict-compactor', task_id: resolvedTaskId, result: res });
+                        return res;
+                      } finally {
+                        queuedAutoCompactions.delete(pendingKey);
+                      }
+                    });
+                  }
+                }
+              }
+            }
           }
         }
       }
 
       // 2. Out-of-band Asynchronous Staging Operator Extraction (fire-and-forget on serial queue)
-      const client = typeof getLlmClient === 'function' ? getLlmClient() : null;
+      const client = typeof getLlmClient === 'function' ? getLlmClient(sessionId) : null;
       if (client) {
         const turnInput = {
           turn: turnNum,
@@ -397,20 +455,23 @@ export function createTurnAccumulator({
     if (!sessionId) return;
     turnStateBySession.delete(sessionId);
     lastTaskIdBySession.delete(sessionId);
+    bindingSourceBySession.delete(sessionId);
     stashedMarkersBySession.delete(sessionId);
   }
 
   function getLastTaskId(sessionOrId, { allowFallback = true } = {}) {
     const sessionId =
       typeof sessionOrId === 'string' ? sessionOrId : String(sessionOrId?.id ?? '');
+    const isActive = id => readTasksIndex(workspaceRoot).tasks.some(task => task.id === id && task.status === 'active');
     if (sessionId && lastTaskIdBySession.has(sessionId)) {
-      return lastTaskIdBySession.get(sessionId);
+      const id = lastTaskIdBySession.get(sessionId);
+      return isActive(id) ? id : null;
     }
     if (!allowFallback) return null;
     // Fallback to the most recently recorded session's task id in single-agent mode
     let fallback = null;
     for (const val of lastTaskIdBySession.values()) {
-      fallback = val;
+      if (isActive(val)) fallback = val;
     }
     return fallback;
   }
@@ -421,12 +482,34 @@ export function createTurnAccumulator({
     }
   }
 
+  function clearTaskBindings(taskId) {
+    const clearedSessions = [];
+    for (const [sessionId, boundTaskId] of lastTaskIdBySession) {
+      if (boundTaskId === taskId) {
+        lastTaskIdBySession.delete(sessionId);
+        bindingSourceBySession.delete(sessionId);
+        clearedSessions.push(sessionId);
+      }
+    }
+    for (const [sessionId, state] of turnStateBySession) {
+      if (state.lastValidParsedMarker?.task_number === taskId) {
+        state.lastValidParsedMarker = null;
+        state.lastMarkedRawAssistantText = null;
+        state.lastMarkedDisplayAssistantText = null;
+        clearedSessions.push(sessionId);
+      }
+    }
+    return [...new Set(clearedSessions)];
+  }
+
   return Object.freeze({
     observeSessionEvent,
     stashStreamMarker,
     consumeStashedMarker,
     disposeSession,
     getLastTaskId,
+    clearTaskBindings,
+    getBindingSource: sessionId => bindingSourceBySession.get(sessionId) ?? null,
     flushPendingJobs,
     _internal: {
       turnStateBySession,

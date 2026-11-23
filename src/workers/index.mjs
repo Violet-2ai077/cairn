@@ -30,3 +30,7 @@ export {
 } from './cold-router.mjs';
 
 export { compileTaskCheckout } from './task-checkout.mjs';
+
+export { runWorkspaceDoctor } from './doctor.mjs';
+
+export { createTaskCompactionCoordinator } from './task-compaction-coordinator.mjs';

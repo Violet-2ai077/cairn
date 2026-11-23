@@ -95,6 +95,57 @@ describe('Cairn Milestone 1 Slice 1: .cairn/ Store Persistence & Replay Engine (
     });
   });
 
+  test('CLI lifecycle transitions filter active tasks and freeze non-active checkout, writes, and compaction', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-lifecycle-cli-'));
+    try {
+      appendTaskTurn(tmpDir, { task_id: 1, turn: 1, role: 'user', content: 'Task one' });
+      appendTaskTurn(tmpDir, { task_id: 2, turn: 1, role: 'user', content: 'Task two' });
+      upsertTask(tmpDir, { work_anchor_task_id: 1 });
+      const callCli = args => {
+        const out = [];
+        const err = [];
+        const code = runCairnCli([...args, '--cwd', tmpDir], {
+          cwd: tmpDir,
+          stdout: line => out.push(line),
+          stderr: line => err.push(line)
+        });
+        return { code, stdout: out.join('\n'), stderr: err.join('\n') };
+      };
+
+      assert.equal(callCli(['close', '1']).code, 0);
+      assert.equal(readTasksIndex(tmpDir).tasks.find(task => task.id === 1).status, 'done');
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, null);
+      assert.throws(() => appendTaskTurn(tmpDir, { task_id: 1, role: 'assistant', content: 'must not write' }), /task_not_active/);
+      assert.equal(readTaskThread(tmpDir, 1).length, 1);
+
+      const active = callCli(['tasks']);
+      assert.match(active.stdout, /task:2/);
+      assert.doesNotMatch(active.stdout, /task:1/);
+      assert.match(callCli(['tasks', '--status', 'done']).stdout, /task:1/);
+      assert.match(callCli(['tasks', '--all']).stdout, /task:1[\s\S]*task:2/);
+      assert.equal(callCli(['tasks', '--all', '--status', 'done']).code, 1);
+
+      assert.equal(callCli(['checkout', '1', '--preview']).code, 0);
+      assert.equal(callCli(['checkout', '1']).code, 1);
+      assert.match(callCli(['archive', '1']).stdout, /done -> archived/);
+      const compactCalls = [];
+      assert.equal(await runCairnCliAsync(['compact', '1'], {
+        cwd: tmpDir,
+        stdout() {},
+        stderr: message => compactCalls.push(message),
+        llmClient: { async complete() { throw new Error('must not invoke'); } }
+      }), 1);
+      assert.match(compactCalls[0], /task_not_active/);
+
+      assert.match(callCli(['reopen', '1']).stdout, /archived -> active/);
+      assert.equal(callCli(['checkout', '1']).code, 0);
+      assert.equal(readTasksIndex(tmpDir).work_anchor_task_id, 1);
+      assert.equal(callCli(['archive', '2']).code, 1, 'active tasks must close before archive');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test('idempotently initializes .cairn/ layout and preserves monotonic next_proposal_seq across drop and commit', () => {
     withTempWorkspace(tmpDir => {
       const init1 = initCairnStore(tmpDir);

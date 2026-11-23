@@ -26,7 +26,9 @@ export function buildSanitizedTaskCards(
   tasks = [],
   { includePreview = true, maxPreviewChars = 200 } = {}
 ) {
-  const sorted = [...tasks].sort((a, b) => normalizeTaskId(a.id) - normalizeTaskId(b.id));
+  const sorted = tasks
+    .filter(task => (task?.status ?? 'active') === 'active')
+    .sort((a, b) => normalizeTaskId(a.id) - normalizeTaskId(b.id));
   return sorted.map(t => {
     const id = normalizeTaskId(t.id);
     const card = {
@@ -114,7 +116,8 @@ export async function runColdRouter({
   }
 
   const tasksIndex = readTasksIndex(workspaceRoot);
-  if (tasksIndex.tasks.length === 0) {
+  const activeTasks = tasksIndex.tasks.filter(task => task.status === 'active');
+  if (activeTasks.length === 0) {
     return {
       ok: true,
       decision: 'new',
@@ -125,7 +128,7 @@ export async function runColdRouter({
     };
   }
 
-  const sanitizedCards = buildSanitizedTaskCards(workspaceRoot, tasksIndex.tasks, {
+  const sanitizedCards = buildSanitizedTaskCards(workspaceRoot, activeTasks, {
     includePreview: includeCompactPreview
   });
   const systemPrompt = buildColdRouterPrompt(sanitizedCards);
@@ -200,7 +203,7 @@ export async function runColdRouter({
     };
   }
 
-  const validIdSet = new Set(tasksIndex.tasks.map(t => t.id));
+  const validIdSet = new Set(activeTasks.map(t => t.id));
   const reason = typeof parsed.reason === 'string' ? parsed.reason.trim() : '';
 
   if (decision === 'match') {
@@ -217,7 +220,7 @@ export async function runColdRouter({
         reason: null,
         llm_called: true,
         error_code: 'invalid_routed_task_id',
-        error: `Routed task_id ${String(parsed.task_id)} does not exist in tasks/index.json`,
+        error: `Routed task_id ${String(parsed.task_id)} is not an active task in tasks/index.json`,
         raw_output: llmRes.content
       };
     }

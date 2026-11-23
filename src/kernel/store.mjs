@@ -692,6 +692,9 @@ export function upsertTask(
 
     const existingIdx = index.tasks.findIndex(t => t.id === taskId);
     if (existingIdx === -1) {
+      if (status !== undefined && status !== 'active') {
+        throw new Error('new_task_status_must_be_active');
+      }
       targetTask = {
         id: taskId,
         title: typeof title === 'string' && title.trim() ? title.trim() : `Task ${taskId}`,
@@ -705,6 +708,9 @@ export function upsertTask(
       index.tasks.push(targetTask);
     } else {
       const prev = index.tasks[existingIdx];
+      if (status !== undefined && status !== prev.status) {
+        throw new Error('task_status_requires_transition_api');
+      }
       targetTask = {
         ...prev,
         title: typeof title === 'string' && title.trim() ? title.trim() : prev.title,
@@ -726,6 +732,44 @@ export function upsertTask(
   writeJsonAtomic(paths.tasksIndexFile, index);
   return {
     task: targetTask,
+    index
+  };
+}
+
+export function transitionTaskStatus(
+  workspaceRoot = process.cwd(),
+  { taskId, action, updatedAt } = {}
+) {
+  const id = normalizeTaskId(taskId);
+  const paths = resolveCairnPaths(workspaceRoot);
+  const index = readTasksIndex(workspaceRoot);
+  const taskIndex = index.tasks.findIndex(task => task.id === id);
+  if (taskIndex === -1) throw new Error(`task_not_found:${id}`);
+
+  const task = index.tasks[taskIndex];
+  const previousStatus = task.status ?? 'active';
+  const transitions = {
+    close: { from: ['active'], to: 'done' },
+    archive: { from: ['done'], to: 'archived' },
+    reopen: { from: ['done', 'archived'], to: 'active' }
+  };
+  const transition = transitions[action];
+  if (!transition) throw new Error(`invalid_task_lifecycle_action:${String(action)}`);
+  if (!transition.from.includes(previousStatus)) {
+    throw new Error(`invalid_task_transition:${previousStatus}:${action}`);
+  }
+
+  const now = updatedAt ?? new Date().toISOString();
+  const nextTask = { ...task, status: transition.to, updated_at: now };
+  index.tasks[taskIndex] = nextTask;
+  const anchorCleared = transition.to !== 'active' && index.work_anchor_task_id === id;
+  if (anchorCleared) index.work_anchor_task_id = null;
+  writeJsonAtomic(paths.tasksIndexFile, index);
+  return {
+    task: nextTask,
+    previous_status: previousStatus,
+    status: transition.to,
+    anchor_cleared: anchorCleared,
     index
   };
 }
@@ -759,6 +803,11 @@ export function appendTaskTurn(
   const paths = resolveCairnPaths(workspaceRoot);
   const taskDir = paths.taskDir(taskId);
   const threadFile = paths.taskThreadFile(taskId);
+  const index = readTasksIndex(workspaceRoot);
+  const existingIdx = index.tasks.findIndex(t => t.id === taskId);
+  if (existingIdx !== -1 && index.tasks[existingIdx].status !== 'active') {
+    throw new Error(`task_not_active:${taskId}:${index.tasks[existingIdx].status}`);
+  }
   fs.mkdirSync(taskDir, { recursive: true });
 
   const existingRecords = readTaskThread(workspaceRoot, taskId);
@@ -778,8 +827,6 @@ export function appendTaskTurn(
 
   fs.appendFileSync(threadFile, `${JSON.stringify(record)}\n`, 'utf8');
 
-  const index = readTasksIndex(workspaceRoot);
-  const existingIdx = index.tasks.findIndex(t => t.id === taskId);
   const hasCompactFile = fs.existsSync(paths.taskCompactFile(taskId));
 
   let taskEntry;

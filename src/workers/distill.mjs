@@ -178,7 +178,8 @@ export function distillTaskThread(
   {
     maxThreadChars = 12000,
     maxPerRecordChars = 1500,
-    maxCodeBlockChars = 300
+    maxCodeBlockChars = 300,
+    maxPerToolChars = 350
   } = {}
 ) {
   if (!Array.isArray(threadRecords) || threadRecords.length === 0) {
@@ -207,7 +208,7 @@ export function distillTaskThread(
     const metaTools = Array.isArray(rec.meta?.tools) ? rec.meta.tools : [];
     if (metaTools.length > 0) {
       const toolText = metaTools
-        .map(t => distillToolEvent(t, { maxPerToolChars: 350 }))
+        .map(t => distillToolEvent(t, { maxPerToolChars }))
         .join('\n');
       body = `${body}\n${toolText}`.trim();
     }
