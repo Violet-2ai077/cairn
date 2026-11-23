@@ -29,6 +29,7 @@ import {
 } from '../../workers/index.mjs';
 import { runCairnCli } from '../../../bin/cairn.mjs';
 import { createTurnAccumulator } from './turn-accumulator.mjs';
+import { createHubDshHost } from './hub-host.mjs';
 
 export const name = 'cairn-dsh-host';
 
@@ -1023,6 +1024,10 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
  * disposer function; programmatic callers/tests that need the handle use `createCairnDshHost`.
  */
 export async function apply(ctx, rawConfig = {}) {
+  if (rawConfig.workspaceRoot === undefined || rawConfig.hubMode === true) {
+    const host = await createHubDshHost(ctx, rawConfig);
+    return () => host.dispose();
+  }
   const host = await createCairnDshHost(ctx, rawConfig);
   return () => host.dispose();
 }

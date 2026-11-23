@@ -24,6 +24,14 @@ Cairn solves this by modeling agent memory after Git's staging and commit lifecy
 
 ## 2. The `.cairn/` On-Disk Model
 
+### M4.1 centralized Hub mode
+
+The dsh host uses the hidden centralized Hub when `workspaceRoot` is omitted. Storage is resolved as explicit `storeRoot` > `$DSH_HOME/cairn` > `~/.cairn`; business repositories never receive a `.cairn/` directory. The Hub layout is `user/ledger/`, `projects/index.json`, `projects/<project_id>/ledger/`, global `tasks/index.json`, `tasks/<id>/`, and hashed per-session bindings under `sessions/`. The CLI defaults to the same Hub; `--store <path>` overrides it, while explicit `--cwd <dir>` remains the compatibility path for workspace-local M1-M3 stores.
+
+Project hints are found by read-only upward `.git` traversal. The deterministic project identity is registered only by the first actual task or ledger write. A cold Turn 1 context contains only the stable User Ledger and global active task catalog; after `agent/pre-step` locks a project, the same turn's later context evaluation may include that project's ledger and selected task checkout. Project-specific decisions override generic User defaults within their project; both authoritative ledgers and their tombstones override task-local history.
+
+User- and project-scoped ledgers have independent revision/ID sequences and staged queues. A `general` session stages only to User scope and uses the strict cross-project preference extraction boundary. CLI checkout preview is read-only; persisting a binding requires `--session <id>`. Session bindings are never global anchors.
+
 Every workspace managed by Cairn stores its state in a human-inspectable, plain-text `.cairn/` directory:
 
 ```text

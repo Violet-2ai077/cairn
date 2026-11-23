@@ -9,18 +9,51 @@ export {
   projectReadOnlyLedger
 } from './ledger.mjs';
 
+export { foldScopedLedger } from './scoped-ledger.mjs';
+
 export {
   parseTaskMarker,
   stripTaskMarker,
-  buildLightTaskCatalog
+  buildLightTaskCatalog,
+  buildHubTaskCatalog
 } from './marker.mjs';
 
 export {
   buildAntiRecencyContract,
   buildStagingExtractorPrompt,
   buildStrictCompactorPrompt,
-  buildAuthorityCheckoutContract
+  buildAuthorityCheckoutContract,
+  buildScopedAuthorityContract,
+  buildScopedStagingExtractorPrompt
 } from './contracts.mjs';
+
+export {
+  resolveHubPaths,
+  isHubInitialized,
+  initHubStore,
+  readProjectsIndex,
+  registerProject,
+  ensureScopedLedger,
+  readScopedHead,
+  readScopedLedgerLog,
+  readScopedStaged,
+  stageScopedOperators,
+  commitScopedStaged,
+  dropScopedStaged,
+  replayScopedLedger,
+  readHubTasksIndex,
+  upsertHubTask,
+  appendHubTaskTurn,
+  readHubTaskThread,
+  readHubTaskCompaction,
+  writeHubTaskCompaction,
+  readSessionBinding,
+  writeSessionBinding,
+  clearSessionBinding,
+  transitionHubTaskStatus,
+  normalizeProjectId,
+  validateLedgerScope
+} from './hub-store.mjs';
 
 export {
   writeTextAtomic,

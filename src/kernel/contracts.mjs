@@ -108,3 +108,35 @@ export function buildAuthorityCheckoutContract(ledgerSnapshot = null) {
 
   return `${contract}\n\n### 当前权威工作区状态账本（workspace_ledger）\n${JSON.stringify(ledgerSnapshot, null, 2)}`;
 }
+
+export function buildScopedAuthorityContract({ userLedgerSnapshot = null, projectLedgerSnapshot = null, projectName = '' } = {}) {
+  const projectLabel = projectName ? `“${String(projectName).replace(/[<>]/gu, '')}”项目` : '当前项目';
+  const text = `### User / Project / Task 分层权威契约
+1. User Ledger 记录跨项目通用默认偏好；Project Ledger 记录明确限定在${projectLabel}内的决策与墓碑。发生冲突时，Project Ledger 中明确的项目决策优先于通用 User 默认偏好，但不得将该项目决策推广到其他项目。
+2. User Ledger 与当前 Project Ledger 均为宿主权威账本；其 active 决策和 tombstones 共同高于并覆盖 Task compact.md 与任务 transcript 中的旧局部描述。不得从局部历史复活被任一适用账本 tombstone 否定的方案。
+3. 当当前会话尚未完成 pre-step 路由且没有显式项目绑定时，不存在可用的 Project Ledger；不得将 cwd hint 当成已选项目，不得猜测或注入其账本。
+4. cwd 项目仅为软路由信号。只有显式绑定、有效任务匹配，或已完成路由后的 new+cwd hint 才能形成当前项目锁定。
+
+### User Ledger
+${userLedgerSnapshot ? JSON.stringify(userLedgerSnapshot, null, 2) : '(none)'}
+
+### Current Project Ledger
+${projectLedgerSnapshot ? JSON.stringify(projectLedgerSnapshot, null, 2) : '(none; no project is locked)'}`;
+  return text;
+}
+
+export function buildScopedStagingExtractorPrompt(scope, readOnlyHead = null) {
+  if (scope !== 'user' && scope !== 'project') throw new Error('invalid_scope');
+  const userOnly = scope === 'user'
+    ? `
+### User-scope extraction boundary
+只抽取用户明确确立的跨项目默认偏好或通用工作约束。任何项目专属工具、架构、部署、目录或实现决策均不得进入 User Ledger；不得猜测项目归属，含混时输出 {"ops":[]}。算子 scope 必须为 "user"。`
+    : `
+### Project-scope extraction boundary
+只抽取当前已锁定项目内明确确立的决策。不得抽取跨项目用户偏好；算子 scope 必须为 "project"，project_id 由宿主固定，模型不得生成或修改。`;
+  const base = buildStagingExtractorPrompt(readOnlyHead)
+    .replaceAll('工作区级状态变更', `${scope === 'user' ? 'User Ledger 跨项目偏好' : '当前 Project Ledger 项目内决策'}变更`)
+    .replaceAll('"scope":"global"', `"scope":"${scope}"`)
+    .replaceAll('scope: "global"', `scope: "${scope}"`);
+  return `${base}${userOnly}`;
+}

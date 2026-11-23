@@ -20,6 +20,16 @@ import {
   transitionTaskStatus
 } from '../src/kernel/index.mjs';
 import { compileTaskCheckout, runStrictCompactor, createOpenAICompatibleClient, runWorkspaceDoctor } from '../src/workers/index.mjs';
+import { resolveStoreRoot } from '../src/workers/store-root.mjs';
+import { compileHubTaskCheckout } from '../src/workers/hub-task-checkout.mjs';
+import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
+import { runHubStrictCompactor } from '../src/workers/hub-strict-compactor.mjs';
+import {
+  initHubStore, isHubInitialized, readHubTasksIndex, readProjectsIndex,
+  readScopedHead, readScopedLedgerLog, readScopedStaged, commitScopedStaged,
+  dropScopedStaged, readSessionBinding, writeSessionBinding, clearSessionBinding,
+  transitionHubTaskStatus
+} from '../src/kernel/index.mjs';
 
 function printUsage(writeOut) {
   writeOut(
@@ -37,6 +47,7 @@ function printUsage(writeOut) {
       '  cairn doctor [--cwd <dir>] [--json]'
       ,'  cairn checkout <id|--clear> [--preview] [--cwd <dir>]'
       ,'  cairn compact <id> [--full] [--cwd <dir>]'
+      ,'  Hub default: $DSH_HOME/cairn or ~/.cairn; use --store <path> to override. --cwd selects legacy workspace storage.'
     ].join('\n')
   );
 }
@@ -56,6 +67,10 @@ export function runCairnCli(
       allowPositionals: true,
       options: {
         cwd: { type: 'string' },
+        store: { type: 'string' },
+        session: { type: 'string' },
+        scope: { type: 'string' },
+        project: { type: 'string' },
         json: { type: 'boolean', default: false },
         rebase: { type: 'boolean', default: false },
         actor: { type: 'string' },
@@ -78,6 +93,11 @@ export function runCairnCli(
   const targetArg = positionals[1] ?? null;
   const workspaceRoot = path.resolve(values.cwd ? path.resolve(cwd, values.cwd) : cwd);
   const asJson = Boolean(values.json);
+
+  const useHubStore = values.store !== undefined || (values.cwd === undefined && path.resolve(cwd) === path.resolve(process.cwd()));
+  if (useHubStore) {
+    return runHubCli(subcommand, targetArg, positionals, values, { stdout, stderr, asJson });
+  }
 
   if (values.help || !subcommand) {
     printUsage(stdout);
@@ -337,7 +357,83 @@ function formatDoctorReport(report) {
   return lines.join('\n');
 }
 
+function runHubCli(command, targetArg, positionals, values, { stdout, stderr, asJson }) {
+  const hubRoot = resolveStoreRoot({ storeRoot: values.store });
+  const scope = values.scope ?? (values.project ? 'project' : 'user');
+  const projectId = values.project ?? null;
+  const emit = value => stdout(asJson ? JSON.stringify(value, null, 2) : String(value));
+  try {
+    if (command === 'init') { emit(initHubStore(hubRoot)); return 0; }
+    if (command === 'doctor') {
+      const report = runHubDoctor({ hubRoot });
+      emit(report);
+      return report.ok ? 0 : 1;
+    }
+    if (!isHubInitialized(hubRoot)) { stderr(`Cairn Hub not initialized at ${hubRoot}; run 'cairn init --store <path>' first.`); return 1; }
+    if (command === 'tasks') {
+      if (values.all && values.status) throw new Error('Use either --all or --status, not both.');
+      const filter = values.all ? null : values.status ?? 'active';
+      if (filter && !['active', 'done', 'archived'].includes(filter)) throw new Error(`Invalid task status: ${filter}`);
+      const index = readHubTasksIndex(hubRoot);
+      const tasks = filter ? index.tasks.filter(task => task.status === filter) : index.tasks;
+      emit({ ...index, tasks, filter: filter ?? 'all' }); return 0;
+    }
+    if (['close', 'archive', 'reopen'].includes(command)) {
+      const id = Number(targetArg);
+      if (!Number.isSafeInteger(id) || id < 1 || positionals.length !== 2) throw new Error(`Use ${command} <id>`);
+      emit(transitionHubTaskStatus(hubRoot, { taskId: id, action: command })); return 0;
+    }
+    if (command === 'status') {
+      const head = readScopedHead(hubRoot, { scope, projectId });
+      const staged = readScopedStaged(hubRoot, { scope, projectId });
+      emit({ scope, project_id: scope === 'project' ? projectId : null, head, staged }); return 0;
+    }
+    if (command === 'log') { emit(readScopedLedgerLog(hubRoot, { scope, projectId })); return 0; }
+    if (command === 'commit') {
+      const result = commitScopedStaged(hubRoot, { scope, projectId, proposal_id: targetArg, rebase: values.rebase, actor_id: values.actor });
+      emit(result); return result.conflict || result.all_rejected ? 1 : 0;
+    }
+    if (command === 'drop') { emit(dropScopedStaged(hubRoot, { scope, projectId, proposal_id: targetArg })); return 0; }
+    if (command === 'checkout') {
+      const sessionId = values.session;
+      if (targetArg === '--clear' || values.clear) {
+        if (!sessionId) throw new Error('checkout --clear requires --session <id>');
+        const cleared = clearSessionBinding(hubRoot, sessionId);
+        emit({ cleared, session_id: sessionId }); return 0;
+      }
+      const taskId = Number(targetArg);
+      if (!Number.isSafeInteger(taskId) || taskId < 1) throw new Error('Use checkout <id|--clear> [--preview]');
+      const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === taskId);
+      if (!task) throw new Error(`Task not found: ${taskId}`);
+      const checkout = compileHubTaskCheckout({ hubRoot, taskId });
+      if (values.preview) { emit(checkout); return 0; }
+      if (!sessionId) throw new Error('checkout binding requires --session <id>; use --preview for read-only output');
+      if (task.status !== 'active') throw new Error(`task_not_active:${taskId}:${task.status}; run 'cairn reopen ${taskId}' first`);
+      const binding = writeSessionBinding(hubRoot, sessionId, { project_id: task.project_id, task_id: taskId, source: 'cli_checkout' });
+      emit({ binding, checkout }); return 0;
+    }
+    if (command === 'compact') throw new Error('Hub compaction runner is not wired in this build.');
+    throw new Error(`Unsupported Hub command: ${command}`);
+  } catch (error) { stderr(`Cairn Hub CLI error: ${error.message}`); return 1; }
+}
+
 export async function runCairnCliAsync(argv = process.argv.slice(2), io = {}) {
+  const ioCwd = io.cwd ?? process.cwd();
+  if (argv[0] === 'compact' && (argv.includes('--store') || (!argv.includes('--cwd') && path.resolve(ioCwd) === path.resolve(process.cwd())))) {
+    const { stdout = msg => process.stdout.write(`${msg}\n`), stderr = msg => process.stderr.write(`${msg}\n`), llmClient = createOpenAICompatibleClient() } = io;
+    try {
+      const parsed = parseArgs({ args: argv.slice(1), allowPositionals: true, options: { store: { type: 'string' }, full: { type: 'boolean', default: false }, json: { type: 'boolean', default: false }, cwd: { type: 'string' } } });
+      const id = Number(parsed.positionals[0]);
+      if (!Number.isSafeInteger(id) || id < 1 || parsed.positionals.length !== 1 || (argv.includes('--store') && !parsed.values.store)) throw new Error('Use compact <id> [--full] [--store <path>]');
+      const hubRoot = resolveStoreRoot({ storeRoot: parsed.values.store });
+      const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === id);
+      if (!task) throw new Error(`Task not found: ${id}`);
+      if (task.status !== 'active') throw new Error(`task_not_active:${id}:${task.status}; run 'reopen ${id}' first`);
+      const result = await runHubStrictCompactor({ hubRoot, taskId: id, mode: parsed.values.full ? 'full' : 'incremental', llmClient });
+      stdout(JSON.stringify(result));
+      return result.ok ? 0 : 1;
+    } catch (error) { stderr(`Cairn Hub CLI error: ${error.message}`); return 1; }
+  }
   if (argv[0] !== 'compact') return runCairnCli(argv, io);
   const { stdout = msg => process.stdout.write(`${msg}\n`), stderr = msg => process.stderr.write(`${msg}\n`), cwd = process.cwd(), llmClient = createOpenAICompatibleClient() } = io;
   const args = argv.slice(1).filter((arg, index, all) => !['--full', '--json', '--cwd'].includes(arg) && (index === 0 || all[index - 1] !== '--cwd'));

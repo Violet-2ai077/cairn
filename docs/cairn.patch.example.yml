@@ -6,7 +6,9 @@
     - id: cairn
       name: 'file:///absolute/path/to/cairn/src/hosts/dsh/index.mjs'
       config:
-        workspaceRoot: '/absolute/path/to/target-workspace'
+        # Omit workspaceRoot for centralized per-session Hub mode.
+        # Defaults to $DSH_HOME/cairn, then ~/.cairn. Use storeRoot for isolated tests.
+        # storeRoot: '/absolute/path/to/cairn-hub'
         actorId: 'dsh-main'
         stripMarkerInStream: true
         useHostLlm: true

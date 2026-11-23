@@ -151,3 +151,16 @@ export function buildLightTaskCatalog(tasks = []) {
   });
   return `Read-only established task catalog (for reference only; do not echo this catalog):\n${lines.join('\n')}`;
 }
+
+export function buildHubTaskCatalog(tasks = []) {
+  if (!Array.isArray(tasks)) return '';
+  const active = tasks.filter(task => (task?.status ?? 'active') === 'active');
+  if (active.length === 0) return '';
+  const lines = active.map(task => {
+    const id = String(task.id).trim();
+    const title = String(task.title ?? '').trim();
+    const project = task.project_id ? ` [project:${String(task.project_name ?? task.project_id)}; id:${String(task.project_id)}]` : ' [general]';
+    return `- <|task:${id}|>${project}: ${title}`;
+  });
+  return `Read-only global active task catalog (reference only; do not echo):\n${lines.join('\n')}`;
+}

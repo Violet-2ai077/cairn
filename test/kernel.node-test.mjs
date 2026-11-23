@@ -9,6 +9,7 @@ import {
   parseTaskMarker,
   stripTaskMarker,
   buildLightTaskCatalog,
+  buildHubTaskCatalog,
   buildAntiRecencyContract,
   buildStagingExtractorPrompt,
   buildStrictCompactorPrompt,
@@ -297,6 +298,14 @@ describe('Cairn Kernel 2: Closed-Fence-Aware Inline Task Marker Parser (src/kern
     ]);
     assert.match(activeOnly, /Active task/);
     assert.doesNotMatch(activeOnly, /Done task|Archived task/);
+    const hubCatalog = buildHubTaskCatalog([
+      { id: 7, title: 'Project task', project_id: 'p_alpha' },
+      { id: 8, title: 'General task', project_id: null },
+      { id: 9, title: 'Closed task', status: 'done' }
+    ]);
+    assert.match(hubCatalog, /<\|task:7\|> \[project:p_alpha; id:p_alpha\]/);
+    assert.match(hubCatalog, /<\|task:8\|> \[general\]/);
+    assert.doesNotMatch(hubCatalog, /Closed task/);
   });
 });
 

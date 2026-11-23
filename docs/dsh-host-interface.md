@@ -8,6 +8,14 @@ This document records **only verified factual capabilities** of the DeepSeek Har
 
 ## 1. Plugin Loading Format & Runtime Baseline
 
+### M4.1 centralized Hub operation
+
+When `workspaceRoot` is omitted, `apply()` selects the centralized Hub adapter; explicit `workspaceRoot` retains the legacy workspace-local adapter for compatibility. `storeRoot` overrides `$DSH_HOME/cairn`, which overrides `~/.cairn`. The Hub adapter resolves `.git` roots from `session.header.cwd` as soft hints only and never writes into the business repository. `resolveGitProjectHint()` is read-only; registration occurs on a task/ledger write.
+
+The first `systemPrompt.context` evaluation in an unbound session contributes only User Ledger and the global active-task catalog. `agent/pre-step` uses the selected `modelSelection`, active task/project cards, and optional cwd hint to route; only after that state is locked does the later context provider add the selected Project Ledger and task checkout. A match can select a project different from the cwd hint. `new` selects the cwd project only when a valid Git hint exists; otherwise the session remains in `general` and project context is omitted. A general session's staging target is User scope only.
+
+User and Project ledger heads, staged proposals, replay integrity, and decision IDs are independent. A Project decision/tombstone takes precedence over a generic User default inside that project; both applicable ledgers override task-local checkout history. CLI `checkout <id> --preview --store <root>` is read-only. Persisting/clearing a CLI checkout requires `--session <id>`; dsh slash checkout is session-local. `inspect` reports a short project fingerprint and routing state only, never absolute paths, prompts, model output, or credentials.
+
 | Dimension | Verified Fact |
 | --- | --- |
 | **Target `dsh` Baseline** | `@deepseek-ai/dsh` `0.2.2-rc.5` |

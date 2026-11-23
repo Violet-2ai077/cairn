@@ -30,6 +30,13 @@ export {
 } from './cold-router.mjs';
 
 export { compileTaskCheckout } from './task-checkout.mjs';
+export { compileHubTaskCheckout } from './hub-task-checkout.mjs';
+export { buildHubColdRouterPrompt, runHubColdRouter } from './hub-cold-router.mjs';
+export { resolveStoreRoot } from './store-root.mjs';
+export { runHubDoctor } from './hub-doctor.mjs';
+export { runHubStagingExtractor } from './hub-staging-extractor.mjs';
+export { runHubStrictCompactor, createHubTaskCompactionCoordinator } from './hub-strict-compactor.mjs';
+export { createHubWriteCoordinator } from './hub-write-coordinator.mjs';
 
 export { runWorkspaceDoctor } from './doctor.mjs';
 

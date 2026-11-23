@@ -17,11 +17,21 @@
     "./kernel/marker": "./src/kernel/marker.mjs",
     "./kernel/contracts": "./src/kernel/contracts.mjs",
     "./kernel/store": "./src/kernel/store.mjs",
+    "./kernel/hub-store": "./src/kernel/hub-store.mjs",
     "./workers": "./src/workers/index.mjs",
+    "./workers/store-root": "./src/workers/store-root.mjs",
+    "./workers/hub-task-checkout": "./src/workers/hub-task-checkout.mjs",
+    "./workers/hub-cold-router": "./src/workers/hub-cold-router.mjs",
+    "./workers/hub-doctor": "./src/workers/hub-doctor.mjs",
+    "./workers/hub-staging-extractor": "./src/workers/hub-staging-extractor.mjs",
+    "./workers/hub-strict-compactor": "./src/workers/hub-strict-compactor.mjs",
+    "./workers/hub-write-coordinator": "./src/workers/hub-write-coordinator.mjs",
     "./hosts/dsh": "./src/hosts/dsh/index.mjs",
-    "./hosts/dsh/turn-accumulator": "./src/hosts/dsh/turn-accumulator.mjs"
+    "./hosts/dsh/turn-accumulator": "./src/hosts/dsh/turn-accumulator.mjs",
+    "./hosts/dsh/git-project": "./src/hosts/dsh/git-project.mjs",
+    "./hosts/dsh/hub-host": "./src/hosts/dsh/hub-host.mjs"
   },
   "scripts": {
-    "test": "node --test test/kernel.node-test.mjs test/store-cli.node-test.mjs test/workers.node-test.mjs test/dsh-host.node-test.mjs"
+    "test": "node --test test/kernel.node-test.mjs test/hub-store.node-test.mjs test/hub-workers.node-test.mjs test/hub-cli.node-test.mjs test/git-project.node-test.mjs test/hub-host.node-test.mjs test/store-cli.node-test.mjs test/workers.node-test.mjs test/dsh-host.node-test.mjs"
   }
 }
