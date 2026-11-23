@@ -26,7 +26,7 @@ import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
 import { runHubStrictCompactor } from '../src/workers/hub-strict-compactor.mjs';
 import {
   initHubStore, isHubInitialized, readHubTasksIndex, readProjectsIndex,
-  readScopedHead, readScopedLedgerLog, readScopedStaged, commitScopedStaged,
+  readScopedHead, readScopedLedgerLog, readScopedStaged, commitScopedStaged, revertScopedCommit, syncScopedLedger,
   dropScopedStaged, readSessionBinding, writeSessionBinding, clearSessionBinding,
   transitionHubTaskStatus
 } from '../src/kernel/index.mjs';
@@ -48,6 +48,8 @@ function printUsage(writeOut) {
       ,'  cairn checkout <id|--clear> [--preview] [--cwd <dir>]'
       ,'  cairn compact <id> [--full] [--cwd <dir>]'
       ,'  Hub default: $DSH_HOME/cairn or ~/.cairn; use --store <path> to override. --cwd selects legacy workspace storage.'
+      ,'  cairn revert <seq> --scope <user|project> [--project <id>] --reason <text> [--preview] [--store <path>] [--json]'
+      ,'  cairn sync [--scope <user|project>] [--project <id>] [--store <path>] [--json]'
     ].join('\n')
   );
 }
@@ -75,6 +77,7 @@ export function runCairnCli(
         rebase: { type: 'boolean', default: false },
         actor: { type: 'string' },
         step: { type: 'string' },
+        reason: { type: 'string' },
         preview: { type: 'boolean', default: false },
         full: { type: 'boolean', default: false },
         clear: { type: 'boolean', default: false },
@@ -95,13 +98,12 @@ export function runCairnCli(
   const asJson = Boolean(values.json);
 
   const useHubStore = values.store !== undefined || (values.cwd === undefined && path.resolve(cwd) === path.resolve(process.cwd()));
-  if (useHubStore) {
-    return runHubCli(subcommand, targetArg, positionals, values, { stdout, stderr, asJson });
-  }
-
   if (values.help || !subcommand) {
     printUsage(stdout);
-    return subcommand ? 0 : 1;
+    return values.help ? 0 : 1;
+  }
+  if (useHubStore) {
+    return runHubCli(subcommand, targetArg, positionals, values, { stdout, stderr, asJson });
   }
 
   if (subcommand === 'doctor') {
@@ -389,6 +391,18 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
       emit(transitionHubTaskStatus(hubRoot, { taskId: id, action: command })); return 0;
     }
     if (command === 'log') { emit(readScopedLedgerLog(hubRoot, { scope, projectId })); return 0; }
+    if (command === 'sync') {
+      if (targetArg) throw new Error('Use cairn sync [--scope <scope>] [--project <id>]');
+      stdout(JSON.stringify(syncScopedLedger(hubRoot, { scope, projectId }), null, asJson ? 2 : 0)); return 0;
+    }
+    if (command === 'revert') {
+      if (!values.scope || positionals.length !== 2 || !/^\d+$/u.test(targetArg ?? '')) {
+        throw new Error('Use cairn revert <seq> --scope <user|project> [--project <id>] --reason <text> [--preview]');
+      }
+      const result = revertScopedCommit(hubRoot, { scope, projectId, commitSeq: Number(targetArg), reason: values.reason, actorId: values.actor, preview: values.preview });
+      stdout(JSON.stringify(result, null, asJson ? 2 : 0));
+      return ['preview', 'reverted', 'already_reverted'].includes(result.status) ? 0 : 1;
+    }
     if (command === 'commit') {
       const result = commitScopedStaged(hubRoot, { scope, projectId, proposal_id: targetArg, rebase: values.rebase, actor_id: values.actor });
       emit(result); return result.conflict || result.all_rejected ? 1 : 0;

@@ -16,6 +16,13 @@
         autoCompactMinChars: 4500
         maxTailChars: 6000
         autoCompactCooldownMs: 300000
+        # Slice A: only verified Project decisions may auto-commit.
+        # Existing host configurations without this block remain stage-only.
+        autopilot:
+          enabled: true
+          autoCommit:
+            project: true
+            supersede: true
         # Optional explicit out-of-band worker model overrides:
         # workerProvider: 'deepseek'
         # workerModel: 'deepseek-chat'

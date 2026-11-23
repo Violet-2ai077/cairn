@@ -16,6 +16,12 @@ The first `systemPrompt.context` evaluation in an unbound session contributes on
 
 User and Project ledger heads, staged proposals, replay integrity, and decision IDs are independent. A Project decision/tombstone takes precedence over a generic User default inside that project; both applicable ledgers override task-local checkout history. CLI `checkout <id> --preview --store <root>` is read-only. Persisting/clearing a CLI checkout requires `--session <id>`; dsh slash checkout is session-local. `inspect` reports a short project fingerprint and routing state only, never absolute paths, prompts, model output, or credentials.
 
+### M4.2 Slice A Hub operation
+
+The example patch opts into Project auto-commit; existing configs remain stage-only unless explicitly enabled. Automatic admission uses actual authored user adoption, not runtime-context messages or the assistant's unilateral recommendation. User-scope proposals always remain staged. Background extraction and auto-compaction use the model route captured for their own turn. A selected general task gets task-local checkout without a Project Ledger.
+
+To preview compensation, use `/cairn undo project <project-id> <commit-seq> --preview <reason>` (or `/cairn undo user <commit-seq> --preview <reason>`). Remove `--preview` to apply. The CLI equivalent is `cairn revert <commit-seq> --scope project --project <project-id> --reason "<reason>" [--preview]`. Both require an explicit scope and commit sequence; use `cairn log --scope project --project <project-id> --json` to find the sequence. Replay/sync and policy behavior are covered offline; these instructions do not claim a new live rc.5 smoke test.
+
 | Dimension | Verified Fact |
 | --- | --- |
 | **Target `dsh` Baseline** | `@deepseek-ai/dsh` `0.2.2-rc.5` |

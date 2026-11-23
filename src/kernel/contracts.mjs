@@ -109,23 +109,20 @@ export function buildAuthorityCheckoutContract(ledgerSnapshot = null) {
   return `${contract}\n\n### 当前权威工作区状态账本（workspace_ledger）\n${JSON.stringify(ledgerSnapshot, null, 2)}`;
 }
 
-export function buildScopedAuthorityContract({ userLedgerSnapshot = null, projectLedgerSnapshot = null, projectName = '' } = {}) {
+export function buildScopedAuthorityContract({ userLedgerSnapshot = null, projectLedgerSnapshot = null, projectName = '', includeUser = true, includeProject = true } = {}) {
   const projectLabel = projectName ? `“${String(projectName).replace(/[<>]/gu, '')}”项目` : '当前项目';
   const text = `### User / Project / Task 分层权威契约
 1. User Ledger 记录跨项目通用默认偏好；Project Ledger 记录明确限定在${projectLabel}内的决策与墓碑。发生冲突时，Project Ledger 中明确的项目决策优先于通用 User 默认偏好，但不得将该项目决策推广到其他项目。
 2. User Ledger 与当前 Project Ledger 均为宿主权威账本；其 active 决策和 tombstones 共同高于并覆盖 Task compact.md 与任务 transcript 中的旧局部描述。不得从局部历史复活被任一适用账本 tombstone 否定的方案。
 3. 当当前会话尚未完成 pre-step 路由且没有显式项目绑定时，不存在可用的 Project Ledger；不得将 cwd hint 当成已选项目，不得猜测或注入其账本。
 4. cwd 项目仅为软路由信号。只有显式绑定、有效任务匹配，或已完成路由后的 new+cwd hint 才能形成当前项目锁定。
-
-### User Ledger
-${userLedgerSnapshot ? JSON.stringify(userLedgerSnapshot, null, 2) : '(none)'}
-
-### Current Project Ledger
-${projectLedgerSnapshot ? JSON.stringify(projectLedgerSnapshot, null, 2) : '(none; no project is locked)'}`;
-  return text;
+5. 以当前生效的决策 ID 为准。显式撤回可由账本以新 ID 恢复旧选项；历史 ID 的 tombstone 仍然有效。撤回项目规则而无替代项时，适用的 User 默认规则仍然有效。`;
+  const sections = includeUser ? [text, `### User Ledger\n${userLedgerSnapshot ? JSON.stringify(userLedgerSnapshot, null, 2) : '(none)'}`] : [];
+  if (includeProject) sections.push(`### Current Project Ledger${projectName ? ` (${projectLabel})` : ''}\n${projectLedgerSnapshot ? JSON.stringify(projectLedgerSnapshot, null, 2) : '(none; no project is locked)'}`);
+  return sections.join('\n\n');
 }
 
-export function buildScopedStagingExtractorPrompt(scope, readOnlyHead = null) {
+export function buildScopedStagingExtractorPrompt(scope, readOnlyHead = null, { withEvidence = false } = {}) {
   if (scope !== 'user' && scope !== 'project') throw new Error('invalid_scope');
   const userOnly = scope === 'user'
     ? `
@@ -138,5 +135,9 @@ export function buildScopedStagingExtractorPrompt(scope, readOnlyHead = null) {
     .replaceAll('工作区级状态变更', `${scope === 'user' ? 'User Ledger 跨项目偏好' : '当前 Project Ledger 项目内决策'}变更`)
     .replaceAll('"scope":"global"', `"scope":"${scope}"`)
     .replaceAll('scope: "global"', `scope: "${scope}"`);
-  return `${base}${userOnly}`;
+  const evidence = withEvidence ? `
+### Project automatic admission evidence
+仍只输出严格 JSON 对象，"ops" 保持原契约。若每项都有明确用户拍板，可附 "evidence":[{"op_index":0,"user_quote":"用户明确采纳的完整原文行","assistant_quote":"同一选项及具体技术方案的助手原话","falsification_quote":"证伪原话"}]。
+op_index 从零开始。user_quote 必须来自 User，不要截取假设、引语、提醒、工具输出或助手的话。简短的“就用方案 B”允许用 assistant_quote 定位同一方案及技术选项。SUPERSEDE 必须给出独立于采纳措辞、包含具体证伪 reason 的 falsification_quote；没有充分证据则省略 evidence，仅入暂存。不要生成 project_id、决策 ID 或置信度分数。` : '';
+  return `${base}${userOnly}${evidence}`;
 }

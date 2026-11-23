@@ -4,7 +4,23 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runCairnCli, runCairnCliAsync } from '../bin/cairn.mjs';
-import { upsertHubTask, appendHubTaskTurn } from '../src/kernel/hub-store.mjs';
+import { upsertHubTask, appendHubTaskTurn, stageScopedOperators, commitScopedStaged, readScopedLedgerLog } from '../src/kernel/hub-store.mjs';
+
+test('Hub CLI revert requires explicit scope, supports read-only preview, and appends a revert event', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-cli-revert-'));
+  try {
+    const { proposal } = stageScopedOperators(root, { ops: [{ op: 'ASSERT', key: 'editor', option_code: 'vim', summary: 'Vim' }] });
+    commitScopedStaged(root, { proposal_id: proposal.proposal_id });
+    const out = [];
+    const run = (...args) => runCairnCli([...args, '--store', root, '--json'], { stdout: msg => out.push(msg), stderr: msg => out.push(msg) });
+    assert.equal(run('revert', '1', '--reason', 'mistake'), 1);
+    assert.equal(run('revert', '1', '--scope', 'user', '--reason', 'mistake', '--preview'), 0);
+    assert.equal(JSON.parse(out.at(-1)).status, 'preview');
+    assert.equal(readScopedLedgerLog(root).length, 1);
+    assert.equal(run('revert', '1', '--scope', 'user', '--reason', 'mistake'), 0);
+    assert.equal(readScopedLedgerLog(root).at(-1).kind, 'revert');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test('Hub CLI keeps task checkout preview read-only and requires session for binding', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-hub-cli-'));

@@ -9,10 +9,10 @@ export function runHubDoctor({ hubRoot } = {}) {
   const projects = readProjectsIndex(hubRoot);
   const tasks = readHubTasksIndex(hubRoot);
   const userReplay = replayScopedLedger(hubRoot, { scope: 'user' });
-  if (!userReplay.valid) issues.push({ code: 'user_ledger_replay_mismatch', reason: userReplay.mismatch_reason });
+  if (!userReplay.valid) issues.push({ code: userReplay.mismatch_reason === 'materialization_pending' ? 'user_ledger_sync_pending' : 'user_ledger_replay_mismatch', reason: userReplay.mismatch_reason });
   for (const project of projects.projects) {
     const replay = replayScopedLedger(hubRoot, { scope: 'project', projectId: project.project_id });
-    if (!replay.valid) issues.push({ code: 'project_ledger_replay_mismatch', project_id: project.project_id, reason: replay.mismatch_reason });
+    if (!replay.valid) issues.push({ code: replay.mismatch_reason === 'materialization_pending' ? 'project_ledger_sync_pending' : 'project_ledger_replay_mismatch', project_id: project.project_id, reason: replay.mismatch_reason });
   }
   for (const task of tasks.tasks) {
     if (!fs.existsSync(paths.taskThreadFile(task.id))) issues.push({ code: 'task_thread_missing', task_id: task.id });

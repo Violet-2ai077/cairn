@@ -4,9 +4,12 @@ import path from 'node:path';
 import { createEmptyLedger, projectReadOnlyLedger } from './ledger.mjs';
 import { normalizeTaskId, writeJsonAtomic, writeTextAtomic } from './store.mjs';
 import { foldScopedLedger } from './scoped-ledger.mjs';
+import { withHubWriteLock } from './hub-write-lock.mjs';
+import { planDecisionRevert, replayHubRecords } from './hub-ledger-replay.mjs';
 
 const SCOPES = new Set(['user', 'project']);
 const PROJECT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
+const locked = operation => (hubRoot, ...args) => withHubWriteLock(hubRoot, () => operation(hubRoot, ...args));
 
 function normalizedProjectId(value) {
   if (value === null || value === undefined || value === '' || value === 'general') return null;
@@ -94,7 +97,8 @@ export function isHubInitialized(hubRoot) {
     paths.projectsIndexFile, paths.tasksIndexFile].every(file => fs.existsSync(file));
 }
 
-export function initHubStore(hubRoot, { createdAt = new Date().toISOString() } = {}) {
+export const initHubStore = locked(initHubStoreUnlocked);
+function initHubStoreUnlocked(hubRoot, { createdAt = new Date().toISOString() } = {}) {
   const paths = resolveHubPaths(hubRoot);
   fs.mkdirSync(paths.userLedgerDir, { recursive: true });
   fs.mkdirSync(paths.projectsDir, { recursive: true });
@@ -132,7 +136,8 @@ export function readProjectsIndex(hubRoot) {
   return { schema_version: 1, next_project_seq: Number.isSafeInteger(raw.next_project_seq) ? raw.next_project_seq : 1, projects };
 }
 
-export function registerProject(hubRoot, { project_id, name, identity_key = '', canonical_root = '', created_at } = {}) {
+export const registerProject = locked(registerProjectUnlocked);
+function registerProjectUnlocked(hubRoot, { project_id, name, identity_key = '', canonical_root = '', created_at } = {}) {
   if (!isHubInitialized(hubRoot)) initHubStore(hubRoot);
   const id = normalizedProjectId(project_id);
   if (!id) throw new Error('project_id_required');
@@ -152,12 +157,13 @@ export function registerProject(hubRoot, { project_id, name, identity_key = '', 
   return { project, created: true };
 }
 
-export function ensureScopedLedger(hubRoot, { scope = 'user', projectId = null, project = null } = {}) {
+export const ensureScopedLedger = locked(ensureScopedLedgerUnlocked);
+function ensureScopedLedgerUnlocked(hubRoot, { scope = 'user', projectId = null, project = null } = {}) {
   const normalized = assertScope(scope, projectId);
   if (!isHubInitialized(hubRoot)) initHubStore(hubRoot);
   const paths = resolveHubPaths(hubRoot).ledgerPaths({ scope, projectId: normalized });
   if (scope === 'project') {
-    if (project) registerProject(hubRoot, { project_id: normalized, ...project });
+    if (project) registerProject(hubRoot, { ...project, project_id: normalized });
     else if (!readProjectsIndex(hubRoot).projects.some(item => item.project_id === normalized)) {
       registerProject(hubRoot, { project_id: normalized, name: normalized, identity_key: normalized });
     }
@@ -177,9 +183,11 @@ export function readScopedHead(hubRoot, { scope = 'user', projectId = null } = {
 export function readScopedLedgerLog(hubRoot, { scope = 'user', projectId = null } = {}) {
   const file = resolveHubPaths(hubRoot).ledgerPaths({ scope, projectId }).ledgerFile;
   if (!fs.existsSync(file)) return [];
-  const text = fs.readFileSync(file, 'utf8').trim();
-  if (!text) return [];
-  return text.split(/\r?\n/u).map((line, index) => {
+  const bytes = fs.readFileSync(file);
+  if (!bytes.length) return [];
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  if (!text.endsWith('\n')) throw new Error('scoped_ledger_incomplete_line');
+  return text.slice(0, -1).split(/\r?\n/u).map((line, index) => {
     try { return JSON.parse(line); }
     catch (error) { throw new Error(`scoped_ledger_line_${index + 1}_invalid:${error.message}`); }
   });
@@ -191,9 +199,11 @@ export function readScopedStaged(hubRoot, { scope = 'user', projectId = null } =
   return { next_proposal_seq: Number.isSafeInteger(raw.next_proposal_seq) ? raw.next_proposal_seq : 1, proposals: Array.isArray(raw.proposals) ? raw.proposals : [] };
 }
 
-export function stageScopedOperators(hubRoot, { scope = 'user', projectId = null, ops, source_step, actor_id = 'default', base_revision, created_at, project = null } = {}) {
+export const stageScopedOperators = locked(stageScopedOperatorsUnlocked);
+function stageScopedOperatorsUnlocked(hubRoot, { scope = 'user', projectId = null, ops, source_step, actor_id = 'default', base_revision, created_at, project = null, admission = null } = {}) {
   const paths = ensureScopedLedger(hubRoot, { scope, projectId, project });
   if (!Array.isArray(ops)) throw new Error('stage_operators_invalid_ops:expected_array');
+  requireSyncedLedger(hubRoot, { scope, projectId });
   const staged = readScopedStaged(hubRoot, { scope, projectId });
   if (ops.length === 0) return { staged: false, reason: 'no_op', proposal: null, next_proposal_seq: staged.next_proposal_seq };
   const head = readScopedHead(hubRoot, { scope, projectId });
@@ -203,12 +213,13 @@ export function stageScopedOperators(hubRoot, { scope = 'user', projectId = null
     scope,
     project_id: scope === 'project' ? normalizedProjectId(projectId) : null,
     created_at: created_at ?? new Date().toISOString(),
-    source_step: source_step ?? `stage_${seq}`,
+    source_step: typeof source_step === 'string' && source_step.trim() ? source_step : `stage_${seq}`,
     actor_id: String(actor_id || 'default'),
     base_revision: base_revision ?? head.revision,
     ops,
     last_conflict: null,
-    last_rejected_ops: null
+    last_rejected_ops: null,
+    ...(admission ? { admission } : {})
   };
   staged.next_proposal_seq++;
   staged.proposals.push(proposal);
@@ -216,18 +227,28 @@ export function stageScopedOperators(hubRoot, { scope = 'user', projectId = null
   return { staged: true, proposal, next_proposal_seq: staged.next_proposal_seq };
 }
 
-export function commitScopedStaged(hubRoot, { scope = 'user', projectId = null, proposal_id = null, actor_id = null, rebase = false, timestamp = null } = {}) {
+export const commitScopedStaged = locked(commitScopedStagedUnlocked);
+function commitScopedStagedUnlocked(hubRoot, { scope = 'user', projectId = null, proposal_id = null, actor_id = null, rebase = false, timestamp = null, mode = 'manual' } = {}) {
   const paths = resolveHubPaths(hubRoot).ledgerPaths({ scope, projectId });
-  let head = readScopedHead(hubRoot, { scope, projectId });
+  const options = { scope, projectId };
+  const initialized = fs.existsSync(paths.ledgerFile) || fs.existsSync(paths.headFile) || fs.existsSync(paths.stagedFile);
+  const state = initialized ? requireSyncedLedger(hubRoot, options) : null;
+  let head = state?.ledger ?? createEmptyLedger();
   const initialRevision = head.revision;
   const staged = readScopedStaged(hubRoot, { scope, projectId });
-  const log = readScopedLedgerLog(hubRoot, { scope, projectId });
-  let commitSeq = log.length ? Math.max(...log.map((record, index) => Number.isSafeInteger(record.commit_seq) ? record.commit_seq : index + 1)) + 1 : 1;
+  let commitSeq = (state?.commit_count ?? 0) + 1;
+  if (mode === 'auto' && (scope !== 'project' || !proposal_id || rebase)) {
+    return { committed: false, reason: 'auto_commit_requires_project_proposal', conflict: false, commits: [], head };
+  }
   const selected = proposal_id === null ? staged.proposals : staged.proposals.filter(proposal => proposal.proposal_id === proposal_id);
   if (proposal_id !== null && selected.length === 0) return { committed: false, reason: 'proposal_not_found', conflict: false, commits: [], head, remaining_proposals: staged.proposals.length };
   if (selected.length === 0) return { committed: false, reason: 'nothing_to_commit', conflict: false, commits: [], head, remaining_proposals: 0 };
   const commits = [];
   for (const proposal of [...selected]) {
+    if (mode === 'auto' && (proposal.admission?.eligible !== true || !Number.isSafeInteger(proposal.base_revision) ||
+        !proposal.ops.every(op => op.op === 'ASSERT' || op.op === 'SUPERSEDE'))) {
+      return { committed: false, reason: 'auto_commit_not_eligible', conflict: false, commits, head };
+    }
     const expectedScope = proposal.scope ?? scope;
     const expectedProject = proposal.project_id ?? null;
     if (expectedScope !== scope || expectedProject !== (scope === 'project' ? projectId : null)) {
@@ -240,11 +261,11 @@ export function commitScopedStaged(hubRoot, { scope = 'user', projectId = null, 
     }
     const baseRevision = head.revision;
     const fold = foldScopedLedger(head, proposal.ops, { scope, project_id: projectId, source_step: proposal.source_step, actor_id: actor_id ?? proposal.actor_id, base_revision: baseRevision });
-    if (fold.conflict || (fold.accepted_ops.length === 0 && fold.rejected_count > 0)) {
+    if (fold.conflict || (fold.rejected_count > 0 && (fold.accepted_ops.length === 0 || mode === 'auto'))) {
       proposal.last_conflict = fold.conflict ? { error: fold.conflict_error } : null;
       proposal.last_rejected_ops = fold.rejected_ops;
       writeJsonAtomic(paths.stagedFile, staged);
-      return { committed: commits.length > 0, reason: fold.conflict ? 'base_revision_conflict' : 'all_operators_rejected', conflict: Boolean(fold.conflict), rejected_ops: fold.rejected_ops, commits, head, remaining_proposals: staged.proposals.length };
+      return { committed: commits.length > 0, reason: fold.conflict ? 'base_revision_conflict' : mode === 'auto' ? 'auto_commit_fold_rejected' : 'all_operators_rejected', conflict: Boolean(fold.conflict), rejected_ops: fold.rejected_ops, commits, head, remaining_proposals: staged.proposals.length };
     }
     if (fold.accepted_ops.length === 0) {
       staged.proposals = staged.proposals.filter(item => item.proposal_id !== proposal.proposal_id);
@@ -255,11 +276,12 @@ export function commitScopedStaged(hubRoot, { scope = 'user', projectId = null, 
       commit_seq: commitSeq++, timestamp: timestamp ?? new Date().toISOString(), proposal_id: proposal.proposal_id,
       scope, project_id: scope === 'project' ? projectId : null, source_step: proposal.source_step,
       actor_id: fold.actor_id, base_revision: baseRevision, staged_base_revision: proposal.base_revision,
-      new_revision: fold.ledger.revision, ops: proposal.ops, accepted_ops: fold.accepted_ops, rejected_ops: fold.rejected_ops
+      new_revision: fold.ledger.revision, ops: proposal.ops, accepted_ops: fold.accepted_ops, rejected_ops: fold.rejected_ops,
+      ...(mode === 'auto' ? { mode } : {})
     };
     head = JSON.parse(JSON.stringify(fold.ledger));
     staged.proposals = staged.proposals.filter(item => item.proposal_id !== proposal.proposal_id);
-    fs.appendFileSync(paths.ledgerFile, `${JSON.stringify(commit)}\n`, 'utf8');
+    appendLedgerRecord(paths, commit);
     writeJsonAtomic(paths.headFile, head);
     writeJsonAtomic(paths.stagedFile, staged);
     commits.push(commit);
@@ -267,8 +289,10 @@ export function commitScopedStaged(hubRoot, { scope = 'user', projectId = null, 
   return { committed: commits.length > 0, reason: commits.length ? 'committed' : 'nothing_to_commit', conflict: false, commits, head, remaining_proposals: staged.proposals.length };
 }
 
-export function dropScopedStaged(hubRoot, { scope = 'user', projectId = null, proposal_id = null } = {}) {
+export const dropScopedStaged = locked(dropScopedStagedUnlocked);
+function dropScopedStagedUnlocked(hubRoot, { scope = 'user', projectId = null, proposal_id = null } = {}) {
   const paths = resolveHubPaths(hubRoot).ledgerPaths({ scope, projectId });
+  if ([paths.headFile, paths.ledgerFile, paths.stagedFile].some(file => fs.existsSync(file))) requireSyncedLedger(hubRoot, { scope, projectId });
   const staged = readScopedStaged(hubRoot, { scope, projectId });
   const before = staged.proposals.length;
   if (proposal_id === null) staged.proposals = [];
@@ -277,23 +301,85 @@ export function dropScopedStaged(hubRoot, { scope = 'user', projectId = null, pr
   return { dropped: before !== staged.proposals.length, dropped_count: before - staged.proposals.length, remaining_proposals: staged.proposals.length, next_proposal_seq: staged.next_proposal_seq };
 }
 
-export function replayScopedLedger(hubRoot, { scope = 'user', projectId = null } = {}) {
+function appendLedgerRecord(paths, record) {
+  fs.appendFileSync(paths.ledgerFile, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flush: true });
+}
+
+function inspectScopedLedger(hubRoot, { scope = 'user', projectId = null } = {}) {
   const paths = resolveHubPaths(hubRoot).ledgerPaths({ scope, projectId });
-  if (!fs.existsSync(paths.ledgerFile) || !fs.existsSync(paths.headFile)) return { valid: false, head_matches: false, commit_count: 0, mismatch_reason: 'ledger_not_initialized' };
-  let ledger = createEmptyLedger();
-  const records = readScopedLedgerLog(hubRoot, { scope, projectId });
-  for (let index = 0; index < records.length; index++) {
-    const record = records[index];
-    if (record.scope !== scope || (record.project_id ?? null) !== (scope === 'project' ? projectId : null)) {
-      return { valid: false, head_matches: false, commit_count: index, mismatch_reason: `scope_mismatch_at_commit_${index + 1}` };
-    }
-    const result = foldScopedLedger(ledger, record.ops, { scope, project_id: projectId, source_step: record.source_step, actor_id: record.actor_id, base_revision: ledger.revision });
-    if (result.accepted_ops.length === 0 && result.rejected_count > 0) return { valid: false, head_matches: false, commit_count: index, mismatch_reason: `invalid_ops_at_commit_${index + 1}` };
-    ledger = JSON.parse(JSON.stringify(result.ledger));
+  const invalid = reason => ({ valid: false, head_matches: false, commit_count: 0, mismatch_reason: reason });
+  if (![paths.ledgerFile, paths.headFile, paths.stagedFile].every(file => fs.existsSync(file))) return invalid('ledger_not_initialized');
+  try {
+    const disk = readScopedHead(hubRoot, { scope, projectId });
+    const records = readScopedLedgerLog(hubRoot, { scope, projectId });
+    const replay = replayHubRecords(records, disk, { scope, projectId: paths.project_id });
+    if (!replay.valid && replay.mismatch_reason !== 'materialization_pending') return replay;
+    const staged = readScopedStaged(hubRoot, { scope, projectId });
+    const proposals = staged.proposals.filter(proposal => !replay.consumed.has(proposal.proposal_id));
+    let nextSeq = staged.next_proposal_seq;
+    for (const id of replay.consumed) nextSeq = Math.max(nextSeq, Number(id.slice(4)) + 1);
+    const stagedPending = proposals.length !== staged.proposals.length || nextSeq !== staged.next_proposal_seq;
+    return {
+      ...replay, valid: replay.valid && !stagedPending,
+      mismatch_reason: stagedPending ? 'materialization_pending' : replay.mismatch_reason,
+      pendingStaged: stagedPending ? { proposals, next_proposal_seq: nextSeq } : null
+    };
+  } catch (error) {
+    return invalid(error.message.split(':')[0] || 'ledger_unreadable');
   }
-  const disk = readScopedHead(hubRoot, { scope, projectId });
-  const headMatches = JSON.stringify(ledger) === JSON.stringify(disk);
-  return { valid: headMatches, head_matches: headMatches, commit_count: records.length, mismatch_reason: headMatches ? null : 'head_mismatch', ledger };
+}
+
+function replayReport({ history, consumed, pendingStaged, ...report }) { return report; }
+
+export function replayScopedLedger(hubRoot, options) {
+  return replayReport(inspectScopedLedger(hubRoot, options));
+}
+
+function requireSyncedLedger(hubRoot, options) {
+  const replay = inspectScopedLedger(hubRoot, options);
+  if (replay.valid) return replay;
+  if (replay.mismatch_reason !== 'materialization_pending') throw new Error(`ledger_integrity:${replay.mismatch_reason}`);
+  const paths = resolveHubPaths(hubRoot).ledgerPaths(options);
+  if (!replay.head_matches) writeJsonAtomic(paths.headFile, replay.ledger);
+  if (replay.pendingStaged) writeJsonAtomic(paths.stagedFile, replay.pendingStaged);
+  return { ...replay, valid: true, head_matches: true, mismatch_reason: null, synchronized: true };
+}
+
+export const syncScopedLedger = locked((hubRoot, options = {}) => replayReport(requireSyncedLedger(hubRoot, options)));
+
+export function revertScopedCommit(hubRoot, options = {}) {
+  if (options.preview) return revertScopedCommitUnlocked(hubRoot, options);
+  return withHubWriteLock(hubRoot, () => revertScopedCommitUnlocked(hubRoot, options));
+}
+
+function revertScopedCommitUnlocked(hubRoot, { scope, projectId = null, commitSeq, reason, actorId = 'human', preview = false } = {}) {
+  projectId = assertScope(scope, projectId);
+  if (!Number.isSafeInteger(commitSeq) || commitSeq <= 0) throw new Error('invalid_revert_commit_seq');
+  if (typeof reason !== 'string' || !reason.trim()) throw new Error('revert_reason_required');
+  const options = { scope, projectId };
+  const replay = preview ? inspectScopedLedger(hubRoot, options) : requireSyncedLedger(hubRoot, options);
+  if (!replay.valid && replay.mismatch_reason !== 'materialization_pending') throw new Error(`ledger_integrity:${replay.mismatch_reason}`);
+  const planned = planDecisionRevert(replay.history, replay.ledger, commitSeq, reason.trim());
+  if (planned.status !== 'ready') return planned;
+  const seq = replay.commit_count + 1;
+  const source_step = `revert_${commitSeq}_at_${seq}`;
+  const base_revision = replay.ledger.revision;
+  const fold = foldScopedLedger(replay.ledger, planned.ops, {
+    scope, project_id: projectId, actor_id: actorId, base_revision, source_step, allowDecisionRetraction: true
+  });
+  if (fold.rejected_count || !fold.accepted_ops.length) throw new Error('revert_fold_rejected');
+  const commit = {
+    kind: 'revert', version: 1, commit_seq: seq, reverts_commit_seq: commitSeq, reason: reason.trim(),
+    scope, project_id: projectId, proposal_id: null, timestamp: new Date().toISOString(), source_step,
+    actor_id: fold.actor_id, base_revision, new_revision: fold.ledger.revision, ops: planned.ops,
+    accepted_ops: fold.accepted_ops, rejected_ops: fold.rejected_ops
+  };
+  if (!preview) {
+    const paths = resolveHubPaths(hubRoot).ledgerPaths(options);
+    appendLedgerRecord(paths, commit);
+    writeJsonAtomic(paths.headFile, fold.ledger);
+  }
+  return { status: preview ? 'preview' : 'reverted', commit, head: fold.ledger };
 }
 
 export function readHubTasksIndex(hubRoot) {
@@ -310,7 +396,8 @@ export function readHubTasksIndex(hubRoot) {
   return { schema_version: 1, next_task_id: Number.isSafeInteger(raw.next_task_id) ? raw.next_task_id : 1, tasks };
 }
 
-export function upsertHubTask(hubRoot, { id, project_id = null, title, birth_turn, status = 'active', updated_at, project = null } = {}) {
+export const upsertHubTask = locked(upsertHubTaskUnlocked);
+function upsertHubTaskUnlocked(hubRoot, { id, project_id = null, title, birth_turn, status = 'active', updated_at, project = null } = {}) {
   if (!isHubInitialized(hubRoot)) initHubStore(hubRoot);
   const paths = resolveHubPaths(hubRoot);
   const index = readHubTasksIndex(hubRoot);
@@ -335,7 +422,8 @@ export function upsertHubTask(hubRoot, { id, project_id = null, title, birth_tur
   return { task, index };
 }
 
-export function appendHubTaskTurn(hubRoot, { task_id, project_id = null, turn, role = 'assistant', content = '', raw_content = null, meta = {}, timestamp } = {}) {
+export const appendHubTaskTurn = locked(appendHubTaskTurnUnlocked);
+function appendHubTaskTurnUnlocked(hubRoot, { task_id, project_id = null, turn, role = 'assistant', content = '', raw_content = null, meta = {}, timestamp } = {}) {
   const id = normalizeTaskId(task_id);
   const projectId = normalizedProjectId(project_id);
   const paths = resolveHubPaths(hubRoot);
@@ -354,6 +442,34 @@ export function appendHubTaskTurn(hubRoot, { task_id, project_id = null, turn, r
   writeJsonAtomic(paths.tasksIndexFile, index);
   return { record, task: indexTask };
 }
+
+export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessionId, turn, user, assistant }) => {
+  const records = readHubTaskThread(hubRoot, taskId);
+  const turnRecords = records.filter(record => record.turn === turn && record.meta?.dsh_session_id === sessionId);
+  const texts = { user, assistant };
+  const roles = ['user', 'assistant'];
+  for (const role of roles) {
+    const matching = turnRecords.filter(record => record.role === role);
+    if (matching.length > 1 || matching.some(record => record.content !== texts[role] || record.project_id !== projectId)) {
+      throw new Error('hub_turn_redelivery_mismatch');
+    }
+  }
+  const missing = roles.filter(role => !turnRecords.some(record => record.role === role));
+  for (const role of missing) {
+    appendHubTaskTurnUnlocked(hubRoot, { task_id: taskId, project_id: projectId, turn, role, content: texts[role], meta: { dsh_session_id: sessionId } });
+  }
+  if (!missing.length) {
+    const index = readHubTasksIndex(hubRoot);
+    const task = index.tasks.find(item => item.id === taskId);
+    const lastRecord = records.at(-1);
+    if (task?.status === 'active' && task.turn_count < lastRecord.seq) {
+      task.turn_count = lastRecord.seq;
+      task.updated_at = lastRecord.timestamp;
+      writeJsonAtomic(resolveHubPaths(hubRoot).tasksIndexFile, index);
+    }
+  }
+  return { appended: missing.length > 0, roles: missing };
+});
 
 export function readHubTaskThread(hubRoot, taskId) {
   const file = resolveHubPaths(hubRoot).taskThreadFile(taskId);
@@ -377,7 +493,8 @@ export function readSessionBinding(hubRoot, sessionId) {
   return { project_id: normalizedProjectId(binding.project_id), task_id: binding.task_id === null ? null : normalizeTaskId(binding.task_id), source: String(binding.source ?? 'explicit'), updated_at: binding.updated_at ?? null };
 }
 
-export function writeSessionBinding(hubRoot, sessionId, { project_id = null, task_id = null, source = 'explicit' } = {}) {
+export const writeSessionBinding = locked(writeSessionBindingUnlocked);
+function writeSessionBindingUnlocked(hubRoot, sessionId, { project_id = null, task_id = null, source = 'explicit' } = {}) {
   const paths = resolveHubPaths(hubRoot);
   const projectId = normalizedProjectId(project_id);
   let normalizedTaskId = null;
@@ -393,7 +510,8 @@ export function writeSessionBinding(hubRoot, sessionId, { project_id = null, tas
   return { ...binding };
 }
 
-export function clearSessionBinding(hubRoot, sessionId) {
+export const clearSessionBinding = locked(clearSessionBindingUnlocked);
+function clearSessionBindingUnlocked(hubRoot, sessionId) {
   const file = resolveHubPaths(hubRoot).sessionBindingFile(sessionId);
   if (!fs.existsSync(file)) return false;
   fs.unlinkSync(file);
@@ -414,7 +532,8 @@ function clearBindingsForTask(hubRoot, taskId) {
   return count;
 }
 
-export function transitionHubTaskStatus(hubRoot, { taskId, action, updatedAt } = {}) {
+export const transitionHubTaskStatus = locked(transitionHubTaskStatusUnlocked);
+function transitionHubTaskStatusUnlocked(hubRoot, { taskId, action, updatedAt } = {}) {
   const id = normalizeTaskId(taskId);
   const paths = resolveHubPaths(hubRoot);
   const index = readHubTasksIndex(hubRoot);
@@ -436,7 +555,8 @@ export function transitionHubTaskStatus(hubRoot, { taskId, action, updatedAt } =
   return { task: nextTask, previous_status: task.status, status: transition.to, cleared_bindings: clearedBindings, index };
 }
 
-export function writeHubTaskCompaction(hubRoot, taskId, content, compactedRecordCount) {
+export const writeHubTaskCompaction = locked(writeHubTaskCompactionUnlocked);
+function writeHubTaskCompactionUnlocked(hubRoot, taskId, content, compactedRecordCount) {
   const paths = resolveHubPaths(hubRoot);
   const index = readHubTasksIndex(hubRoot);
   const task = index.tasks.find(item => item.id === normalizeTaskId(taskId));

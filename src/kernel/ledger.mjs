@@ -120,7 +120,8 @@ export function foldLedger(currentLedger, ops, stepMeta = {}) {
     }
 
     const opType = rawOp.op;
-    if (!VALID_OP_TYPES.includes(opType)) {
+    const retract = opType === 'RETRACT_DECISION' && stepMeta.allowDecisionRetraction === true;
+    if (!retract && !VALID_OP_TYPES.includes(opType)) {
       rejectedOps.push({ index: i, op: rawOp, error: `invalid_op_type:${String(opType)}` });
       continue;
     }
@@ -128,6 +129,20 @@ export function foldLedger(currentLedger, ops, stepMeta = {}) {
     // Model is strictly forbidden from inventing or supplying its own primary `id` handle
     if (rawOp.id !== undefined) {
       rejectedOps.push({ index: i, op: rawOp, error: 'model_invented_id_forbidden' });
+      continue;
+    }
+
+    if (retract) {
+      const idx = active.findIndex(entry => entry.id === rawOp.target_id);
+      if (idx === -1 || !isNonEmptyString(rawOp.reason)) {
+        rejectedOps.push({ index: i, op: rawOp, error: 'invalid_decision_retraction' });
+        continue;
+      }
+      const [{ id, scope, key, option_code }] = active.splice(idx, 1);
+      tombstones.push({ id, scope, key, option_code, superseded_by: null, reason: rawOp.reason, source_step: sourceStep, actor_id: actorId });
+      revision++;
+      lastActorId = actorId;
+      acceptedOps.push({ index: i, op: rawOp, retracted_id: id, actor_id: actorId });
       continue;
     }
 

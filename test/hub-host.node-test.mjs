@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHubDshHost } from '../src/hosts/dsh/hub-host.mjs';
-import { initHubStore, readProjectsIndex, upsertHubTask } from '../src/kernel/hub-store.mjs';
+import { initHubStore, readProjectsIndex, upsertHubTask, appendHubTaskTurn, readHubTaskThread, writeSessionBinding, stageScopedOperators, commitScopedStaged, readScopedLedgerLog } from '../src/kernel/hub-store.mjs';
 
 function mockCtx() {
   const contexts = [];
@@ -39,6 +39,7 @@ test('Hub host withholds cwd project ledger until pre-step locks the project and
     assert.doesNotMatch(base, /Current Project Ledger[\s\S]*beta service/u);
     await ctx.handlers.get('agent/pre-step')({ agent: { session: { id: 's1', header: { cwd: projectA } } }, modelSelection: { provider: 'p', model: 'm' }, messages: [{ source: { kind: 'user' }, content: 'continue beta service migration' }] }, async () => ({ kind: 'enter' }));
     const locked = ctx.contexts[1].text({ agent: { session: { id: 's1' } } });
+    assert.doesNotMatch(locked, /### User Ledger/u);
     assert.match(locked, new RegExp(hintB.project_id));
     assert.doesNotMatch(locked, new RegExp(hintA.project_id));
     const inspectResult = await ctx.registeredCommands[0].handler({ rawInput: 'inspect', agent: { session: { id: 's1' } } });
@@ -50,6 +51,106 @@ test('Hub host withholds cwd project ledger until pre-step locks the project and
     assert.match(doctor.text, /task_thread_missing/u);
     assert.equal(fs.existsSync(path.join(projectA, '.cairn')), false);
     assert.equal(fs.existsSync(path.join(projectB, '.cairn')), false);
+  } finally { await host.dispose(); fs.rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('general bindings mount checkout and a redelivered half-written turn fills only the missing role', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-general-'));
+  const ctx = mockCtx();
+  let calls = 0;
+  const host = await createHubDshHost(ctx, { storeRoot: hub, llmClient: { complete: async () => { calls++; return { ok: true, content: '{"ops":[]}' }; } } });
+  try {
+    upsertHubTask(hub, { id: 1, title: 'General' });
+    const session = { id: 'general' };
+    writeSessionBinding(hub, session.id, { task_id: 1 });
+    const meta = { dsh_session_id: session.id };
+    appendHubTaskTurn(hub, { task_id: 1, turn: 1, role: 'user', content: 'Saved half', meta });
+    const pre = ctx.handlers.get('agent/pre-step');
+    await pre({ session, turn: 1 }, async () => ({ kind: 'enter' }));
+    const checkout = ctx.contexts[1].text({ session });
+    assert.match(checkout, /Saved half/u);
+    assert.doesNotMatch(checkout, /### Current Project Ledger/u);
+    const event = ctx.handlers.get('session/event');
+    for (let i = 0; i < 2; i++) {
+      event(session, { type: 'turn/start', data: { turn: 1 } });
+      event(session, { type: 'user/message', data: { message: { source: { kind: 'user' }, content: 'Saved half' } } });
+      event(session, { type: 'assistant/message', data: { message: { content: 'Finished.\n<|task:1|>' } } });
+      event(session, { type: 'turn/end', data: { turn: 1 } });
+      await ctx.handlers.get('session/flush')(session);
+    }
+    assert.deepEqual(readHubTaskThread(hub, 1).map(record => record.role), ['user', 'assistant']);
+    assert.equal(calls, 1);
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('delayed Hub worker uses its turn model even after another session selects a different route', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-host-route-'));
+  const ctx = mockCtx();
+  const seen = [];
+  ctx.llm.stream = async function* (request) {
+    seen.push([request.sessionId, request.provider, request.model]);
+    yield { type: 'text-delta', text: '{"ops":[]}' };
+  };
+  const host = await createHubDshHost(ctx, { storeRoot: hub });
+  try {
+    const a = { id: 'a' };
+    const b = { id: 'b' };
+    const pre = ctx.handlers.get('agent/pre-step');
+    const enter = async () => ({ kind: 'enter' });
+    await pre({ session: a, turn: 1, modelSelection: { provider: 'p1', model: 'm1' } }, enter);
+    await pre({ session: b, turn: 1, modelSelection: { provider: 'p2', model: 'm2' } }, enter);
+    const event = ctx.handlers.get('session/event');
+    event(a, { type: 'turn/start', data: { turn: 1 } });
+    event(a, { type: 'user/message', data: { message: { source: { kind: 'user' }, content: 'Work' } } });
+    event(a, { type: 'assistant/message', data: { message: { content: 'Done\n<|task:1|>' } } });
+    event(a, { type: 'turn/end', data: { turn: 1 } });
+    await ctx.handlers.get('session/flush')(a);
+    assert.deepEqual(seen, [['a', 'p1', 'm1']]);
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('Hub slash undo accepts explicit scope and commit, and preview does not append', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-host-undo-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub });
+  try {
+    const { proposal } = stageScopedOperators(hub, { ops: [{ op: 'ASSERT', key: 'editor', option_code: 'vim', summary: 'Vim' }] });
+    commitScopedStaged(hub, { proposal_id: proposal.proposal_id });
+    const run = rawInput => ctx.registeredCommands[0].handler({ rawInput });
+    assert.equal(JSON.parse((await run('undo user 1 --preview wrong decision')).text).status, 'preview');
+    assert.equal(readScopedLedgerLog(hub).length, 1);
+    assert.equal(JSON.parse((await run('undo user 1 wrong decision')).text).status, 'reverted');
+    assert.equal(readScopedLedgerLog(hub).length, 2);
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('Hub passes only authored user evidence to enabled Project auto-commit', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-host-auto-'));
+  const hub = path.join(temp, 'hub');
+  const cwd = path.join(temp, 'project');
+  const ctx = mockCtx();
+  const proof = 'Use Redis';
+  const result = { ops: [{ op: 'ASSERT', key: 'cache', option_code: 'redis', summary: 'Use Redis' }], evidence: [{ op_index: 0, user_quote: proof }] };
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () => ({ ok: true, content: JSON.stringify(result) }) } });
+  try {
+    fs.mkdirSync(cwd);
+    execFileSync('git', ['init', '-q'], { cwd });
+    const session = { id: 'auto', header: { cwd } };
+    await ctx.handlers.get('agent/pre-step')({ session, turn: 1 }, async () => ({ kind: 'enter' }));
+    const event = ctx.handlers.get('session/event');
+    const finish = async (turn, source) => {
+      event(session, { type: 'turn/start', data: { turn } });
+      event(session, { type: 'user/message', surfaceOp: 'append', data: { message: { source: { kind: source }, content: proof } } });
+      event(session, { type: 'assistant/message', data: { message: { content: 'Done.\n<|task:1|>' } } });
+      event(session, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } });
+      await ctx.handlers.get('session/flush')(session);
+    };
+    await finish(1, 'runtime-context');
+    const scope = { scope: 'project', projectId: readProjectsIndex(hub).projects[0].project_id };
+    assert.equal(readScopedLedgerLog(hub, scope).length, 0);
+    assert.equal(readHubTaskThread(hub, 1)[0].content, '');
+    await finish(2, 'user');
+    assert.equal(readScopedLedgerLog(hub, scope)[0].mode, 'auto');
   } finally { await host.dispose(); fs.rmSync(temp, { recursive: true, force: true }); }
 });
 

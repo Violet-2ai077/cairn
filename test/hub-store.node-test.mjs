@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, test } from 'node:test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
   appendHubTaskTurn,
   commitScopedStaged,
@@ -25,6 +27,8 @@ import {
 } from '../src/kernel/hub-store.mjs';
 import { foldScopedLedger } from '../src/kernel/scoped-ledger.mjs';
 import { buildScopedAuthorityContract } from '../src/kernel/contracts.mjs';
+import * as hubStore from '../src/kernel/hub-store.mjs';
+import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
 
 const temporaryRoots = [];
 
@@ -33,6 +37,132 @@ function tempRoot() {
   temporaryRoots.push(root);
   return root;
 }
+
+const projectScope = { scope: 'project', projectId: 'p_alpha' };
+const assertion = (key, option_code = 'a') => ({ op: 'ASSERT', key, option_code, summary: option_code });
+
+function stage(hub, ops) {
+  return stageScopedOperators(hub, { ...projectScope, ops }).proposal.proposal_id;
+}
+
+function commit(hub, ops) {
+  return commitScopedStaged(hub, { ...projectScope, proposal_id: stage(hub, ops) });
+}
+
+test('strict replay identifies a materialization gap, cleans the consumed staged ID and refuses a corrupt tail', () => {
+  const hub = tempRoot();
+  const id = stage(hub, [assertion('build')]);
+  const files = resolveHubPaths(hub).ledgerPaths(projectScope);
+  const oldHead = fs.readFileSync(files.headFile);
+  const oldStaged = fs.readFileSync(files.stagedFile);
+  assert.equal(commitScopedStaged(hub, { ...projectScope, proposal_id: id }).committed, true);
+  const log = fs.readFileSync(files.ledgerFile, 'utf8');
+  fs.writeFileSync(files.headFile, oldHead);
+  fs.writeFileSync(files.stagedFile, oldStaged);
+  assert.equal(replayScopedLedger(hub, projectScope).mismatch_reason, 'materialization_pending');
+  assert.ok(runHubDoctor({ hubRoot: hub }).issues.some(issue => issue.reason === 'materialization_pending'));
+  assert.deepEqual(fs.readFileSync(files.headFile), oldHead);
+  assert.equal(hubStore.syncScopedLedger(hub, projectScope).valid, true);
+  assert.equal(fs.readFileSync(files.ledgerFile, 'utf8'), log);
+  assert.equal(hubStore.readScopedStaged(hub, projectScope).proposals.length, 0);
+  fs.writeFileSync(files.stagedFile, oldStaged);
+  const stagedOnly = replayScopedLedger(hub, projectScope);
+  assert.equal(stagedOnly.mismatch_reason, 'materialization_pending');
+  assert.equal(stagedOnly.head_matches, true);
+  assert.equal(commitScopedStaged(hub, { ...projectScope, proposal_id: id }).reason, 'proposal_not_found');
+  assert.equal(replayScopedLedger(hub, projectScope).valid, true);
+  fs.appendFileSync(files.ledgerFile, '{"commit_seq":');
+  assert.equal(replayScopedLedger(hub, projectScope).valid, false);
+  assert.equal(runHubDoctor({ hubRoot: hub }).ok, false);
+  assert.throws(() => commitScopedStaged(hub, projectScope), /ledger_integrity/u);
+  assert.equal(fs.readFileSync(files.ledgerFile, 'utf8'), log + '{"commit_seq":');
+});
+
+test('strict replay checks persisted sequence, scope, revisions and complete fold effects', () => {
+  const hub = tempRoot();
+  commit(hub, [assertion('build')]);
+  const files = resolveHubPaths(hub).ledgerPaths(projectScope);
+  const original = JSON.parse(fs.readFileSync(files.ledgerFile, 'utf8'));
+  for (const [key, value] of Object.entries({ commit_seq: 9, project_id: 'p_beta', base_revision: 3, new_revision: 7, accepted_ops: [], rejected_ops: [{}] })) {
+    fs.writeFileSync(files.ledgerFile, JSON.stringify({ ...original, [key]: value }) + '\n');
+    assert.equal(replayScopedLedger(hub, projectScope).valid, false, key);
+  }
+});
+
+test('a non-prefix head is not a recoverable lag', () => {
+  const hub = tempRoot();
+  commit(hub, [assertion('build')]);
+  const { headFile } = resolveHubPaths(hub).ledgerPaths(projectScope);
+  const head = { ...readScopedHead(hub, projectScope), revision: 0 };
+  fs.writeFileSync(headFile, JSON.stringify(head));
+  assert.equal(replayScopedLedger(hub, projectScope).mismatch_reason, 'head_mismatch');
+  assert.throws(() => hubStore.syncScopedLedger(hub, projectScope), /ledger_integrity:head_mismatch/u);
+  assert.deepEqual(JSON.parse(fs.readFileSync(headFile, 'utf8')), head);
+});
+
+test('revert compensates a multi-op same-key change and rejects a question batch', () => {
+  const hub = tempRoot();
+  commit(hub, [assertion('a'), { op: 'SUPERSEDE', target_id: 'D1', option_code: 'b', summary: 'B', reason: 'A failed' }]);
+  commit(hub, [assertion('b'), { op: 'OPEN_QUESTION', key: 'q', summary: 'What now?' }]);
+  const undo = { ...projectScope, reason: 'Wrong' };
+  assert.equal(hubStore.revertScopedCommit(hub, { ...undo, commitSeq: 2 }).status, 'unsupported_commit');
+  const result = hubStore.revertScopedCommit(hub, { ...undo, commitSeq: 1 });
+  assert.equal(result.commit.ops.length, 1);
+  assert.deepEqual(result.head.active.map(item => item.id), ['D3']);
+  assert.deepEqual(result.head.tombstones.map(item => item.id), ['D1', 'D2']);
+  assert.equal(replayScopedLedger(hub, projectScope).valid, true);
+});
+
+test('revert previews without writes, preserves history, restores a new D ID and refuses a later same-key change', () => {
+  const hub = tempRoot();
+  commit(hub, [assertion('build')]);
+  commit(hub, [{ op: 'SUPERSEDE', target_id: 'D1', option_code: 'b', summary: 'new compiler', reason: 'old compiler fails' }]);
+  commit(hub, [assertion('deploy')]);
+  const files = resolveHubPaths(hub).ledgerPaths(projectScope);
+  const log = fs.readFileSync(files.ledgerFile, 'utf8');
+  const undo = { ...projectScope, commitSeq: 2, reason: 'incorrect proposal' };
+  assert.equal(hubStore.revertScopedCommit(hub, { ...undo, preview: true }).status, 'preview');
+  assert.equal(fs.readFileSync(files.ledgerFile, 'utf8'), log);
+  const result = hubStore.revertScopedCommit(hub, undo);
+  assert.equal(result.status, 'reverted');
+  assert.deepEqual(result.head.active.map(({ id, option_code }) => [id, option_code]), [['D3', 'a'], ['D4', 'a']]);
+  assert.deepEqual(result.head.tombstones.map(({ id, superseded_by }) => [id, superseded_by]), [['D1', 'D2'], ['D2', 'D4']]);
+  assert.equal(hubStore.revertScopedCommit(hub, undo).status, 'already_reverted');
+  assert.equal(hubStore.revertScopedCommit(hub, { ...undo, commitSeq: 1 }).status, 'key_changed');
+  assert.equal(hubStore.revertScopedCommit(hub, { ...undo, commitSeq: 3 }).status, 'reverted');
+  assert.equal(readScopedHead(hub, projectScope).tombstones.at(-1).superseded_by, null);
+  assert.ok(fs.readFileSync(files.ledgerFile, 'utf8').startsWith(log));
+  assert.equal(replayScopedLedger(hub, projectScope).valid, true);
+});
+
+test('two real processes race proposals at the same scoped revision; only one commits', async () => {
+  const hub = tempRoot();
+  const ids = [stage(hub, [assertion('alpha')]), stage(hub, [assertion('beta')])];
+  const script = `
+    import { commitScopedStaged } from ${JSON.stringify(new URL('../src/kernel/hub-store.mjs', import.meta.url).href)};
+    import fs from 'node:fs';
+    const [hub, id, ready, go] = process.argv.slice(1);
+    fs.writeFileSync(ready, '');
+    const start = Date.now();
+    while (!fs.existsSync(go)) {
+      if (Date.now() - start > 5000) throw Error('barrier timeout');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+    console.log(JSON.stringify(commitScopedStaged(hub, { scope: 'project', projectId: 'p_alpha', proposal_id: id })));
+  `;
+  const go = path.join(hub, 'go');
+  const ready = ids.map(id => path.join(hub, id));
+  const children = Promise.all(ids.map((id, i) => promisify(execFile)(process.execPath, ['--input-type=module', '-e', script, hub, id, ready[i], go], { timeout: 7000 })));
+  children.catch(() => {});
+  const start = Date.now();
+  while (!ready.every(file => fs.existsSync(file)) && Date.now() - start < 5000) await new Promise(resolve => setTimeout(resolve, 5));
+  fs.writeFileSync(go, '');
+  const results = (await children).map(child => JSON.parse(child.stdout));
+  assert.equal(results.filter(result => result.committed).length, 1);
+  assert.equal(results.filter(result => result.reason === 'base_revision_conflict').length, 1);
+  assert.equal(replayScopedLedger(hub, projectScope).commit_count, 1);
+  assert.equal(replayScopedLedger(hub, projectScope).valid, true);
+});
 
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });

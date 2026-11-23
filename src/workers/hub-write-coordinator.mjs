@@ -13,7 +13,8 @@ export function createHubWriteCoordinator() {
     const next = previous.catch(() => {}).then(work);
     tails.set(id, next);
     pending.add(next);
-    next.finally(() => { pending.delete(next); if (tails.get(id) === next) tails.delete(id); });
+    const cleanup = () => { pending.delete(next); if (tails.get(id) === next) tails.delete(id); };
+    next.then(cleanup, cleanup);
     return next;
   }
   async function flush() { while (pending.size) await Promise.allSettled([...pending]); }
