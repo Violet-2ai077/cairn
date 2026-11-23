@@ -1,12 +1,15 @@
 # Cairn Reference Host Adapter Patch for DeepSeek Harness (dsh 0.2.2-rc.5)
 # Usage:
 #   dsh --profile web --patch /absolute/path/to/cairn/docs/cairn.patch.example.yml
+# Omit workspaceRoot to resolve each session from session.header.cwd. Set it only
+# when every session in this profile should intentionally share one workspace.
 
 - insert:
     - id: cairn
       name: 'file:///absolute/path/to/cairn/src/hosts/dsh/index.mjs'
       config:
-        workspaceRoot: '/absolute/path/to/target-workspace'
+        # workspaceRoot: '/absolute/path/to/target-workspace'
+        autoInitWorkspace: true
         actorId: 'dsh-main'
         stripMarkerInStream: true
         useHostLlm: true

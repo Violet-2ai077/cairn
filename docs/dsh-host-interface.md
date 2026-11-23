@@ -132,3 +132,24 @@ The integration details below were confirmed against the installed `@deepseek-ai
 | **1. `llm/stream` Chunks & `session/event` Propagation** | **CONFIRMED**: `ReactLoopAgent.step` (`@deepseek-ai/dsh-agent-loop`) feeds every `StreamChunk` (`block-start`, `text-delta`, `reasoning-delta`, `tool-call-delta`, `block-end`, `usage`, `finish`) yielded by `llm/stream` simultaneously into `agent/assistant-stream`, `AssistantStreamAccumulator`, and `BlockAssembler` (`assistant/message`). Modifying chunks in `llm/stream` directly alters the committed `assistant/message`. | `src/hosts/dsh/index.mjs` maintains a 64-character trailing window per text block `index`, stashes the unstripped `rawText` and parsed `<\|task:N\|>` into `accumulator.stashStreamMarker(sessionId, ...)` **before** yielding stripped `text-delta` and shallow-cloned `block-end` chunks, and bypasses `request.purpose === 'cairn-worker'` to prevent reentrancy. |
 | **2. Interactive `/slash` Commands & Tools** | **CONFIRMED**: `@deepseek-ai/dsh-commands` exposes `ctx.commands.register({ name, description, input: { hint }, handler })` returning `{ kind: 'success' \| 'error', text }` in Web/TUI profiles, while `@deepseek-ai/dsh-tools` requires `output: { schema, render }` on `ctx.tools.register(...)`. | Registers `cairn_status`, `cairn_tasks`, `cairn_commit`, and `cairn_drop` (with explicit human-authority red lines) on `ctx.tools.register`, conditionally registers `/cairn` on `ctx.commands` when mounted, and provides the standalone `bin/cairn.mjs` CLI. |
 | **3. Native Compaction (`request.purpose === 'compaction'`)** | **CONFIRMED**: `summarizeWithLlm` in `@deepseek-ai/dsh-compaction-basic` constructs `request.messages` with `deepFreeze`-d `Message` objects (`[system, ...regionMessages, finalUserInstructionMessage]`) and calls `ctx.llm.stream(options)` directly without `prepareCall`. Mutating a frozen message in-place throws `TypeError`, while replacing `request.messages` with a shallow-cloned array and a cloned final `user` message is completely safe and preserves prefix KV-cache reuse. | `injectStrictBoundaryIntoCompactionMessages()` clones `request.messages` and appends `buildStrictCompactorPrompt()` + `buildGlobalExclusionWatchlistSection(head)` to the final `user` compaction directive message without mutating frozen objects. |
+# Multi-workspace runtime (dsh 0.2.2-rc.5)
+
+The plugin is profile-scoped, not workspace-scoped. Unless `workspaceRoot` is explicitly
+configured, each session resolves its own workspace from the absolute `session.header.cwd`.
+The rc.5 agent factory uses the same ID for `agent.id` and `session.id`; `session/created`
+provides restored/announced sessions, while there is no separate `session/loaded` or
+`session/opened` event. For missed announcements the host lazily resolves by `ctx.sessions.get`
+and defensively by `agent.session.header.cwd`. Invalid, missing, non-absolute, or unavailable
+directories fail closed; Cairn never falls back to `process.cwd()`.
+
+`WorkspaceRuntime` instances are pooled by canonical real path (case-folded on Windows).
+Sessions for the same project share its serial write queue and compaction coordinator, while
+session bindings, checkout snapshots, and route state remain session-local. `session/flush`
+drains only its workspace runtime and retains the `AsyncLocalStorage` reentrancy guard;
+`session/disposed` removes only that session's state, and plugin disposal drains every runtime.
+
+Read-only prompt context, status, doctor, and inspect do not create `.cairn/`. The default
+`autoInitWorkspace: true` initializes lazily on the first real write; with `false`, automatic
+turn archiving silently skips until `cairn init` or `/cairn init` is run. `/cairn inspect`
+reports `workspace_fingerprint` (`ws_` plus eight hex characters), `workspace_resolution`,
+and `initialized`, never the absolute path, credentials, prompts, or model text.

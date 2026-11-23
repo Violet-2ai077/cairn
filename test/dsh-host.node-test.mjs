@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import {
   freezeDeep,
+  initCairnStore,
   readHead,
   readStaged,
   readTasksIndex,
@@ -30,18 +31,47 @@ async function withTempWorkspace(fn) {
   }
 }
 
+function emitTurn(ctx, session, turn, userText, assistantText) {
+  ctx.emit('session/event', session, { seq: turn * 10, type: 'turn/start', data: { turn } });
+  ctx.emit('session/event', session, {
+    seq: turn * 10 + 1,
+    type: 'user/message',
+    data: { turn, message: { role: 'user', source: { kind: 'user' }, content: userText } }
+  });
+  ctx.emit('session/event', session, {
+    seq: turn * 10 + 2,
+    type: 'assistant/message',
+    data: { turn, message: { role: 'assistant', content: assistantText } }
+  });
+  ctx.emit('session/event', session, { seq: turn * 10 + 3, type: 'turn/end', data: { turn, reason: { kind: 'completed' } } });
+}
+
+function fileTreeSnapshot(root) {
+  const entries = [];
+  const visit = directory => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(absolute);
+      else entries.push([path.relative(root, absolute), fs.readFileSync(absolute)]);
+    }
+  };
+  visit(root);
+  return entries.sort(([left], [right]) => left.localeCompare(right));
+}
+
 /**
  * Builds a Mock Cordis Context (`ctx`) that enforces real `dsh 0.2.2-rc.1` service contracts:
  * - `tools.register` validates `output: { schema, render }` per `@deepseek-ai/dsh-tools`
  * - `commands.register` validates `/^[a-z][a-z0-9_-]*$/u` per `@deepseek-ai/dsh-commands`
  * - `llm.stream` runs registered `llm/stream` waterfall middleware before calling `adapterStream`
  */
-function createMockDshContext({ adapterStream } = {}) {
+function createMockDshContext({ adapterStream, sessions = [] } = {}) {
   const contexts = new Map();
   const listeners = new Map();
   const tools = new Map();
   const commands = new Map();
   const effects = [];
+  const sessionById = new Map(sessions.map(session => [String(session.id), session]));
 
   function on(eventName, listener) {
     if (!listeners.has(eventName)) {
@@ -80,7 +110,12 @@ function createMockDshContext({ adapterStream } = {}) {
       if (serviceName === 'tools') return ctx.tools;
       if (serviceName === 'llm') return ctx.llm;
       if (serviceName === 'systemPrompt') return ctx.systemPrompt;
+      if (serviceName === 'sessions') return ctx.sessions;
       return undefined;
+    },
+    sessions: {
+      get(id) { return sessionById.get(String(id)); },
+      list() { return [...sessionById.values()]; }
     },
     systemPrompt: {
       context(entry) {
@@ -148,7 +183,8 @@ function createMockDshContext({ adapterStream } = {}) {
       listeners,
       tools,
       commands,
-      effects
+      effects,
+      sessions: sessionById
     }
   };
 
@@ -1134,6 +1170,215 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       assert.equal(ctx._registry.commands.size, 0);
       assert.equal(ctx._registry.contexts.size, 0);
       assert.equal((ctx._registry.listeners.get('llm/stream') ?? []).length, 0);
+    });
+  });
+
+  test('M3.1 one plugin isolates project A/B by session cwd and shares one runtime across sessions in A', async () => {
+    await withTempWorkspace(async projectA => withTempWorkspace(async projectB => {
+      for (const [root, title, marker] of [[projectA, 'Project A', 'A_ONLY_HISTORY'], [projectB, 'Project B', 'B_ONLY_HISTORY']]) {
+        initCairnStore(root);
+        upsertTask(root, { id: 1, title });
+        appendTaskTurn(root, { task_id: 1, turn: 1, role: 'user', content: marker });
+      }
+      const sessions = [
+        { id: 'session-a1', header: { cwd: projectA } },
+        { id: 'session-a2', header: { cwd: projectA } },
+        { id: 'session-b', header: { cwd: projectB } }
+      ];
+      const ctx = createMockDshContext({ sessions });
+      const router = {
+        async complete() {
+          return { ok: true, content: JSON.stringify({ decision: 'match', task_id: 1, reason: 'same local project task' }) };
+        }
+      };
+      const host = await applyCairnDshHost(ctx, {
+        useHostLlm: false,
+        llmClient: router,
+        autoCompactMinRecords: 0,
+        autoCompactMinChars: 0
+      });
+      const routeFor = async id => ctx.runPreStep({
+        agent: { id },
+        turn: 1,
+        step: 1,
+        signal: new AbortController().signal,
+        modelSelection: { provider: 'test-provider', model: 'test-model' },
+        messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `continue ${id}` }] }]
+      });
+      await routeFor('session-a1');
+      await routeFor('session-b');
+
+      const textFor = id => ctx.systemPrompt.renderAll({ agent: { id } })
+        .map(section => section.text).join('\n');
+      const aText = textFor('session-a1');
+      const bText = textFor('session-b');
+      assert.match(aText, /A_ONLY_HISTORY/);
+      assert.doesNotMatch(aText, /B_ONLY_HISTORY/);
+      assert.match(bText, /B_ONLY_HISTORY/);
+      assert.doesNotMatch(bText, /A_ONLY_HISTORY/);
+
+      const runtimeA = host.getRuntime('session-a1');
+      const runtimeA2 = host.getRuntime('session-a2');
+      const runtimeB = host.getRuntime('session-b');
+      assert.ok(runtimeA);
+      assert.strictEqual(runtimeA, runtimeA2, 'sessions in one project must reuse the exact runtime, queue, and task lock');
+      assert.notStrictEqual(runtimeA, runtimeB);
+      assert.strictEqual(runtimeA.accumulator, runtimeA2.accumulator);
+      assert.strictEqual(runtimeA.compactionCoordinator, runtimeA2.compactionCoordinator);
+      assert.equal(runtimeA.routeStates.has('session-a1'), true);
+      assert.equal(runtimeA.routeStates.has('session-a2'), false, 'route/snapshot state remains session-scoped');
+
+      const tasksA = await ctx._registry.tools.get('cairn_tasks').execute({}, { agent: { id: 'session-a1' } });
+      const tasksB = await ctx._registry.tools.get('cairn_tasks').execute({}, { agent: { id: 'session-b' } });
+      assert.match(tasksA, /Project A/);
+      assert.doesNotMatch(tasksA, /Project B/);
+      assert.match(tasksB, /Project B/);
+      assert.doesNotMatch(tasksB, /Project A/);
+
+      emitTurn(ctx, sessions[0], 2, 'A session-specific write', 'Saved in A.\n<|task:1|>');
+      emitTurn(ctx, sessions[2], 2, 'B session-specific write', 'Saved in B.\n<|task:1|>');
+      await Promise.all([runtimeA.accumulator.flushPendingJobs(), runtimeB.accumulator.flushPendingJobs()]);
+      assert.ok(readTaskThread(projectA, 1).some(record => record.content.includes('A session-specific write')));
+      assert.equal(readTaskThread(projectA, 1).some(record => record.content.includes('B session-specific write')), false);
+      assert.ok(readTaskThread(projectB, 1).some(record => record.content.includes('B session-specific write')));
+      assert.equal(readTaskThread(projectB, 1).some(record => record.content.includes('A session-specific write')), false);
+
+      let releaseACompaction;
+      let markACompactionStarted;
+      const aCompactionStarted = new Promise(resolve => { markACompactionStarted = resolve; });
+      const aGate = new Promise(resolve => { releaseACompaction = resolve; });
+      let aCompactionCalls = 0;
+      let bCompactionCalls = 0;
+      const aClient = {
+        async complete() {
+          aCompactionCalls++;
+          markACompactionStarted();
+          await aGate;
+          return { ok: true, content: 'Project A compact summary' };
+        }
+      };
+      const bClient = {
+        async complete() {
+          bCompactionCalls++;
+          return { ok: true, content: 'Project B compact summary' };
+        }
+      };
+      const aFirst = runtimeA.compactionCoordinator.run({ taskId: 1, source: 'manual', llmClient: aClient });
+      await aCompactionStarted;
+      const aSecond = runtimeA2.compactionCoordinator.run({ taskId: 1, source: 'manual', llmClient: aClient });
+      const bIndependent = runtimeB.compactionCoordinator.run({ taskId: 1, source: 'manual', llmClient: bClient });
+      await bIndependent;
+      assert.equal(bCompactionCalls, 1, 'the same task id in project B must not wait on project A lock');
+      assert.equal(aCompactionCalls, 1, 'the two A sessions share one task lock');
+      releaseACompaction();
+      const [aFirstResult, aSecondResult] = await Promise.all([aFirst, aSecond]);
+      assert.equal(aFirstResult.ok, true);
+      assert.equal(aSecondResult.reason, 'no_new_turns');
+      assert.equal(aCompactionCalls, 1);
+
+      const inspectA = JSON.parse((await ctx._registry.commands.get('cairn').handler({ rawInput: 'inspect', agent: { id: 'session-a1' } })).text);
+      const inspectB = JSON.parse((await ctx._registry.commands.get('cairn').handler({ rawInput: 'inspect', agent: { id: 'session-b' } })).text);
+      assert.match(inspectA.workspace_fingerprint, /^ws_[0-9a-f]{8}$/u);
+      assert.match(inspectB.workspace_fingerprint, /^ws_[0-9a-f]{8}$/u);
+      assert.notEqual(inspectA.workspace_fingerprint, inspectB.workspace_fingerprint);
+      for (const inspect of [inspectA, inspectB]) {
+        const serialized = JSON.stringify(inspect);
+        assert.doesNotMatch(serialized, new RegExp(projectA.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'iu'));
+        assert.doesNotMatch(serialized, new RegExp(projectB.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'iu'));
+        assert.doesNotMatch(serialized, /prompt|api.?key|model response/iu);
+      }
+      const disposeSession = ctx._registry.listeners.get('session/disposed')?.[0];
+      await disposeSession(sessions[0]);
+      assert.equal(host.getRuntime('session-a1'), null);
+      assert.strictEqual(host.getRuntime('session-a2'), runtimeA, 'disposing one session must retain shared project runtime');
+      assert.equal(runtimeA.routeStates.has('session-a1'), false);
+      await host.dispose();
+    }));
+  });
+
+  test('M3.1 missing cwd is fail-closed; readonly paths never initialize; auto-init and explicit init work lazily', async () => {
+    await withTempWorkspace(async workspace => {
+      const session = { id: 'session-lazy', header: { cwd: workspace } };
+      const ctx = createMockDshContext({ sessions: [session] });
+      const host = await applyCairnDshHost(ctx, { autoCompactMinRecords: 0, autoCompactMinChars: 0 });
+      assert.equal(fs.existsSync(path.join(workspace, '.cairn')), false);
+      ctx.systemPrompt.renderAll({ agent: { id: session.id } });
+      await ctx.runPreStep({
+        agent: { id: session.id }, turn: 1, step: 1,
+        signal: new AbortController().signal,
+        modelSelection: { provider: 'test-provider', model: 'test-model' },
+        messages: [{ role: 'user', source: { kind: 'user' }, content: 'read-only first prompt' }]
+      });
+      await ctx._registry.tools.get('cairn_status').execute({}, { agent: { id: session.id } });
+      await ctx._registry.commands.get('cairn').handler({ rawInput: 'doctor', agent: { id: session.id } });
+      emitTurn(ctx, session, 1, 'No marker, so no state should be created.', 'Ordinary response.');
+      assert.equal(fs.existsSync(path.join(workspace, '.cairn')), false);
+
+      emitTurn(ctx, session, 2, 'Create the first task.', 'Created.\n<|task:1|>');
+      assert.equal(fs.existsSync(path.join(workspace, '.cairn')), true, 'first concrete task marker lazily initializes when autoInitWorkspace defaults true');
+      assert.ok(readTaskThread(workspace, 1).length > 0);
+      await host.dispose();
+    });
+
+    await withTempWorkspace(async workspace => {
+      const session = { id: 'session-manual-init', header: { cwd: workspace } };
+      const ctx = createMockDshContext({ sessions: [session] });
+      const host = await applyCairnDshHost(ctx, {
+        autoInitWorkspace: false,
+        autoCompactMinRecords: 0,
+        autoCompactMinChars: 0
+      });
+      emitTurn(ctx, session, 1, 'Do not auto-create the store.', 'Skipped.\n<|task:1|>');
+      assert.equal(fs.existsSync(path.join(workspace, '.cairn')), false);
+      const initialized = await ctx._registry.commands.get('cairn').handler({ rawInput: 'init', agent: { id: session.id } });
+      assert.equal(initialized.kind, 'success');
+      assert.equal(fs.existsSync(path.join(workspace, '.cairn')), true);
+      const second = await ctx._registry.commands.get('cairn').handler({ rawInput: 'init', agent: { id: session.id } });
+      assert.equal(second.kind, 'success');
+      assert.equal(JSON.parse((await ctx._registry.commands.get('cairn').handler({ rawInput: 'inspect', agent: { id: session.id } })).text).initialized, true);
+      await host.dispose();
+    });
+
+    const processStore = path.join(process.cwd(), '.cairn');
+    const processStoreExisted = fs.existsSync(processStore);
+    const missingContext = createMockDshContext();
+    const missingHost = await applyCairnDshHost(missingContext, {});
+    assert.equal(missingContext.systemPrompt.renderAll({ agent: { id: 'no-cwd-session' } }).every(item => !item.text), true);
+    const missingCommand = await missingContext._registry.commands.get('cairn').handler({ rawInput: 'status', agent: { id: 'no-cwd-session' } });
+    assert.equal(missingCommand.kind, 'error');
+    assert.match(missingCommand.text, /workspace_cwd_missing|workspace_unavailable/u);
+    assert.equal(fs.existsSync(processStore), processStoreExisted, 'missing cwd must not fall back and create state in process.cwd()');
+    await missingHost.dispose();
+  });
+
+  test('M3.1 historical-session lazy lookup by agent.id and read-only status/doctor preserve workspace files', async () => {
+    await withTempWorkspace(async workspace => {
+      initCairnStore(workspace);
+      upsertTask(workspace, { id: 1, title: 'Historical task' });
+      appendTaskTurn(workspace, { task_id: 1, turn: 1, role: 'user', content: 'Existing history' });
+      const session = { id: 'historical-session', header: { cwd: workspace } };
+      const ctx = createMockDshContext();
+      const host = await applyCairnDshHost(ctx, { autoCompactMinRecords: 0, autoCompactMinChars: 0 });
+      ctx._registry.sessions.set(session.id, session);
+      const agent = { id: session.id };
+      const command = await ctx._registry.commands.get('cairn').handler({ rawInput: 'tasks', agent });
+      assert.equal(command.kind, 'success');
+      assert.match(command.text, /Historical task/);
+      assert.equal(host.getRuntime(session.id).workspaceRoot.toLowerCase(), fs.realpathSync.native(workspace).toLowerCase());
+
+      const store = path.join(workspace, '.cairn');
+      const before = fileTreeSnapshot(store);
+      const status = await ctx._registry.commands.get('cairn').handler({ rawInput: 'status', agent });
+      const doctor = await ctx._registry.commands.get('cairn').handler({ rawInput: 'doctor', agent });
+      assert.equal(status.kind, 'success');
+      assert.equal(doctor.kind, 'success');
+      assert.deepEqual(fileTreeSnapshot(store), before);
+
+      const sessionOnlyAgent = { session };
+      const viaAgentSession = await ctx._registry.commands.get('cairn').handler({ rawInput: 'inspect', agent: sessionOnlyAgent });
+      assert.equal(viaAgentSession.kind, 'success');
+      assert.equal(JSON.parse(viaAgentSession.text).workspace_fingerprint, JSON.parse((await ctx._registry.commands.get('cairn').handler({ rawInput: 'inspect', agent })).text).workspace_fingerprint);
+      await host.dispose();
     });
   });
 });

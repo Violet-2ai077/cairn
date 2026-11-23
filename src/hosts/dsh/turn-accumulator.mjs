@@ -65,6 +65,7 @@ function summarizeToolTarget(name, rawArgs) {
 export function createTurnAccumulator({
   workspaceRoot = process.cwd(),
   actorId = 'dsh-host',
+  autoInitWorkspace = true,
   getLlmClient,
   autoCompactMinRecords = 0,
   autoCompactMinChars = 0,
@@ -306,10 +307,6 @@ export function createTurnAccumulator({
         return;
       }
 
-      if (!isCairnInitialized(workspaceRoot)) {
-        initCairnStore(workspaceRoot);
-      }
-
       // 1. Archive to .cairn/tasks/<id>/thread.jsonl if resolved to a specific task 1..999
       let resolvedTaskId = null;
       let attribution = null;
@@ -332,6 +329,13 @@ export function createTurnAccumulator({
           attribution = 'session_fallback';
           lastTaskIdBySession.set(sessionId, resolvedTaskId);
         }
+      }
+
+      if (!isCairnInitialized(workspaceRoot)) {
+        const hasConcreteMarker = parsedMarker?.valid &&
+          !parsedMarker.is_unresolved && typeof parsedMarker.task_number === 'number';
+        if (!autoInitWorkspace || !hasConcreteMarker) return;
+        initCairnStore(workspaceRoot);
       }
 
       if (resolvedTaskId !== null) {

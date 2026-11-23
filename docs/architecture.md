@@ -26,6 +26,13 @@ Cairn solves this by modeling agent memory after Git's staging and commit lifecy
 
 Every workspace managed by Cairn stores its state in a human-inspectable, plain-text `.cairn/` directory:
 
+In the dsh adapter, the default is one `.cairn/` store per session workspace: an explicit
+`workspaceRoot` overrides session `header.cwd`; otherwise each session's validated absolute
+cwd selects a lazily-created `WorkspaceRuntime`. No cwd means fail-closed (never `process.cwd()`).
+Read-only commands and prompts do not initialize an empty workspace. With the default
+`autoInitWorkspace: true`, the first actual write initializes it; setting it to `false` requires
+`cairn init` or `/cairn init` before automatic archiving can persist turns.
+
 ```text
 .cairn/
 ├── head.json                   # Materialized read-only Workspace State Ledger snapshot (revision, active, tombstones, open_questions)
