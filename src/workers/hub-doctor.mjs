@@ -1,28 +1,113 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { isHubInitialized, readHubTasksIndex, readProjectsIndex, replayScopedLedger, resolveHubPaths, readHubTaskThread } from '../kernel/index.mjs';
+import { isHubInitialized, readFileWrites, readHubTasksIndex, readProjectsIndex, replayScopedLedger, resolveHubPaths, readHubTaskThread } from '../kernel/index.mjs';
+import { readTaskObservations } from '../kernel/hub-store.mjs';
+
+function inspectReceipts(paths, observations, inspect, issue) {
+  const dir = path.join(paths.sessionsDir, 'turns');
+  if (!fs.existsSync(dir)) return;
+  for (const session of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!/^[a-f0-9]{24}$/u.test(session.name)) continue;
+    const fields = { session_key: session.name };
+    inspect('receipt_directory_unreadable', fields, () => {
+      if (!session.isDirectory()) throw new Error('invalid_directory');
+      const folder = path.join(dir, session.name);
+      for (const name of fs.readdirSync(folder).filter(n => /^\d+\.json$/u.test(n))) {
+        const turn = Number.parseInt(name, 10);
+        inspect('turn_receipt_unreadable', { ...fields, turn }, () => {
+          const r = JSON.parse(fs.readFileSync(path.join(folder, name), 'utf8'));
+          if (r.turn !== turn || typeof r.status !== 'string') throw new Error('invalid_receipt');
+          if (r.observation_task_id != null && !observations.has([r.observation_task_id, session.name, turn].join(':'))) {
+            issue('receipt_observation_missing', { ...fields, turn, task_id: r.observation_task_id });
+          }
+        });
+      }
+    });
+  }
+}
 
 export function runHubDoctor({ hubRoot } = {}) {
-  const paths = resolveHubPaths(hubRoot);
-  const issues = [];
-  if (!isHubInitialized(hubRoot)) issues.push({ code: 'hub_not_initialized' });
-  const projects = readProjectsIndex(hubRoot);
-  const tasks = readHubTasksIndex(hubRoot);
-  const userReplay = replayScopedLedger(hubRoot, { scope: 'user' });
-  if (!userReplay.valid) issues.push({ code: userReplay.mismatch_reason === 'materialization_pending' ? 'user_ledger_sync_pending' : 'user_ledger_replay_mismatch', reason: userReplay.mismatch_reason });
-  for (const project of projects.projects) {
-    const replay = replayScopedLedger(hubRoot, { scope: 'project', projectId: project.project_id });
-    if (!replay.valid) issues.push({ code: replay.mismatch_reason === 'materialization_pending' ? 'project_ledger_sync_pending' : 'project_ledger_replay_mismatch', project_id: project.project_id, reason: replay.mismatch_reason });
+  const paths = resolveHubPaths(hubRoot), issues = [];
+  const issue = (code, fields = {}) => issues.push({ code, ...fields });
+  const inspect = (code, fields, fn) => {
+    try { return fn(); } catch { issue(code, fields); return null; }
+  };
+  const initialized = isHubInitialized(hubRoot);
+  if (!initialized) issue('hub_not_initialized');
+  if (fs.existsSync(paths.hubFile)) inspect('hub_metadata_invalid', {}, () => {
+    if (JSON.parse(fs.readFileSync(paths.hubFile, 'utf8')).schema_version !== 1) issue('hub_schema_unsupported');
+  });
+  function index(key, file, reader) {
+    return inspect(key + '_index_unreadable', {}, () => {
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!Array.isArray(raw[key]) || raw.schema_version !== 1) throw new Error('invalid_index');
+      if (key === 'tasks' && raw.tasks.some(t => ['turn_count', 'compacted_record_count'].some(k =>
+        Object.hasOwn(t, k) && (!Number.isSafeInteger(t[k]) || t[k] < 0)))) throw new Error('invalid_index_counter');
+      return reader(hubRoot)[key];
+    });
   }
-  for (const task of tasks.tasks) {
-    if (!fs.existsSync(paths.taskThreadFile(task.id))) issues.push({ code: 'task_thread_missing', task_id: task.id });
-    const count = readHubTaskThread(hubRoot, task.id).length;
-    if (task.compacted_record_count > count) issues.push({ code: 'task_cursor_out_of_bounds', task_id: task.id, cursor: task.compacted_record_count, record_count: count });
-    if (task.project_id && !projects.projects.some(p => p.project_id === task.project_id)) issues.push({ code: 'task_project_unregistered', task_id: task.id, project_id: task.project_id });
+  const projects = index('projects', paths.projectsIndexFile, readProjectsIndex);
+  const tasks = index('tasks', paths.tasksIndexFile, readHubTasksIndex);
+  function ledger(scope, projectId = null) {
+    const fields = projectId ? { project_id: projectId } : {};
+    inspect(scope + '_ledger_unreadable', fields, () => {
+      const replay = replayScopedLedger(hubRoot, { scope, projectId });
+      if (!replay.valid) {
+        const reason = replay.mismatch_reason?.split(':', 1)[0];
+        issue(scope + (reason === 'materialization_pending' ? '_ledger_sync_pending' : '_ledger_replay_mismatch'), { ...fields, reason });
+      }
+    });
   }
-  const registered = new Set(projects.projects.map(p => p.project_id));
-  if (fs.existsSync(paths.projectsDir)) for (const dir of fs.readdirSync(paths.projectsDir, { withFileTypes: true })) {
-    if (dir.isDirectory() && dir.name !== 'index.json' && !registered.has(dir.name) && fs.existsSync(path.join(paths.projectsDir, dir.name, 'ledger'))) issues.push({ code: 'orphan_project_ledger', project_id: dir.name });
+  ledger('user');
+  for (const project of projects ?? []) ledger('project', project.project_id);
+  const observations = new Set();
+  for (const task of tasks ?? []) {
+    const fields = { task_id: task.id };
+    if (!fs.existsSync(paths.taskDir(task.id))) issue('task_dir_missing', fields);
+    // A new task has a directory but no thread until its first record is appended.
+    if (task.turn_count > 0 && !fs.existsSync(paths.taskThreadFile(task.id))) issue('task_thread_missing', fields);
+    inspect('task_thread_unreadable', fields, () => {
+      const rows = readHubTaskThread(hubRoot, task.id, { requireComplete: true }), count = rows.length;
+      if (task.turn_count !== count) issue('task_record_count_mismatch', { ...fields, indexed_count: task.turn_count, record_count: count });
+      if (task.compacted_record_count < 0 || task.compacted_record_count > count) {
+        issue('task_cursor_out_of_bounds', { ...fields, cursor: task.compacted_record_count, record_count: count });
+      }
+      const bad = rows.findIndex((r, i) => r?.seq !== i + 1 || r.project_id !== task.project_id);
+      if (bad !== -1) issue('task_record_identity_mismatch', { ...fields, record_number: bad + 1 });
+    });
+    if ((task.has_compact || task.compacted_record_count > 0) && !fs.existsSync(paths.taskCompactFile(task.id))) issue('task_compact_missing', fields);
+    inspect('task_observations_unreadable', fields, () => {
+      for (const row of readTaskObservations(hubRoot, task.id)) {
+        const session = path.basename(paths.sessionBindingFile(row.source.session_id), '.json');
+        observations.add([task.id, session, row.source.turn].join(':'));
+      }
+    });
+    inspect('task_file_writes_unreadable', fields, () => {
+      for (const w of readFileWrites(hubRoot, task.id)) {
+        if (w.task_id !== task.id || w.project_id !== task.project_id || !/^[a-f0-9]{64}$/u.test(w.id) ||
+          !/^[a-f0-9]{64}$/u.test(w.expected_sha256) || typeof w.relative_path !== 'string' ||
+          !fs.existsSync(path.join(paths.taskDir(task.id), 'file-writes', w.id + '.json'))) {
+          issue('task_file_write_identity_invalid', fields);
+          break;
+        }
+      }
+    });
+    if (projects && task.project_id && !projects.some(p => p.project_id === task.project_id)) issue('task_project_unregistered', fields);
   }
-  return { ok: issues.length === 0, hub_initialized: isHubInitialized(hubRoot), project_count: projects.projects.length, task_count: tasks.tasks.length, issues };
+  if (tasks) inspect('receipts_unreadable', {}, () => inspectReceipts(paths, observations, inspect, issue));
+  if (projects && fs.existsSync(paths.projectsDir)) inspect('projects_dir_unreadable', {}, () => {
+    const known = new Set(projects.map(p => p.project_id));
+    for (const dir of fs.readdirSync(paths.projectsDir, { withFileTypes: true })) {
+      if (dir.isDirectory() && !known.has(dir.name) && fs.existsSync(path.join(paths.projectsDir, dir.name, 'ledger'))) {
+        issue('orphan_project_ledger', { project_id: dir.name });
+      }
+    }
+  });
+  if (tasks && fs.existsSync(paths.tasksDir)) inspect('tasks_dir_unreadable', {}, () => {
+    const known = new Set(tasks.map(t => String(t.id)));
+    for (const dir of fs.readdirSync(paths.tasksDir, { withFileTypes: true })) {
+      if (dir.isDirectory() && /^[1-9]\d*$/u.test(dir.name) && !known.has(dir.name)) issue('orphan_task_directory', { task_id: Number(dir.name) });
+    }
+  });
+  return { ok: !issues.length, hub_initialized: initialized, project_count: projects?.length ?? 0, task_count: tasks?.length ?? 0, issues };
 }

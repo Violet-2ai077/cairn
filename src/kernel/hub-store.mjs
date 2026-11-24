@@ -494,10 +494,12 @@ export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessi
   return { appended: missing.length > 0, roles: missing, prior_seq: records.length, end_seq: records.length + missing.length };
 });
 
-export function readHubTaskThread(hubRoot, taskId) {
+export function readHubTaskThread(hubRoot, taskId, { requireComplete = false } = {}) {
   const file = resolveHubPaths(hubRoot).taskThreadFile(taskId);
   if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, 'utf8').split(/\r?\n/u).filter(Boolean).map((line, index) => {
+  const text = requireComplete ? new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(file)) : fs.readFileSync(file, 'utf8');
+  if (requireComplete && text && !text.endsWith('\n')) throw new Error('task_thread_incomplete_line');
+  return text.split(/\r?\n/u).filter(Boolean).map((line, index) => {
     try { return JSON.parse(line); }
     catch (error) { throw new Error(`task_thread_line_${index + 1}_invalid:${error.message}`); }
   });

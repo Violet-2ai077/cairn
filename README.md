@@ -69,6 +69,10 @@ cairn verify-write 1 <write-id> --store /path/to/hub --json
 
 `matches` (exit 0) means the bytes matched the expected SHA-256 **when checked**. `differs` (2) means the bytes differed or the file was missing. `unverifiable` (3) means no safe comparison could be made. Command/usage errors exit 1. The command records its latest finding on the active task; it does not write the target, repeat the tool, or mark the task complete. Ordinary checkout only reads the Hub.
 
+### Health and recovery
+
+For day-to-day Hub use, [check health and rehearse a cold restore](docs/hub-recovery.md) before relying on the ledger. `doctor` is read-only. `backup` and `restore` use explicit store paths and fresh destinations; neither changes which Hub dsh is configured to use.
+
 ## Running Tests
 
 Cairn uses Node.js built-in test runner (`node:test` and `node:assert/strict`) with zero external runtime dependencies:

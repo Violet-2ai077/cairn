@@ -937,7 +937,7 @@ test('Hub host withholds cwd project ledger until pre-step locks the project and
     assert.equal(inspect.binding_source, 'cold_router_match');
     assert.doesNotMatch(inspectResult.text, /[A-Z]:[\\/]|Continue beta|specific beta service/iu);
     const doctor = await ctx.registeredCommands[0].handler({ rawInput: 'doctor', agent: { session: { id: 's1' } } });
-    assert.match(doctor.text, /task_thread_missing/u);
+    assert.equal(JSON.parse(doctor.text).ok, true, 'new task has no history to lose');
     assert.equal(fs.existsSync(path.join(projectA, '.cairn')), false);
     assert.equal(fs.existsSync(path.join(projectB, '.cairn')), false);
   } finally { await host.dispose(); fs.rmSync(temp, { recursive: true, force: true }); }

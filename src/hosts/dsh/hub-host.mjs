@@ -489,7 +489,10 @@ export async function createHubDshHost(ctx, config = {}) {
         const receipts = readTurnReceipts(hubRoot, sessionId, args[1] ? Number(args[1]) : null);
         return { kind: receipts === null ? 'error' : 'success', text: JSON.stringify(receipts, null, 2) };
       }
-      if (args[0] === 'doctor') return { kind: 'success', text: JSON.stringify(runHubDoctor({ hubRoot }), null, 2) };
+      if (args[0] === 'doctor') {
+        const report = runHubDoctor({ hubRoot });
+        return { kind: report.ok ? 'success' : 'error', text: JSON.stringify(report, null, 2) };
+      }
       if (args[0] === 'status') return { kind: 'success', text: JSON.stringify(readStatus(), null, 2) };
       if (args[0] === 'init') return { kind: 'success', text: JSON.stringify(initHubStore(hubRoot)) };
       if (args[0] === 'commit' || args[0] === 'drop') {

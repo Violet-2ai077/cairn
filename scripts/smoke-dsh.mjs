@@ -30,8 +30,8 @@ function verifyWriteCrash(writer, projectId) {
   const priorBinding = readSessionBinding(hub, writer);
   const priorHeads = [readScopedHead(hub), readScopedHead(hub, { scope: 'project', projectId })];
   run('file-write-crash', 'Write the requested test artifact.', writer, cwd, 24);
-  const cli = (args, code = 0) => {
-    const r = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/cairn.mjs', import.meta.url)), ...args, '--store', hub, '--json'],
+  const cli = (args, code = 0, store = hub) => {
+    const r = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/cairn.mjs', import.meta.url)), ...args, '--store', store, '--json'],
       { encoding: 'utf8', windowsHide: true });
     assert.equal(r.status, code, r.stderr + r.stdout);
     return JSON.parse(r.stdout);
@@ -46,6 +46,16 @@ function verifyWriteCrash(writer, projectId) {
   assert.equal(intent.source.session_id, writer);
   assert.equal(intent.relative_path, 'effect.txt');
   assert.equal(intent.last_check, null);
+  // The child dsh has exited. Exercise the operator commands, not an in-memory clone of the Hub.
+  const bundle = path.join(tmp, 'cold-backup'), restored = path.join(tmp, 'restored-hub');
+  const checkoutArgs = ['checkout', '1', '--preview'], original = cli(checkoutArgs);
+  assert.equal(cli(['backup', bundle]).ok, true);
+  assert.equal(cli(['restore', bundle], 0, restored).ok, true);
+  assert.equal(cli(['doctor'], 0, restored).ok, true);
+  assert.deepEqual(cli(checkoutArgs, 0, restored), original);
+  assert.equal(cli(['verify-write', '1', intent.id], 0, restored).status, 'matches');
+  assert.equal(previewWrites()[0].last_check, null, 'restored verification cannot update the original Hub');
+  console.log('PASS: cold backup of the stopped dsh Hub restored the same handoff; explicit verification updated only the new Hub.');
   assert.equal(fs.readFileSync(written, 'utf8'), 'exact UTF-8 bytes: \u03bb\r\n');
   const verify = code => cli(['verify-write', '1', intent.id], code);
   assert.equal(verify(0).status, 'matches');

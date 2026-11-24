@@ -24,6 +24,7 @@ import { resolveStoreRoot } from '../src/workers/store-root.mjs';
 import { compileHubHandoff } from '../src/workers/hub-handoff.mjs';
 import { verifyFileWrite } from '../src/kernel/file-writes.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
+import { backupHub, restoreHub } from '../src/workers/hub-recovery.mjs';
 import { runHubStrictCompactor } from '../src/workers/hub-strict-compactor.mjs';
 import { listHubTaskPools, resolveTaskHeatPolicy } from '../src/kernel/task-heat.mjs';
 import {
@@ -50,6 +51,8 @@ function printUsage(writeOut) {
       '  cairn doctor [--cwd <dir>] [--json]'
       ,'  cairn checkout <id|--clear> [--preview] [--cwd <dir>]'
       ,'  cairn verify-write <task-id> <write-id> [--store <path>] [--json]'
+      ,'  cairn backup <new-bundle-dir> --store <stopped-hub> [--json]'
+      ,'  cairn restore <bundle-dir> --store <new-hub-dir> [--json]'
       ,'  cairn compact <id> [--full] [--cwd <dir>]'
       ,'  Hub default: $DSH_HOME/cairn or ~/.cairn; use --store <path> to override. --cwd selects legacy workspace storage.'
       ,'  cairn revert <seq> --scope <user|project> [--project <id>] --reason <text> [--preview] [--store <path>] [--json]'
@@ -372,10 +375,20 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
   const projectId = values.project ?? null;
   const emit = value => stdout(asJson ? JSON.stringify(value, null, 2) : String(value));
   try {
+    if (command === 'backup' || command === 'restore') {
+      if (positionals.length !== 2 || !targetArg?.trim() || !values.store?.trim() ||
+          Object.entries(values).some(([key, v]) => v && key !== 'json' && key !== 'store')) {
+        throw new Error('Use cairn ' + command + ' <bundle-dir> --store <hub-dir> [--json]');
+      }
+      const result = command === 'backup' ? backupHub(hubRoot, targetArg) : restoreHub(targetArg, hubRoot);
+      emit(asJson ? result : 'Verified ' + result.file_count + ' files: ' + (result.backup ?? result.hub));
+      return 0;
+    }
     if (command === 'init') { emit(initHubStore(hubRoot)); return 0; }
     if (command === 'doctor') {
       const report = runHubDoctor({ hubRoot });
-      emit(report);
+      if (asJson) emit(report);
+      else stdout(['Hub doctor: ' + (report.ok ? 'OK' : 'issues found'), ...report.issues.map(i => JSON.stringify(i))].join('\n'));
       return report.ok ? 0 : 1;
     }
     if (command === 'status') {
