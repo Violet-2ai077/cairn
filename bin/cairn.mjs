@@ -22,6 +22,7 @@ import {
 import { compileTaskCheckout, runStrictCompactor, createOpenAICompatibleClient, runWorkspaceDoctor } from '../src/workers/index.mjs';
 import { resolveStoreRoot } from '../src/workers/store-root.mjs';
 import { compileHubHandoff } from '../src/workers/hub-handoff.mjs';
+import { verifyFileWrite } from '../src/kernel/file-writes.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
 import { runHubStrictCompactor } from '../src/workers/hub-strict-compactor.mjs';
 import { listHubTaskPools, resolveTaskHeatPolicy } from '../src/kernel/task-heat.mjs';
@@ -48,6 +49,7 @@ function printUsage(writeOut) {
       '  cairn close <id> | archive <id> | reopen <id> [--cwd <dir>] [--json]',
       '  cairn doctor [--cwd <dir>] [--json]'
       ,'  cairn checkout <id|--clear> [--preview] [--cwd <dir>]'
+      ,'  cairn verify-write <task-id> <write-id> [--store <path>] [--json]'
       ,'  cairn compact <id> [--full] [--cwd <dir>]'
       ,'  Hub default: $DSH_HOME/cairn or ~/.cairn; use --store <path> to override. --cwd selects legacy workspace storage.'
       ,'  cairn revert <seq> --scope <user|project> [--project <id>] --reason <text> [--preview] [--store <path>] [--json]'
@@ -418,6 +420,12 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
       emit(result); return result.conflict || result.all_rejected ? 1 : 0;
     }
     if (command === 'drop') { emit(dropScopedStaged(hubRoot, { scope, projectId, proposal_id: targetArg })); return 0; }
+    if (command === 'verify-write') {
+      if (positionals.length !== 3 || !/^[1-9]\d*$/u.test(targetArg) || values.preview) throw new Error('Use verify-write <task-id> <write-id>');
+      const result = verifyFileWrite(hubRoot, Number(targetArg), positionals[2]);
+      emit(asJson ? result : [result.relative_path, result.status, result.reason ?? result.actual_sha256, result.checked_at].join('  '));
+      return result.status === 'matches' ? 0 : result.status === 'differs' ? 2 : 3;
+    }
     if (command === 'checkout') {
       const sessionId = values.session;
       if (targetArg === '--clear' || values.clear) {

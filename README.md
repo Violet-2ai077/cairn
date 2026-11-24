@@ -59,6 +59,16 @@ cairn checkout 1 --store /path/to/hub --preview --json
 
 Both show the applicable rules, filed history and any checkpointed tool results for turns that were not filed. A result from an interrupted turn is evidence to verify, not a completed task or an instruction to repeat the tool. See [the handoff format](docs/architecture.md#read-only-task-handoff-hub).
 
+### Checking a file after a disconnect
+
+If a bound dsh task started a native full-file `write`, its checkout can show a write ID even when no tool result returned. Copy the ID from `work_state.file_writes` and explicitly check the file:
+
+```sh
+cairn verify-write 1 <write-id> --store /path/to/hub --json
+```
+
+`matches` (exit 0) means the bytes matched the expected SHA-256 **when checked**. `differs` (2) means the bytes differed or the file was missing. `unverifiable` (3) means no safe comparison could be made. Command/usage errors exit 1. The command records its latest finding on the active task; it does not write the target, repeat the tool, or mark the task complete. Ordinary checkout only reads the Hub.
+
 ## Running Tests
 
 Cairn uses Node.js built-in test runner (`node:test` and `node:assert/strict`) with zero external runtime dependencies:

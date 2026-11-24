@@ -5,7 +5,7 @@ import { textOf, collectToolEvidence, resumeUserText } from './turn-journal.mjs'
 import { selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { mentionsCompetingTopic, runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
-import { readHandoffInputs, renderHandoffAuthority, renderHandoffObservations } from '../../workers/hub-handoff.mjs';
+import { readHandoffInputs, renderHandoffAuthority, renderHandoffObservations, renderFileWrites } from '../../workers/hub-handoff.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
 import { genericResume, pickTask, resumeIntent } from './task-picker.mjs';
 
@@ -59,7 +59,8 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     const v = inputs.version;
     const cached = state.snapshot?.bindingEpoch === target.bindingEpoch ? state.snapshot : null;
     const sameHistory = cached && cached.seenSeq === v.thread_seq;
-    if (sameHistory && cached.userRevision === v.user_revision && cached.projectRevision === v.project_revision && cached.observations === v.observations_sha256) return cached;
+    if (sameHistory && cached.userRevision === v.user_revision && cached.projectRevision === v.project_revision &&
+        cached.observations === v.observations_sha256 && cached.fileWrites === v.file_writes_sha256) return cached;
     const checkout = sameHistory ? cached.checkout : (target.taskId
       ? compileHubTaskCheckout({ hubRoot, taskId: target.taskId, maxTailChars })
       : null);
@@ -69,12 +70,12 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       `### Cairn current scope\nEarlier Cairn Project Ledgers and Task Checkouts do not apply to this turn. Project: ${target.projectId ?? 'general'}.\nRequired tail marker for this request: <|task:${chosen}|>.`,
       renderHandoffAuthority(inputs, projects.get(target.projectId)),
       checkout?.ok ? `<cairn_task_checkout task_id="${target.taskId}" project_id="${target.projectId ?? 'general'}">\n${checkout.text}\n</cairn_task_checkout>` : '',
-      renderHandoffObservations(inputs), catalog
+      renderHandoffObservations(inputs), renderFileWrites(inputs), catalog
     ].filter(Boolean).join('\n\n');
     return Object.freeze({
       bindingEpoch: target.bindingEpoch, userRevision: v.user_revision, projectRevision: v.project_revision,
       seenSeq: sameHistory ? cached.seenSeq : (checkout?.total_record_count ?? 0),
-      observations: v.observations_sha256,
+      observations: v.observations_sha256, fileWrites: v.file_writes_sha256,
       checkout: checkout ? Object.freeze(checkout) : null,
       catalog,
       text
@@ -223,6 +224,9 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     const entry = turns.get(sessionId);
     if (!entry || (data.turn != null && data.turn !== entry.turn)) return;
     const msg = data.message ?? data;
+    if (event.type === 'tool/call' && data.name === 'write' && data.turn === entry.turn && Number.isSafeInteger(event.seq)) {
+      (entry.writeCalls ??= new Map()).set(data.callId, { step: data.step, seq: event.seq });
+    }
     if (Number.isSafeInteger(event.seq)) entry.firstSeq ??= event.seq;
     const tool = collectToolEvidence(entry, event);
     const pinned = entry.scope;

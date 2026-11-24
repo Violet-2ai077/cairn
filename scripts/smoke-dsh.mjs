@@ -22,10 +22,48 @@ function run(phase, input, sessionId, workdir = cwd, expectedExit = 0) {
   const args = [bin, '--profile', 'headless', '--patch', patch, ...(sessionId ? ['--session-id', sessionId] : []), input];
   const res = spawnSync(process.execPath, args, { cwd: workdir, encoding: 'utf8', timeout: 60000, windowsHide: true,
     env: { ...env, DSH_HOME: path.join(tmp, 'dsh'), CAIRN_DSH_BIN: bin, CAIRN_SMOKE_PHASE: phase, CAIRN_SMOKE_TRACE: trace } });
-  assert.equal(res.status, expectedExit, res.error?.message ?? (res.stderr + res.stdout));
+  assert.equal(res.status, expectedExit, res.error?.message ?? (res.stderr + res.stdout + (phase === 'file-write-crash' ? JSON.stringify(entries().filter(e => e.phase === phase)) : '')));
   return res.stdout;
 }
-try {
+function verifyWriteCrash(writer, projectId) {
+  const priorRecords = readHubTaskThread(hub, 1).length;
+  const priorBinding = readSessionBinding(hub, writer);
+  const priorHeads = [readScopedHead(hub), readScopedHead(hub, { scope: 'project', projectId })];
+  run('file-write-crash', 'Write the requested test artifact.', writer, cwd, 24);
+  const cli = (args, code = 0) => {
+    const r = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/cairn.mjs', import.meta.url)), ...args, '--store', hub, '--json'],
+      { encoding: 'utf8', windowsHide: true });
+    assert.equal(r.status, code, r.stderr + r.stdout);
+    return JSON.parse(r.stdout);
+  };
+  const written = path.join(cwd, 'effect.txt'), previewWrites = () => cli(['checkout', '1', '--preview']).work_state.file_writes;
+  const [intent] = previewWrites();
+  assert.ok(intent, 'dsh must publish the intent before the native write');
+  const calls = entries().filter(e => e.phase === 'file-write-crash' && e.event);
+  assert.deepEqual(calls.map(e => e.event), ['tool/call', 'after-native-write']);
+  assert.equal(intent.source.journal_seq, calls[0].seq);
+  assert.equal(intent.source.call_id, calls[0].call_id);
+  assert.equal(intent.source.session_id, writer);
+  assert.equal(intent.relative_path, 'effect.txt');
+  assert.equal(intent.last_check, null);
+  assert.equal(fs.readFileSync(written, 'utf8'), 'exact UTF-8 bytes: \u03bb\r\n');
+  const verify = code => cli(['verify-write', '1', intent.id], code);
+  assert.equal(verify(0).status, 'matches');
+  fs.writeFileSync(written, 'edit by another actor');
+  assert.equal(previewWrites()[0].last_check.status, 'matches');
+  assert.equal(verify(2).status, 'differs');
+  assert.equal(fs.readFileSync(written, 'utf8'), 'edit by another actor');
+  fs.unlinkSync(written);
+  fs.mkdirSync(written);
+  assert.equal(verify(3).status, 'unverifiable');
+  assert.ok(fs.statSync(written).isDirectory());
+  assert.equal(previewWrites()[0].last_check.status, 'unverifiable');
+  assert.equal(readHubTaskThread(hub, 1).length, priorRecords);
+  assert.deepEqual(readSessionBinding(hub, writer), priorBinding);
+  assert.deepEqual([readScopedHead(hub), readScopedHead(hub, { scope: 'project', projectId })], priorHeads);
+  console.log('PASS: native write exited before tool/result; separate CLI checks matched, detected a peer edit and declined a non-file, without replay.');
+}
+function main() {
   fs.mkdirSync(cwd);
   assert.equal(spawnSync('git', ['init', '--quiet'], { cwd, windowsHide: true }).status, 0);
   fs.writeFileSync(path.join(cwd, 'csv.test.cjs'), "require('node:test')('csv-header', () => require('node:assert/strict').equal('wrong', 'CSV_HEADER_EXPECTED'));");
@@ -42,6 +80,7 @@ try {
   const id = entries().find(e => e.sessionId).sessionId;
   const projectId = readHubTasksIndex(hub).tasks[0].project_id;
   assert.ok(projectId);
+  if (process.argv.includes('--file-write-only')) return verifyWriteCrash(id, projectId);
   assert.equal(readScopedHead(hub, { scope: 'project', projectId }).active[0]?.option_code, 'npm');
   assert.match(JSON.stringify(readHubTaskThread(hub, 1).at(-1).meta.tools), /CSV_HEADER_EXPECTED/);
   run('b', 'New task: change the project test runner.\nUse pnpm', id);
@@ -118,10 +157,12 @@ try {
   assert.equal(total_record_count, priorRecords);
   assert.deepEqual(readSessionBinding(hub, id), binding);
   assert.equal(entries().filter(e => e.phase === 'handoff-crash' && e.event === 'verify-tool').length, 1);
+  verifyWriteCrash(native.find(e => e.snapshot).sessionId, projectId);
   console.log('PASS: dsh exited after the tool result, before turn/end; an independent CLI checkout retained evidence, not a completion or retry.');
   console.log('PASS: memory review follows the answer, survives restart, and injects the project exception only in its own checkout.');
   console.log('PASS: real dsh tool failure, Project supersession, native compaction, restart and natural-language checkout (offline provider).');
   console.log('PASS: native userQuestions selection and restarted text fallback; no business request before selection, original verification runs after selection.');
-} finally {
+}
+try { main(); } finally {
   if (path.dirname(tmp) === fs.realpathSync(os.tmpdir()) && path.basename(tmp).startsWith('cairn-live-')) fs.rmSync(tmp, { recursive: true, force: true });
 }

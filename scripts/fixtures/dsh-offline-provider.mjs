@@ -12,6 +12,18 @@ const reason = 'npm fails the workspace install';
 export const name = 'cairn-smoke-provider';
 export const inject = ['llm', 'compaction', 'tools', 'commands'];
 export function apply(ctx) {
+  if (phase === 'file-write-crash') {
+    ctx.on('session/event', (session, e) => {
+      if (e.type === 'tool/call' || e.type === 'tool/result') log({ event: e.type, seq: e.seq, turn: e.data.turn,
+        session_id: session.id, call_id: e.data.callId, error: e.data.error?.code, output: e.data.message?.content });
+    }, { global: true });
+    ctx.on('fs/observed', (_target, observation, exec) => {
+      if (exec?.name === 'write' && observation.kind === 'present') {
+        log({ event: 'after-native-write', call_id: exec.callId });
+        process.exit(24);
+      }
+    }, { global: true });
+  }
   if (phase === 'picker-native') ctx.on('user-questions/request', request => {
     const question = request.questions[0];
     const option = question.options.find(o => o.label.includes('CSV export'));
@@ -87,11 +99,13 @@ export function apply(ctx) {
           (phase === 'picker-native' ? req.messages.some(m => m.source?.kind === 'user' && body(m).includes('继续，把失败的测试修掉'))
             : snapshot.includes('<cairn_resume_request>') && snapshot.includes('继续，把失败的测试修掉'));
         if (phase === 'handoff-crash' && calledTool) process.exit(23);
-        if ((phase === 'a' || phase === 'handoff-crash' || pickerAction) && !calledTool) {
+        if ((phase === 'a' || phase === 'handoff-crash' || phase === 'file-write-crash' || pickerAction) && !calledTool) {
           calledTool = true;
+          const name = phase === 'file-write-crash' ? 'write' : 'probe_csv';
+          const args = name === 'write' ? JSON.stringify({ file_path: 'effect.txt', content: 'exact UTF-8 bytes: \u03bb\r\n' }) : '{}';
           yield { type: 'block-start', index: 0, blockType: 'tool-call' };
-          yield { type: 'tool-call-delta', index: 0, id: 'smoke-csv', name: 'probe_csv', argumentsDelta: '{}' };
-          yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'smoke-csv', name: 'probe_csv', arguments: '{}' } };
+          yield { type: 'tool-call-delta', index: 0, id: 'smoke-csv', name, argumentsDelta: args };
+          yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'smoke-csv', name, arguments: args } };
           yield { type: 'finish', reason: { kind: 'tool-calls' } };
           return;
         }

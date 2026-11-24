@@ -10,6 +10,7 @@ export {
 } from './ledger.mjs';
 
 export { foldScopedLedger } from './scoped-ledger.mjs';
+export { captureFileWrite, readFileWrites, verifyFileWrite } from './file-writes.mjs';
 
 export {
   parseTaskMarker,

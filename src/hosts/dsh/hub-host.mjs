@@ -11,6 +11,7 @@ import { resolveStoreRoot } from '../../workers/store-root.mjs';
 import { runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
 import { compileHubHandoff } from '../../workers/hub-handoff.mjs';
+import { installFileWriteHook } from './file-write-hook.mjs';
 import { runHubDoctor } from '../../workers/hub-doctor.mjs';
 import { runHubStagingExtractor } from '../../workers/hub-staging-extractor.mjs';
 import { createHubTaskCompactionCoordinator, exclusionWatchlist } from '../../workers/hub-strict-compactor.mjs';
@@ -232,6 +233,10 @@ export async function createHubDshHost(ctx, config = {}) {
   }
 
   if (typeof ctx.on === 'function') {
+    if (turnRuntime) {
+      const stop = installFileWriteHook(ctx, hubRoot, turnRuntime);
+      if (typeof stop === 'function') disposers.push(stop);
+    }
     const stopPreStep = ctx.on('agent/pre-step', async (payload, next) => {
       const decision = await next();
       const sessionId = sessionIdFrom(payload);

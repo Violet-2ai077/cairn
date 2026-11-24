@@ -42,6 +42,12 @@ To preview compensation, use `/cairn undo project <project-id> <commit-seq> --pr
 
 **Repeatable host check:** `node scripts/smoke-dsh.mjs /absolute/path/to/dsh/lib/bin.js` runs the installed headless dsh in an isolated temporary home and Git repository. The provider is a deterministic local fixture, not a network model. The check runs a failing Node test in task A, supersedes a Project rule in B, manually recovers a markerless turn, runs native compaction, then resumes the persisted session in a fresh process without a task ID. It checks the provider-facing checkout for the actual failure evidence and the current decision/tombstone. This validates host wiring, not semantic accuracy on unseen prompts.
 
+#### Verifying a file write
+
+The Hub adapter also observes the rc.5 native `write` call **before** the effect: it pairs the session's `tool/call` cursor with the actual executor arguments at `fs/write-intent`. It delegates to the native policy first and returns that policy unchanged. Only a direct call on an already-bound active project task, with a proven host path mapping inside its registered project root, is eligible. General tasks, provisional binding, shell commands, patches, edits and unknown filesystem mappings are not covered. Lack of a record does not prove that no file changed.
+
+Run the smoke script with the extra argument `--file-write-only` for the focused check. The local fixture exits at `fs/observed` after a real dsh write, before `tool/result`. Separate CLI invocations then check untouched bytes, a peer edit, and a non-regular target. This does not exercise power loss or a remote filesystem.
+
 #### Choosing which task to resume
 
 With Hub Autopilot and mid-session switching enabled (as in the example patch), a bound session keeps its task for a plain “继续”. In an unbound session, the same request asks even if only one task is active. An ambiguous route also asks; an empty candidate pool does not create a task. A clear reference such as `继续任务 #9` does not need a menu.
