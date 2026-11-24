@@ -18,6 +18,7 @@ import { appendCompactionDirective } from './compaction-directive.mjs';
 import { createHubWriteCoordinator } from '../../workers/hub-write-coordinator.mjs';
 import { readProjectsIndex, readTurnReceipts, recordTurnReceipt, recoverMarkerlessTurn, turnSourceDigest } from '../../kernel/hub-store.mjs';
 import { collectToolEvidence, recoverJournalText } from './turn-journal.mjs';
+import { menuStream } from './task-picker.mjs';
 import { listHubTaskPools, resolveTaskHeatPolicy, selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
 import { createHubTurnRuntime, hideHubStreamMarker, HUB_TURN_CONTRACT, resolveMidSessionPolicy } from './hub-turn-runtime.mjs';
@@ -76,6 +77,7 @@ export async function createHubDshHost(ctx, config = {}) {
   const clientFor = route => config.llmClient ?? createHubHostLlmClient(ctx, route);
   const midSession = resolveMidSessionPolicy(config.autopilot);
   const turnRuntime = midSession.enabled ? createHubTurnRuntime({
+    ask: request => ctx.get?.('userQuestions')?.ask(request),
     hubRoot, policy: midSession, taskHeat, clientFor, maxTailChars: config.maxTailChars ?? 6000,
     stripReminders: stripTrailingSystemReminders,
     onArchive({ sessionId, turn, scope, taskId, user, assistant }) {
@@ -284,6 +286,8 @@ export async function createHubDshHost(ctx, config = {}) {
           request.messages = messages;
           return next(request);
         }
+        const blocked = !request?.purpose && turnRuntime?.blockedReply(request?.sessionId);
+        if (blocked) return menuStream(blocked, config.stripMarkerInStream === false);
         const stream = next(request);
         if (request?.purpose || config.stripMarkerInStream === false || !entry?.scope || entry.signal !== request.signal) return stream;
         return hideHubStreamMarker(stream, entry);
@@ -431,7 +435,8 @@ export async function createHubDshHost(ctx, config = {}) {
         const turn = Number(args[1]), taskId = Number(args[2]);
         try {
           const receipt = readTurnReceipts(hubRoot, sessionId, turn);
-          const source = receipt?.reason === 'marker_missing' ? recoverJournalText(agent.session, receipt, stripTrailingSystemReminders) : null;
+          const origin = receipt?.original_turn != null ? readTurnReceipts(hubRoot, sessionId, receipt.original_turn) : null;
+          const source = receipt?.reason === 'marker_missing' ? recoverJournalText(agent.session, receipt, stripTrailingSystemReminders, origin) : null;
           recoverMarkerlessTurn(hubRoot, sessionId, turn, taskId, source);
           return { kind: 'success', text: 'Recovered task history only; binding and ledgers unchanged.' };
         } catch (error) { return { kind: 'error', text: error.message }; }

@@ -69,13 +69,27 @@ function readWindow(file, tail = false) {
   } finally { fs.closeSync(fd); }
 }
 
+function readRecentRecords(paths, id) {
+  const { text, clipped } = readWindow(paths.taskThreadFile(id), true);
+  if (clipped && !text.includes('\n')) return [];
+  const lines = (clipped ? text.slice(text.indexOf('\n') + 1) : text).trim().split(/\r?\n/u);
+  return lines.filter(Boolean).slice(-2).map(line => JSON.parse(line));
+}
+
 function readPreview(paths, id) {
   const compact = readWindow(paths.taskCompactFile(id)).text;
-  if (compact.trim()) return compact;
-  const { text, clipped } = readWindow(paths.taskThreadFile(id), true);
-  if (clipped && !text.includes('\n')) return '';
-  const lines = (clipped ? text.slice(text.indexOf('\n') + 1) : text).trim().split(/\r?\n/u);
-  return lines.filter(Boolean).slice(-2).map(line => JSON.parse(line)?.content ?? '').join(' | ');
+  return compact.trim() ? compact : readRecentRecords(paths, id).map(r => r.content ?? '').join(' | ');
+}
+
+// Menu labels enter native conversation history. Do not echo candidate transcripts or raw logs.
+export function taskPickerHint(paths, task) {
+  const evidence = readRecentRecords(paths, task.id).flatMap(r => r.meta?.tools ?? []);
+  const last = evidence.at(-1);
+  if (last) {
+    const tool = /^[\w.-]{1,60}$/u.test(last.name) ? last.name : '工具';
+    return `上次工具记录：${tool} ${last.ok === false ? '失败' : '已运行'}`;
+  }
+  return task.has_compact ? '有已保存的任务摘要' : task.turn_count ? '有已保存的任务记录' : '尚无归档记录';
 }
 
 const failure = (error_code, llm_called = false) => ({

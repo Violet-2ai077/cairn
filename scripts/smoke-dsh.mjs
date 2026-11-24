@@ -57,7 +57,23 @@ try {
   assert.deepEqual(entries().find(e => e.phase === 'resume' && e.snapshot)?.snapshot,
     { task: 1, blocker: true, current: true, superseded: true });
   assert.equal(readHubTaskThread(hub, 1).at(-2).content, 'Back to the CSV export issue from yesterday.');
+  const original = '继续，把失败的测试修掉';
+  run('picker-native', original);
+  const native = entries().filter(e => e.phase === 'picker-native');
+  assert.equal(native[0].event, 'human-choice');
+  assert.equal(native.find(e => e.snapshot)?.snapshot.task, 1);
+  assert.ok(native.some(e => e.event === 'verify-tool'), 'selection must proceed to verification, not another question');
+  const before = readHubTaskThread(hub, 1).length;
+  const menu = run('picker-menu', original);
+  assert.match(menu, /CSV export/u);
+  assert.doesNotMatch(menu, /<\|task:/u);
+  assert.equal(entries().filter(e => e.phase === 'picker-menu' && (e.snapshot || e.event === 'verify-tool')).length, 0);
+  assert.equal(readHubTaskThread(hub, 1).length, before);
+  run('picker-reply', 'CSV 那个', entries().find(e => e.menuSession).menuSession);
+  assert.ok(entries().some(e => e.phase === 'picker-reply' && e.event === 'verify-tool'));
+  assert.equal(readHubTaskThread(hub, 1).at(-2).content, original);
   console.log('PASS: real dsh tool failure, Project supersession, native compaction, restart and natural-language checkout (offline provider).');
+  console.log('PASS: native userQuestions selection and restarted text fallback; no business request before selection, original verification runs after selection.');
 } finally {
   if (path.dirname(tmp) === fs.realpathSync(os.tmpdir()) && path.basename(tmp).startsWith('cairn-live-')) fs.rmSync(tmp, { recursive: true, force: true });
 }

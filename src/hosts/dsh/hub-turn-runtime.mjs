@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { buildAntiRecencyContract, buildHubTaskCatalog, buildScopedAuthorityContract, parseTaskMarker, projectReadOnlyLedger } from '../../kernel/index.mjs';
-import { finishHubScopedTurn, readHubTasksIndex, readProjectsIndex, readScopedHead, readSessionBinding, recordTurnReceipt, turnSourceDigest } from '../../kernel/hub-store.mjs';
-import { textOf, collectToolEvidence } from './turn-journal.mjs';
+import { finishHubScopedTurn, readHubTasksIndex, readProjectsIndex, readScopedHead, readSessionBinding, readSessionChoice, recordTurnReceipt, replaceSessionChoice, turnSourceDigest } from '../../kernel/hub-store.mjs';
+import { textOf, collectToolEvidence, resumeUserText } from './turn-journal.mjs';
 import { selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { mentionsCompetingTopic, runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
+import { genericResume, pickTask, resumeIntent } from './task-picker.mjs';
 
 const SWITCH = /^(?:(?:please\s+)?(?:switch\s+(?:to|topics?)|change\s+(?:topics?|tasks?)|(?:start\s+(?:a\s+)?)?new\s+(?:topic|task))\b|(?:请\s*)?(?:切换|切到|换个话题|另开|新任务|新话题))/iu;
 const EXACT = /(?:\btask\s*#?\s*|任务\s*#?\s*|<\|task:)([1-9]\d{0,2})(?!\d)/giu;
@@ -24,7 +25,7 @@ export function resolveMidSessionPolicy(autopilot) {
   };
 }
 
-export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, maxTailChars, stripReminders, onArchive }) {
+export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, maxTailChars, stripReminders, onArchive, ask }) {
   const sessions = new Map();
   const turns = new Map();
   function stateFor(id) {
@@ -84,7 +85,8 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       turnKey: entry.turnKey, projectId: null, taskId: null, bindingEpoch: expectedEpoch, expectedEpoch,
       modelSelection, snapshot: Object.freeze({ text: clarification }), newTaskTicket: null, route: Object.freeze(route), ...fields
     });
-    const deny = reason => scoped({ result: 'clarify', reason });
+    const deny = (reason, display = '未能确认本轮任务。请指定任务名称或任务号；没有执行操作。') =>
+      scoped({ result: 'clarify', reason }, { display });
     const started = Date.now();
     const index = readHubTasksIndex(hubRoot);
     const tasks = index.tasks;
@@ -95,12 +97,16 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     const ids = new Set([...entry.input.matchAll(EXACT)].map(m => Number(m[1])));
     const requestToReturn = RETURN_TO.test(entry.input);
     const returning = requestToReturn || state.route?.reason === 'ambiguous' ||
-      (bound && !state.explicitPin && mentionsCompetingTopic(entry.input, bound, tasks));
+      (bound && !state.explicitPin && !genericResume(entry.input) && mentionsCompetingTopic(entry.input, bound, tasks));
     const explicit = EXACT_START.test(entry.input) || SWITCH.test(entry.input) || requestToReturn;
     let result;
     const hint = bound ? null : resolveGitProjectHint(cwd);
     const projectMention = /\bproject:([a-z0-9_-]+)\b/iu.exec(entry.input)?.[1];
-    if (recovery) {
+    const pending = readSessionChoice(hubRoot, sessionId);
+    const undirected = !bound && genericResume(entry.input) && !ids.size;
+    if (pending || undirected) {
+      result = { decision: 'ambiguous' };
+    } else if (recovery) {
       result = { decision: 'new', task_id: null };
     } else if (explicit && ids.size === 1) {
       const task = tasks.find(item => item.id === [...ids][0] && item.status === 'active');
@@ -116,7 +122,21 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       });
     }
     if (payload.signal?.aborted || turns.get(sessionId) !== entry) return deny('aborted');
-    if (returning && result.decision === 'new' && !SWITCH.test(entry.input)) return deny('ambiguous');
+    let picked = null;
+    if (result.decision === 'ambiguous' || ((returning || resumeIntent(entry.input)) && result.decision === 'new' && !SWITCH.test(entry.input)) ||
+        (!result.ok && !result.decision && resumeIntent(entry.input) && !ids.size) ||
+        result.error_code === 'continuation_unresolved') {
+      const eligible = tasks.filter(t => t.status === 'active' && (!bound || policy.crossProject || bound.project_id === t.project_id) &&
+        (!projectMention || !explicit || projectMention === t.project_id));
+      picked = await pickTask({ root: hubRoot, sessionId, entry, payload, expectedEpoch, eligible, projects,
+        candidates: result.candidates, ask, pending, current: () => !payload.signal?.aborted && turns.get(sessionId) === entry &&
+          syncBinding(sessionId).bindingEpoch === expectedEpoch });
+      if (!picked.id) return deny(picked.reason, picked.text);
+      const task = eligible.find(t => t.id === picked.id);
+      if (!task) return deny('task_invalidated');
+      result = { decision: 'match', task_id: task.id, project_id: task.project_id,
+        pool: dormant.some(t => t.id === task.id) ? 'dormant' : 'hot' };
+    }
     if (!['match', 'keep', 'new'].includes(result.decision)) return deny(result.decision === 'ambiguous' ? 'ambiguous' : 'route_error');
     if (syncBinding(sessionId).bindingEpoch !== expectedEpoch) return deny('epoch_conflict');
     if (projectMention && explicit && !projects.has(projectMention)) return deny('unknown_project');
@@ -136,7 +156,9 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     const snapshot = makeSnapshot(state, target, ticket, hot, projects);
     return scoped({ result: result.decision, pool: result.pool ?? null, elapsed_ms: Date.now() - started }, {
       ...target, snapshot, newTaskTicket: ticket, explicitPin: same && state.explicitPin,
-      bindingSource: same ? state.bindingSource : allocate ? 'new_task_ticket' : result.pool === 'dormant' ? 'dormant_wake' : explicit ? 'explicit_switch' : 'cold_router_match',
+      humanChoice: Boolean(picked),
+      resumed: picked && picked.originalTurn !== entry.turn ? { turn: picked.originalTurn, input: picked.input } : null,
+      bindingSource: picked ? 'human_choice' : same ? state.bindingSource : allocate ? 'new_task_ticket' : result.pool === 'dormant' ? 'dormant_wake' : explicit ? 'explicit_switch' : 'cold_router_match',
       projectHint: hint && hint.project_id === projectId ? Object.freeze({ ...hint }) : null
     });
   }
@@ -148,9 +170,11 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     entry.signal = payload.signal;
     if (!entry.pending && !entry.scope) {
       if (entry.step !== 1) return;
-      const input = (payload.messages ?? []).filter(msg => msg.source?.kind === 'user').map(msg => stripReminders(textOf(msg))).filter(Boolean).join('\n\n');
+      const authored = (payload.messages ?? []).filter(msg => msg.source?.kind === 'user').map(msg => stripReminders(textOf(msg))).filter(Boolean);
+      const input = authored.join('\n\n');
       if (!input) return;
       entry.input = input;
+      entry.selectionMessages = authored.length;
       const state = stateFor(sessionId);
       if (state.lastProcessedTurnKey === entry.turnKey) return;
       state.pendingSwitch = null;
@@ -166,6 +190,20 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
         recordTurnReceipt(hubRoot, sessionId, turn, { status: 'in_progress', reason: 'awaiting_turn_end', first_seq: entry.firstSeq ?? null });
       }
     }
+  }
+  function blockedReply(id) {
+    const entry = turns.get(id);
+    const scope = entry?.scope;
+    if (!scope && id && readSessionChoice(hubRoot, id)) return '仍在等待用户选择任务；没有执行操作。';
+    if (scope?.route.result === 'clarify') return scope.display ?? '请指定要继续的任务；没有执行操作。';
+    if (scope?.bindingSource !== 'human_choice') return null;
+    const binding = readSessionBinding(hubRoot, id, { includeCleared: true });
+    if ((binding?.binding_epoch ?? null) !== scope.expectedEpoch ||
+        !readHubTasksIndex(hubRoot).tasks.some(t => t.id === scope.taskId && t.project_id === scope.projectId && t.status === 'active')) {
+      entry.invalidatedChoice = true;
+      return '刚选择的任务或会话绑定已改变；请重新选择。';
+    }
+    return null;
   }
   function event(sessionId, event) {
     const data = event.data ?? {};
@@ -196,18 +234,27 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     turns.delete(sessionId);
     const state = stateFor(sessionId);
     const scope = entry.scope;
-    const user = entry.authored || entry.input;
+    const user = scope?.resumed ? resumeUserText(scope.resumed.input, entry.input, entry.authored) : entry.authored || entry.input;
     if (!user || state.lastProcessedTurnKey === entry.turnKey) return;
     const receipt = (status, reason, extra) => recordTurnReceipt(hubRoot, sessionId, entry.turn, {
-      status, reason, first_seq: entry.firstSeq ?? null, end_seq: event.seq ?? null, ...extra
+      status, reason, first_seq: entry.firstSeq ?? null, end_seq: event.seq ?? null,
+      ...(scope?.resumed ? { original_turn: scope.resumed.turn } : {}), ...extra
     });
-    if (data.reason?.kind !== 'completed' || entry.signal?.aborted) return receipt('interrupted', 'not_completed');
+    if (data.reason?.kind !== 'completed' || entry.signal?.aborted) {
+      if (scope?.route.reason === 'awaiting_choice') {
+        const pending = readSessionChoice(hubRoot, sessionId);
+        if (pending?.turn === entry.turn) replaceSessionChoice(hubRoot, sessionId, pending.key, null);
+      }
+      return receipt('interrupted', 'not_completed');
+    }
     if (!scope || scope.route.result === 'clarify') return receipt('unassigned', scope?.route.reason ?? 'scope_unavailable');
+    if (entry.invalidatedChoice) return receipt('unassigned', 'choice_stale');
     if (entry.terminal?.step !== entry.step) return receipt('unassigned', 'no_final_answer');
     const marker = entry.terminal.marker;
     if (!marker.valid || marker.is_unresolved) {
       if (marker.is_unresolved || marker.display_text?.includes('<|task:')) return receipt('unassigned', marker.is_unresolved ? 'unresolved' : 'marker_invalid');
       return receipt('unassigned', 'marker_missing', { project_id: scope.projectId, final_seq: entry.terminal.seq ?? null,
+        ...(scope.resumed ? { selection_messages: entry.selectionMessages } : {}),
         source_digest: turnSourceDigest(user, marker.display_text) });
     }
     if (marker.task_number !== (scope.taskId ?? scope.newTaskTicket?.taskId)) {
@@ -227,9 +274,14 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     const scope = turns.get(id)?.scope;
     if (scope?.taskId && !readHubTasksIndex(hubRoot).tasks.some(task =>
       task.id === scope.taskId && task.project_id === scope.projectId && task.status === 'active')) return clarification;
-    return scope?.snapshot.text ?? sessions.get(id)?.presentedSnapshot?.text ?? '';
+    const text = scope?.snapshot.text ?? sessions.get(id)?.presentedSnapshot?.text ?? '';
+    if (!scope?.humanChoice) return text;
+    const guidance = '\n任务选择只确认归属，不扩大原请求的授权。请接着原请求做；若只有“继续”，先核实历史状态，仅推进此前已经明确的目标。';
+    if (!scope.resumed) return text + guidance;
+    return text + guidance + '\n\n<cairn_resume_request>\n以下是用户先前提出、现在已确认归属的原请求：\n' +
+      JSON.stringify(scope.resumed.input).replaceAll('<', '\\u003c') + '\n</cairn_resume_request>';
   }
-  return { sessions, turns, syncBinding, preStep, event, context };
+  return { sessions, turns, syncBinding, preStep, event, context, blockedReply };
 }
 
 export const HUB_TURN_CONTRACT = buildAntiRecencyContract();

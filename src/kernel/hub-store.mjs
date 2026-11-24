@@ -567,6 +567,22 @@ function receiptDir(root, sessionId) {
   return path.join(path.dirname(binding), 'turns', path.basename(binding, '.json'));
 }
 
+function choiceFile(root, sessionId) {
+  const binding = resolveHubPaths(root).sessionBindingFile(sessionId);
+  return path.join(path.dirname(binding), 'choices', path.basename(binding));
+}
+
+export const readSessionChoice = (root, sessionId) => readJson(choiceFile(root, sessionId), null, 'task_choice_unreadable');
+
+// A late UI answer cannot consume or replace a newer menu for this session.
+export const replaceSessionChoice = locked((root, sessionId, expectedKey, choice) => {
+  const current = readSessionChoice(root, sessionId);
+  if ((current?.key ?? null) !== expectedKey) return false;
+  if (choice) writeJsonAtomic(choiceFile(root, sessionId), choice);
+  else fs.rmSync(choiceFile(root, sessionId), { force: true });
+  return true;
+});
+
 export function readTurnReceipts(root, sessionId, turn = null) {
   const dir = receiptDir(root, sessionId);
   if (turn !== null) {

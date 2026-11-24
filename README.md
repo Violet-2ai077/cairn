@@ -60,6 +60,8 @@ node --test test/kernel.node-test.mjs
 
 With dsh installed, `node scripts/smoke-dsh.mjs /absolute/path/to/dsh/lib/bin.js` additionally verifies the real headless host across native compaction and process restart, with a local deterministic provider. See [dsh continuity and recovery](docs/dsh-host-interface.md#continuity-fixes-and-recovery) for turn diagnostics, markerless recovery, and rebuilding old summaries.
 
+With Hub Autopilot enabled as in the example patch, an unbound “继续” asks which task to resume instead of guessing. Pick a task in the dsh client, or reply “CSV 那个” to the text menu; Cairn then resumes the original request without asking you to repeat it. See [choosing which task to resume](docs/dsh-host-interface.md#choosing-which-task-to-resume).
+
 ---
 
 ## Documentation

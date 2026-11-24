@@ -15,9 +15,13 @@ export function collectToolEvidence(entry, event) {
   if (entry.tools.length > 8) entry.tools.splice(Math.max(0, entry.tools.findIndex(tool => tool.ok)), 1);
 }
 
-// Only the original native session supplies text; receipts never duplicate unassigned turns.
-export function recoverJournalText(session, receipt, stripReminders) {
-  const end = receipt.end_seq;
+export function resumeUserText(original, selection, authored) {
+  if (!authored || authored === selection) return original;
+  return original + '\n\n' + (authored.startsWith(selection + '\n\n') ? authored.slice(selection.length + 2) : authored);
+}
+
+function completedEvents(session, receipt) {
+  const end = receipt?.end_seq;
   if (!Number.isSafeInteger(end) || typeof session?.eventAt !== 'function') return null;
   const terminal = session.eventAt(end);
   if (terminal?.type !== 'turn/end' || terminal.data?.turn !== receipt.turn || terminal.data.reason?.kind !== 'completed') return null;
@@ -28,16 +32,31 @@ export function recoverJournalText(session, receipt, stripReminders) {
     if (!event || event.type === 'turn/end') break;
     if (event.data?.turn == null || event.data.turn === receipt.turn) events.push(event);
   }
+  return events.reverse();
+}
+
+// Only the original native session supplies text; receipts never duplicate unassigned turns.
+export function recoverJournalText(session, receipt, stripReminders, originalReceipt) {
+  const events = completedEvents(session, receipt);
+  if (!events) return null;
   const evidence = { toolNames: new Map(), tools: [] };
   const authored = [];
   let assistant = '';
-  for (const event of events.reverse()) {
+  for (const event of events) {
     collectToolEvidence(evidence, event);
     const msg = event.data?.message ?? event.data;
     if (event.surfaceOp !== 'append') continue;
     if (event.type === 'user/message' && msg.source?.kind === 'user') authored.push(stripReminders(textOf(msg)));
     if (event.type === 'assistant/message' && event.seq === receipt.final_seq) assistant = textOf(msg).trim();
   }
-  const user = authored.filter(Boolean).join('\n\n');
+  let user = authored.filter(Boolean).join('\n\n');
+  if (receipt.original_turn != null) {
+    if (originalReceipt?.turn !== receipt.original_turn || originalReceipt.reason !== 'awaiting_choice') return null;
+    const original = completedEvents(session, originalReceipt)?.filter(e => e.type === 'user/message' && e.surfaceOp === 'append')
+      .map(e => e.data.message ?? e.data).filter(m => m.source?.kind === 'user')
+      .map(m => stripReminders(textOf(m))).filter(Boolean).join('\n\n');
+    if (!original || !Number.isSafeInteger(receipt.selection_messages) || receipt.selection_messages < 1) return null;
+    user = resumeUserText(original, authored.filter(Boolean).slice(0, receipt.selection_messages).join('\n\n'), user);
+  }
   return user && assistant ? { user, assistant, tools: evidence.tools } : null;
 }

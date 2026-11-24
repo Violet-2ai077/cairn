@@ -95,6 +95,171 @@ function scopedSession(ctx, id) {
   };
 }
 
+test('native task picker pauses an unbound generic continue and mounts the human choice in the same request', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-'));
+  const ctx = mockCtx();
+  let resolveAnswer;
+  const asked = Promise.withResolvers();
+  ctx.get = key => key === 'userQuestions' ? { ask(req) {
+    asked.resolve(req);
+    return new Promise(resolve => { resolveAnswer = resolve; });
+  } } : ctx[key];
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 4, title: 'Login tokens' });
+  upsertHubTask(hub, { id: 9, title: 'CSV export' });
+  appendHubTaskTurn(hub, { task_id: 9, content: 'private transcript',
+    meta: { tools: [{ name: 'csv_header_test', ok: false, output: 'private error log' }] } });
+  const session = { id: 'native-picker' }, agent = { session };
+  const input = '继续，把失败的测试修掉';
+  const step = ctx.handlers.get('agent/pre-step')({ agent, turn: 1, step: 1,
+    messages: [{ source: { kind: 'user' }, content: input }] }, async () => ({ kind: 'enter' }));
+  const req = await Promise.race([asked.promise, step.then(() => null)]);
+  assert.ok(req, 'must wait for the human before entering the first answer step');
+  assert.equal(req.agent, agent);
+  assert.equal(readSessionBinding(hub, session.id), null);
+  const q = req.questions[0];
+  const option = q.options.find(o => o.label.includes('CSV export'));
+  assert.match(option.description, /csv_header_test 失败/u);
+  assert.doesNotMatch(JSON.stringify(q), /private/u);
+  resolveAnswer({ answers: [{ id: q.id, selected: [option.label] }] });
+  await step;
+  assert.match(ctx.contexts[1].text({ session }), /Required tail marker.*task:9/u);
+  const s = scopedSession(ctx, session.id);
+  s.end(1, 'verified\n<|task:9|>');
+  assert.equal(readHubTaskThread(hub, 9).at(-2).content, input);
+});
+
+test('text picker skips provider and business tools, survives restart, and archives the original request, not the menu reply', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-text-'));
+  t.after(() => fs.rmSync(hub, { recursive: true, force: true }));
+  upsertHubTask(hub, { id: 4, title: 'Login tokens' });
+  upsertHubTask(hub, { id: 9, title: 'CSV export' });
+  const config = { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } };
+  const ctx = mockCtx(), s = scopedSession(ctx, 'picker');
+  const host = await createHubDshHost(ctx, config);
+  const input = '继续，把失败的测试修掉';
+  try {
+    await s.start(1, input);
+    const stream = ctx.handlers.get('llm/stream')({ sessionId: 'picker' }, () => assert.fail('not a provider request'));
+    const chunks = await Array.fromAsync(stream);
+    const menu = chunks.find(c => c.type === 'block-end').block.text;
+    assert.match(menu, /CSV export/u);
+    assert.match(menu, /Login tokens/u);
+    s.end(1, menu);
+    assert.equal(readHubTaskThread(hub, 9).length, 0);
+  } finally { await host.dispose(); }
+  const fresh = mockCtx(), r = scopedSession(fresh, 'picker');
+  const restarted = await createHubDshHost(fresh, config);
+  try {
+    await r.start(2, 'CSV 那个');
+    assert.match(r.view(), /Required tail marker.*task:9/u);
+    assert.ok(r.view().includes(input));
+    r.end(2, 'regression fixed\n<|task:9|>');
+    assert.deepEqual(readHubTaskThread(hub, 9).map(x => x.content), [input, 'regression fixed']);
+    await r.start(3, 'what next?');
+    assert.doesNotMatch(r.view(), /cairn_resume_request/u);
+  } finally { await restarted.dispose(); }
+});
+
+test('selector never renumbers a withdrawn option; invalid, cancelled and empty menus cannot create a task', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-stale-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: async () => assert.fail('generic continue and menu controls are deterministic') } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  const s = scopedSession(ctx, 'stale');
+  async function reply(turn, input) {
+    await s.start(turn, input);
+    const stream = ctx.handlers.get('llm/stream')({ sessionId: 'stale' }, () => assert.fail('no answer model'));
+    const text = (await Array.fromAsync(stream)).find(c => c.type === 'block-end').block.text;
+    s.end(turn, text);
+    return text;
+  }
+  assert.match(await reply(1, '继续'), /没有可继续/u);
+  upsertHubTask(hub, { id: 12, title: 'Only task' });
+  assert.match(await reply(2, '继续上次的任务？'), /Only task/u);
+  upsertHubTask(hub, { id: 13, title: 'Later task' });
+  transitionHubTaskStatus(hub, { taskId: 12, action: 'close' });
+  assert.match(await reply(3, '1'), /已不可选/u);
+  assert.doesNotMatch(await reply(4, '#13'), /Later task/u);
+  assert.match(await reply(5, '取消'), /已取消/u);
+  assert.equal(readSessionBinding(hub, 'stale'), null);
+  assert.equal(readHubTasksIndex(hub).tasks.length, 2);
+  assert.equal(readHubTaskThread(hub, 13).length, 0);
+});
+
+test('interrupting the original text menu drops the outstanding request', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-stop-'));
+  const ctx = mockCtx(), s = scopedSession(ctx, 'stop');
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, title: 'CSV' });
+  await s.start(1, '继续');
+  s.end(1, 'partial menu', 'interrupted');
+  await s.start(2, '继续');
+  const stream = ctx.handlers.get('llm/stream')({ sessionId: 'stop' }, () => assert.fail('no model'));
+  const menu = (await Array.fromAsync(stream)).find(c => c.type === 'block-end').block.text;
+  assert.match(menu, /CSV/u);
+  assert.doesNotMatch(menu, /未能唯一/u);
+});
+
+test('native picker ignores a late answer after abort even if the answerer ignores the signal', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-abort-'));
+  const ctx = mockCtx(), opened = Promise.withResolvers(), answer = Promise.withResolvers();
+  ctx.get = k => k === 'userQuestions' ? { ask(q) { opened.resolve(q); return answer.promise; } } : ctx[k];
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 7, title: 'CSV' });
+  const ctl = new AbortController(), session = { id: 'cancel-native' };
+  const pending = ctx.handlers.get('agent/pre-step')({ turn: 1, step: 1, signal: ctl.signal, agent: { session },
+    messages: [{ source: { kind: 'user' }, content: '继续' }] }, async () => ({ kind: 'enter' }));
+  const { questions: [q] } = await opened.promise;
+  ctl.abort();
+  const outcome = await Promise.race([pending.then(() => 'entered', () => 'aborted'), new Promise(resolve => setImmediate(() => resolve('still waiting')))]);
+  answer.resolve({ answers: [{ id: q.id, selected: [q.options[0].label] }] });
+  assert.equal(outcome, 'aborted');
+  assert.equal(readSessionBinding(hub, session.id), null);
+});
+
+test('router ambiguity offers validated candidates only; more pages, project restrictions and duplicate names stay deterministic', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-pages-'));
+  const ctx = mockCtx(), s = scopedSession(ctx, 'pages');
+  let routes = 0;
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true, taskHeat: { enabled: false } },
+    llmClient: { complete: async req => {
+      if (!req.system.startsWith('Route the opening')) return { ok: true, content: '{"ops":[]}' };
+      routes++;
+      return { ok: true, content: '{"decision":"ambiguous","task_id":null,"candidates":[2,3,8]}' };
+    } } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  for (let id = 1; id <= 8; id++) upsertHubTask(hub, { id, project_id: id === 8 ? 'other' : 'here',
+    title: id === 8 ? 'Foreign topic' : id === 2 || id === 3 ? 'CSV export' : 'Task ' + id });
+  await s.slash('checkout 1');
+  async function menu(turn, input) {
+    await s.start(turn, input);
+    const chunks = await Array.fromAsync(ctx.handlers.get('llm/stream')({ sessionId: 'pages' }, () => assert.fail('picker leaked to provider')));
+    const text = chunks.find(c => c.type === 'block-end').block.text;
+    s.end(turn, text);
+    return text;
+  }
+  const initial = await menu(1, '切换到导出工作，核实失败的测试');
+  assert.doesNotMatch(initial, /Foreign topic|Task 1/u);
+  assert.match(initial, /CSV export \(#2\)/u);
+  assert.match(await menu(2, 'CSV 那个'), /未能唯一/u);
+  assert.doesNotMatch(await menu(3, '都不是'), /Foreign topic/u);
+  assert.match(await menu(4, '更多'), /Task 7/u);
+  await s.start(5, '#7');
+  assert.match(s.view(), /Required tail marker.*task:7/u);
+  transitionHubTaskStatus(hub, { taskId: 7, action: 'close' });
+  const refused = await Array.fromAsync(ctx.handlers.get('llm/stream')({ sessionId: 'pages' }, () => assert.fail('withdrawn choice')));
+  s.end(5, refused.find(c => c.type === 'block-end').block.text);
+  assert.equal(JSON.parse((await s.slash('turns 5')).text).reason, 'choice_stale');
+  assert.equal(readSessionBinding(hub, 'pages').task_id, 1);
+  assert.equal(routes, 1);
+});
+
 test('native compaction gets the scoped boundary without mutating history, even with stream stripping off', async t => {
   const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-native-boundary-'));
   const ctx = mockCtx();
@@ -229,6 +394,37 @@ test('human recovery rereads only a verified completed markerless journal turn; 
   assert.deepEqual(readHubTaskThread(hub, 2).map(r => r.content), ['the original input', 'terminal answer']);
   assert.equal(readSessionBinding(hub, 'lost-turn').task_id, 1);
   assert.equal(JSON.parse((await a.slash('turns 1')).text).reason, 'manual_recovery');
+});
+
+test('manual recovery after a text choice uses the original request plus later authored steering', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-recover-'));
+  const ctx = mockCtx(), s = scopedSession(ctx, 'recover-choice');
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 9, title: 'CSV export' });
+  const events = [];
+  s.session.eventAt = i => events[i];
+  const append = (type, data) => {
+    const event = { seq: events.length, surfaceOp: 'append', type, data };
+    events.push(event);
+    ctx.handlers.get('session/event')(s.session, event);
+  };
+  const user = content => append('user/message', { source: { kind: 'user' }, content });
+  const finish = (turn, content) => {
+    append('assistant/message', { turn, step: 1, message: { content } });
+    append('turn/end', { turn, reason: { kind: 'completed' } });
+  };
+  const original = '继续，把失败的测试修掉';
+  await s.start(1, original);
+  user(original);
+  finish(1, '你想继续哪项任务？');
+  await s.start(2, 'CSV 那个');
+  user('CSV 那个');
+  user('Only check the header.');
+  finish(2, 'header verified');
+  assert.equal((await s.slash('recover 2 9')).kind, 'success');
+  assert.deepEqual(readHubTaskThread(hub, 9).map(r => r.content), [original + '\n\nOnly check the header.', 'header verified']);
+  assert.equal(readSessionBinding(hub, s.session.id), null);
 });
 
 test('Slice C dormant cross-project switch is opt-in, binds after confirmation, and old workers keep their scoped ledger', async () => {

@@ -12,9 +12,17 @@ const reason = 'npm fails the workspace install';
 export const name = 'cairn-smoke-provider';
 export const inject = ['llm', 'compaction', 'tools', 'commands'];
 export function apply(ctx) {
+  if (phase === 'picker-native') ctx.on('user-questions/request', request => {
+    const question = request.questions[0];
+    const option = question.options.find(o => o.label.includes('CSV export'));
+    log({ event: 'human-choice', labels: question.options.map(o => o.label) });
+    return { answers: [{ id: question.id, selected: [option.label] }] };
+  }, { global: true });
+  if (phase === 'picker-menu') ctx.on('agent/created', ({ agent }) => { log({ menuSession: agent.session.id }); }, { global: true });
   ctx.tools.register({ name: 'probe_csv', description: 'Run the smoke CSV test', parameters: { type: 'object', properties: {} },
     output: { schema: { type: 'string' }, render: (_, text) => [{ type: 'text', text }] },
     execute() {
+      log({ event: 'verify-tool' });
       const result = spawnSync(process.execPath, ['--test', 'csv.test.cjs'], { encoding: 'utf8', windowsHide: true });
       if (result.status !== 1 || !result.stdout.includes('CSV_HEADER_EXPECTED')) throw Error('Unexpected fixture output');
       throw Error('FAIL csv-header: CSV_HEADER_EXPECTED');
@@ -61,7 +69,10 @@ export function apply(ctx) {
         log({ sessionId: req.sessionId, snapshot: { task, blocker: checkout.includes('CSV_HEADER_EXPECTED'),
           current: ledger.active?.some(d => d.option_code === 'pnpm') ?? false,
           superseded: ledger.tombstones?.some(d => d.option_code === 'npm') ?? false } });
-        if (phase === 'a' && !calledTool) {
+        const pickerAction = ['picker-native', 'picker-reply'].includes(phase) && task === 1 && checkout.includes('CSV_HEADER_EXPECTED') &&
+          (phase === 'picker-native' ? req.messages.some(m => m.source?.kind === 'user' && body(m).includes('继续，把失败的测试修掉'))
+            : snapshot.includes('<cairn_resume_request>') && snapshot.includes('继续，把失败的测试修掉'));
+        if ((phase === 'a' || pickerAction) && !calledTool) {
           calledTool = true;
           yield { type: 'block-start', index: 0, blockType: 'tool-call' };
           yield { type: 'tool-call-delta', index: 0, id: 'smoke-csv', name: 'probe_csv', argumentsDelta: '{}' };
