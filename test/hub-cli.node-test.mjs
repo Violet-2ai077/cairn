@@ -22,6 +22,23 @@ test('Hub CLI revert requires explicit scope, supports read-only preview, and ap
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('Hub tasks CLI reports derived pool and unchanged lifecycle in text and JSON', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-cli-task-heat-'));
+  try {
+    upsertHubTask(root, { id: 1, title: 'Old' });
+    appendHubTaskTurn(root, { task_id: 1, content: 'old turn', timestamp: '2000-01-01T00:00:00Z' });
+    upsertHubTask(root, { id: 2, title: 'Closed' });
+    const out = [];
+    const run = (...args) => runCairnCli([...args, '--store', root], { stdout: msg => out.push(msg), stderr: msg => out.push(msg) });
+    assert.equal(run('close', '2'), 0);
+    assert.equal(run('tasks', '--task-heat', '--all', '--json'), 0);
+    assert.deepEqual(JSON.parse(out.at(-1)).tasks.map(task => [task.status, task.pool]), [['active', 'dormant'], ['done', 'excluded']]);
+    assert.equal(run('tasks', '--all'), 0);
+    assert.match(out.at(-1), /active.*hot.*Old/u);
+    assert.match(out.at(-1), /done.*excluded.*Closed/u);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('Hub CLI keeps task checkout preview read-only and requires session for binding', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-hub-cli-'));
   const output = [];

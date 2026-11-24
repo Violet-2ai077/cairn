@@ -154,13 +154,33 @@ export function buildLightTaskCatalog(tasks = []) {
 
 export function buildHubTaskCatalog(tasks = []) {
   if (!Array.isArray(tasks)) return '';
-  const active = tasks.filter(task => (task?.status ?? 'active') === 'active');
-  if (active.length === 0) return '';
-  const lines = active.map(task => {
-    const id = String(task.id).trim();
-    const title = String(task.title ?? '').trim();
-    const project = task.project_id ? ` [project:${String(task.project_name ?? task.project_id)}; id:${String(task.project_id)}]` : ' [general]';
-    return `- <|task:${id}|>${project}: ${title}`;
+  const cards = buildHubRoutingCards(tasks);
+  if (!cards.length) return '';
+  const lines = cards.map(card => {
+    const project = card.project_id ? ` [project:${card.project_name}; id:${card.project_id}]` : ' [general]';
+    return `- <|task:${card.task_id}|>${project}: ${card.title}`;
   });
   return `Read-only global active task catalog (reference only; do not echo):\n${lines.join('\n')}`;
+}
+
+export function sanitizeHubRoutingText(value) {
+  return String(value ?? '')
+    .replace(/<system-reminder\b[^>]*>[\s\S]*?(?:<\/system-reminder>|$)/giu, '')
+    .replace(/\[\s*(?:(?:#\d+|turn\s*=\s*\d+)(?:\s+|(?=\])))+(?:(?:user|assistant|tool)\s*)?\]/giu, '')
+    .replace(/\b(?:established\s+turn|turn\s*#|seq\s*#)\s*\d+|\[turn\s+\d+\]|\b\d+\s+turns?\s+ago\b/giu, '')
+    .replace(/\b(?:created[_ ]at|updated[_ ]at|last[_ ]activity[_ ]at|timestamp|birth[_ ]turn|turn[_ ]count|seq(?:uence)?(?:[_ ]count)?|record[_ ]count|compacted[_ ]record[_ ]count|age(?:[_ ]days)?|heat(?:[_ ]score)?|recency(?:[_ ]score)?|turn)\b["']?\s*[:=]\s*["']?(?:\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?)?|\d+(?:\.\d+)?)(?:["'])?/giu, '')
+    .replace(/\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?\b/giu, '')
+    .replace(/\s+/gu, ' ').trim();
+}
+
+export function buildHubRoutingCards(tasks) {
+  return tasks.filter(task => (task?.status ?? 'active') === 'active')
+    .map(task => ({
+      task_id: Number(task.id),
+      project_id: task.project_id ?? null,
+      project_name: sanitizeHubRoutingText(task.project_name ?? task.project_id ?? 'general').slice(0, 120),
+      title: sanitizeHubRoutingText(task.title).slice(0, 200),
+      preview: sanitizeHubRoutingText(task.preview).slice(0, 200)
+    })).filter(card => Number.isSafeInteger(card.task_id) && card.task_id >= 1 && card.task_id <= 999)
+    .sort((a, b) => a.task_id - b.task_id);
 }

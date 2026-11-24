@@ -391,7 +391,10 @@ export function readHubTasksIndex(hubRoot) {
     status: ['active', 'done', 'archived'].includes(task.status) ? task.status : 'active',
     turn_count: Number.isSafeInteger(task.turn_count) ? task.turn_count : 0,
     compacted_record_count: Number.isSafeInteger(task.compacted_record_count) ? task.compacted_record_count : 0,
-    has_compact: Boolean(task.has_compact), updated_at: task.updated_at ?? null
+    has_compact: Boolean(task.has_compact), updated_at: task.updated_at ?? null,
+    // Pre-heat compaction overwrote updated_at, so it cannot date a compacted legacy task.
+    last_activity_at: Object.hasOwn(task, 'last_activity_at') ? task.last_activity_at ?? null
+      : !task.has_compact && task.turn_count > 0 ? task.updated_at ?? null : null
   })).sort((a, b) => a.id - b.id) : [];
   return { schema_version: 1, next_task_id: Number.isSafeInteger(raw.next_task_id) ? raw.next_task_id : 1, tasks };
 }
@@ -413,7 +416,7 @@ function upsertHubTaskUnlocked(hubRoot, { id, project_id = null, title, birth_tu
   if (existingIndex < 0 && status !== 'active') throw new Error('new_task_status_must_be_active');
   const task = existingIndex >= 0
     ? { ...index.tasks[existingIndex], title: title?.trim() || index.tasks[existingIndex].title, updated_at: now }
-    : { id: taskId, project_id: projectId, title: title?.trim() || `Task ${taskId}`, birth_turn: birth_turn ?? 1, status, turn_count: 0, compacted_record_count: 0, has_compact: false, updated_at: now };
+    : { id: taskId, project_id: projectId, title: title?.trim() || `Task ${taskId}`, birth_turn: birth_turn ?? 1, status, turn_count: 0, compacted_record_count: 0, has_compact: false, updated_at: now, last_activity_at: null };
   if (existingIndex >= 0) index.tasks[existingIndex] = task;
   else { index.tasks.push(task); index.next_task_id = Math.max(index.next_task_id, taskId + 1); }
   index.tasks.sort((a, b) => a.id - b.id);
@@ -423,6 +426,16 @@ function upsertHubTaskUnlocked(hubRoot, { id, project_id = null, title, birth_tu
 }
 
 export const appendHubTaskTurn = locked(appendHubTaskTurnUnlocked);
+function updateTaskActivity(task, at) {
+  const next = Date.parse(at);
+  const current = Date.parse(task.last_activity_at);
+  if (Number.isFinite(next) && (!Number.isFinite(current) || next >= current)) task.last_activity_at = at;
+}
+
+function isActivityRecord(record) {
+  return ['user', 'assistant'].includes(record.role) && record.meta?.cairn_activity !== false;
+}
+
 function appendHubTaskTurnUnlocked(hubRoot, { task_id, project_id = null, turn, role = 'assistant', content = '', raw_content = null, meta = {}, timestamp } = {}) {
   const id = normalizeTaskId(task_id);
   const projectId = normalizedProjectId(project_id);
@@ -439,11 +452,12 @@ function appendHubTaskTurnUnlocked(hubRoot, { task_id, project_id = null, turn, 
   const indexTask = index.tasks.find(item => item.id === id);
   indexTask.turn_count = record.seq;
   indexTask.updated_at = record.timestamp;
+  if (isActivityRecord(record)) updateTaskActivity(indexTask, record.timestamp);
   writeJsonAtomic(paths.tasksIndexFile, index);
   return { record, task: indexTask };
 }
 
-export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessionId, turn, user, assistant }) => {
+export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessionId, turn, user, assistant, activity = true }) => {
   const records = readHubTaskThread(hubRoot, taskId);
   const turnRecords = records.filter(record => record.turn === turn && record.meta?.dsh_session_id === sessionId);
   const texts = { user, assistant };
@@ -456,7 +470,8 @@ export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessi
   }
   const missing = roles.filter(role => !turnRecords.some(record => record.role === role));
   for (const role of missing) {
-    appendHubTaskTurnUnlocked(hubRoot, { task_id: taskId, project_id: projectId, turn, role, content: texts[role], meta: { dsh_session_id: sessionId } });
+    const meta = { dsh_session_id: sessionId, ...(activity ? {} : { cairn_activity: false }) };
+    appendHubTaskTurnUnlocked(hubRoot, { task_id: taskId, project_id: projectId, turn, role, content: texts[role], meta });
   }
   if (!missing.length) {
     const index = readHubTasksIndex(hubRoot);
@@ -465,6 +480,7 @@ export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessi
     if (task?.status === 'active' && task.turn_count < lastRecord.seq) {
       task.turn_count = lastRecord.seq;
       task.updated_at = lastRecord.timestamp;
+      updateTaskActivity(task, records.findLast(isActivityRecord)?.timestamp);
       writeJsonAtomic(resolveHubPaths(hubRoot).tasksIndexFile, index);
     }
   }
@@ -510,6 +526,21 @@ function writeSessionBindingUnlocked(hubRoot, sessionId, { project_id = null, ta
   return { ...binding };
 }
 
+export const bindHubRoutedTask = locked((hubRoot, { sessionId, taskId, projectId, source = 'cold_router_match', wake = false, at = new Date().toISOString() }) => {
+  const paths = resolveHubPaths(hubRoot);
+  const index = readHubTasksIndex(hubRoot);
+  const task = index.tasks.find(item => item.id === normalizeTaskId(taskId));
+  if (!task) throw new Error(`task_not_found:${taskId}`);
+  if (task.status !== 'active') throw new Error(`task_not_active:${taskId}:${task.status}`);
+  if (task.project_id !== normalizedProjectId(projectId)) throw new Error('task_project_mismatch');
+  const binding = writeSessionBindingUnlocked(hubRoot, sessionId, { project_id: projectId, task_id: task.id, source });
+  if (wake) {
+    updateTaskActivity(task, at);
+    writeJsonAtomic(paths.tasksIndexFile, index);
+  }
+  return binding;
+});
+
 export const clearSessionBinding = locked(clearSessionBindingUnlocked);
 function clearSessionBindingUnlocked(hubRoot, sessionId) {
   const file = resolveHubPaths(hubRoot).sessionBindingFile(sessionId);
@@ -549,6 +580,7 @@ function transitionHubTaskStatusUnlocked(hubRoot, { taskId, action, updatedAt } 
   if (!transition) throw new Error(`invalid_task_lifecycle_action:${String(action)}`);
   if (!transition.from.includes(task.status)) throw new Error(`invalid_task_transition:${task.status}:${action}`);
   const nextTask = { ...task, status: transition.to, updated_at: updatedAt ?? new Date().toISOString() };
+  if (action === 'reopen') updateTaskActivity(nextTask, nextTask.updated_at);
   index.tasks[taskIndex] = nextTask;
   const clearedBindings = transition.to !== 'active' ? clearBindingsForTask(hubRoot, id) : 0;
   writeJsonAtomic(paths.tasksIndexFile, index);

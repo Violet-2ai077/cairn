@@ -41,6 +41,64 @@ function tempRoot() {
 const projectScope = { scope: 'project', projectId: 'p_alpha' };
 const assertion = (key, option_code = 'a') => ({ op: 'ASSERT', key, option_code, summary: option_code });
 
+test('task heat derives capacity, idle and frozen pools, with a deterministic ID tie-break', async () => {
+  const { resolveTaskHeatPolicy, selectHubTaskPools } = await import('../src/kernel/task-heat.mjs');
+  const nowMs = Date.parse('2026-02-01T00:00:00Z');
+  const recent = '2026-01-31T00:00:00Z';
+  const old = '2025-12-01T00:00:00Z';
+  const tasks = [
+    { id: 5, status: 'active', last_activity_at: recent },
+    { id: 4, status: 'archived', last_activity_at: recent },
+    { id: 3, status: 'active', last_activity_at: old },
+    { id: 2, status: 'active', last_activity_at: recent },
+    { id: 1, status: 'active', last_activity_at: recent }
+  ];
+  const run = autopilot => selectHubTaskPools(tasks, { policy: resolveTaskHeatPolicy(autopilot), nowMs });
+  const active = { enabled: true, taskHeat: { hotMaxTasks: 2 } };
+  assert.deepEqual(run(active).hot.map(task => task.id), [1, 2]);
+  assert.deepEqual(run(active).dormant.map(task => task.id), [3, 5]);
+  assert.deepEqual(run(active).excluded.map(task => task.id), [4]);
+  assert.deepEqual(run({ ...active, enabled: false }).hot.map(task => task.id), [1, 2, 3, 5]);
+  assert.deepEqual(run({ ...active, taskHeat: { enabled: false } }).hot.map(task => task.id), [1, 2, 3, 5]);
+  assert.deepEqual(resolveTaskHeatPolicy({ enabled: true }), { enabled: true, hotMaxTasks: 24, idleDays: 14, dormantMaxCandidates: 5 });
+});
+
+test('Hub task activity survives compaction and is refreshed only by turn, reopen or verified wake', () => {
+  const hub = tempRoot();
+  const at = '2026-01-02T00:00:00.000Z';
+  const resumed = '2026-01-05T00:00:00.000Z';
+  upsertHubTask(hub, { id: 1, project_id: 'p_alpha', updated_at: at });
+  const get = () => readHubTasksIndex(hub).tasks[0];
+  assert.equal(get().last_activity_at, null);
+  appendHubTaskTurn(hub, { task_id: 1, project_id: 'p_alpha', content: 'turn', timestamp: at });
+  assert.equal(get().last_activity_at, at);
+  const indexFile = resolveHubPaths(hub).tasksIndexFile;
+  const old = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+  delete old.tasks[0].last_activity_at;
+  fs.writeFileSync(indexFile, JSON.stringify(old));
+  assert.equal(get().last_activity_at, at);
+  hubStore.writeHubTaskCompaction(hub, 1, 'compact', 1);
+  assert.equal(get().last_activity_at, at);
+  const legacyCompacted = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+  delete legacyCompacted.tasks[0].last_activity_at;
+  fs.writeFileSync(indexFile, JSON.stringify(legacyCompacted));
+  assert.equal(get().last_activity_at, null, 'a compacted legacy updated_at is not evidence of a turn');
+  legacyCompacted.tasks[0].last_activity_at = at;
+  fs.writeFileSync(indexFile, JSON.stringify(legacyCompacted));
+  transitionHubTaskStatus(hub, { taskId: 1, action: 'close' });
+  assert.throws(() => hubStore.bindHubRoutedTask(hub, { sessionId: 's', taskId: 1, projectId: 'p_alpha', wake: true }), /task_not_active/u);
+  assert.equal(readSessionBinding(hub, 's'), null);
+  transitionHubTaskStatus(hub, { taskId: 1, action: 'archive' });
+  assert.equal(get().last_activity_at, at);
+  transitionHubTaskStatus(hub, { taskId: 1, action: 'reopen', updatedAt: resumed });
+  assert.equal(get().last_activity_at, resumed);
+  assert.throws(() => hubStore.bindHubRoutedTask(hub, { sessionId: 's', taskId: 1, projectId: 'p_wrong', wake: true }), /task_project_mismatch/u);
+  hubStore.bindHubRoutedTask(hub, { sessionId: 's', taskId: 1, projectId: 'p_alpha', wake: true, at: '2026-02-01T00:00:00.000Z' });
+  assert.equal(get().last_activity_at, '2026-02-01T00:00:00.000Z');
+  assert.equal(readSessionBinding(hub, 's').task_id, 1);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(indexFile, 'utf8')).tasks[0], 'pool'), false);
+});
+
 function stage(hub, ops) {
   return stageScopedOperators(hub, { ...projectScope, ops }).proposal.proposal_id;
 }

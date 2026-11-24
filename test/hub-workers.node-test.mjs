@@ -3,13 +3,106 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { initHubStore, upsertHubTask, appendHubTaskTurn, stageScopedOperators, commitScopedStaged, readScopedHead, readScopedStaged } from '../src/kernel/hub-store.mjs';
+import { initHubStore, upsertHubTask, appendHubTaskTurn, stageScopedOperators, commitScopedStaged, readScopedHead, readScopedStaged, resolveHubPaths, transitionHubTaskStatus, writeHubTaskCompaction } from '../src/kernel/hub-store.mjs';
 import { compileHubTaskCheckout } from '../src/workers/hub-task-checkout.mjs';
 import { resolveStoreRoot } from '../src/workers/store-root.mjs';
 import { buildHubColdRouterPrompt, runHubColdRouter } from '../src/workers/hub-cold-router.mjs';
 import { runHubStagingExtractor } from '../src/workers/hub-staging-extractor.mjs';
 import { runHubStrictCompactor, createHubTaskCompactionCoordinator } from '../src/workers/hub-strict-compactor.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
+
+const heat = { enabled: true, hotMaxTasks: 1, idleDays: 14, dormantMaxCandidates: 1 };
+const recent = '2026-01-31T00:00:00Z';
+const old = '2025-12-01T00:00:00Z';
+const nowMs = Date.parse('2026-02-01T00:00:00Z');
+const newRoute = '{"decision":"new","task_id":null}';
+
+function seedTask(hub, id, title, timestamp = old) {
+  upsertHubTask(hub, { id, title });
+  appendHubTaskTurn(hub, { task_id: id, content: title, timestamp });
+}
+
+test('dormant routing prescreens English and Chinese metadata, reads only shortlisted previews, and calls at most twice', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-heat-'));
+  try {
+    seedTask(hub, 1, 'Hot finance', recent);
+    seedTask(hub, 2, '支付回调迁移');
+    seedTask(hub, 3, 'Kafka ingestion');
+    seedTask(hub, 4, 'Unrelated');
+    seedTask(hub, 5, 'Kafka historical');
+    const paths = resolveHubPaths(hub);
+    fs.writeFileSync(paths.taskThreadFile(4), 'NOT JSON: must not open this unrelated thread');
+    fs.writeFileSync(paths.taskThreadFile(5), 'NOT JSON: matching candidate outside shortlist budget');
+    writeHubTaskCompaction(hub, 2, '[#721 turn=892 assistant] 支付方案 timestamp=2026-01-02T03:04:05Z\nturn_count: 995\n业务日期 2026-02-10', 1);
+    for (const [userPrompt, id] of [['继续支付回调', 2], ['Continue Kafka ingestion', 3]]) {
+      const requests = [];
+      const result = await runHubColdRouter({
+        hubRoot: hub, userPrompt, taskHeat: heat, nowMs,
+        llmClient: { complete: async ({ system }) => {
+          requests.push(system);
+          return { ok: true, content: requests.length === 1 ? newRoute : JSON.stringify({ decision: 'match', task_id: id, project_id: null }) };
+        } }
+      });
+      assert.equal(result.task_id, id);
+      assert.equal(result.pool, 'dormant');
+      assert.equal(requests.length, 2);
+      assert.match(requests[0], /Hot finance/u);
+      assert.doesNotMatch(requests[0], /支付回调|Kafka|Unrelated/u);
+      assert.doesNotMatch(requests[1], /Hot finance|Unrelated|721|892|995|03:04:05|turn_count/u);
+      if (id === 2) assert.match(requests[1], /业务日期 2026-02-10/u);
+    }
+  } finally { fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('a hung hot router times out even if the client ignores abort, without calling the cold stage', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-heat-timeout-'));
+  try {
+    seedTask(hub, 1, 'Hot finance', recent);
+    seedTask(hub, 2, 'Kafka ingestion');
+    let calls = 0;
+    let signal;
+    const result = await runHubColdRouter({
+      hubRoot: hub, userPrompt: 'Resume Kafka', taskHeat: heat, nowMs, timeoutMs: 25,
+      llmClient: { complete: request => { calls++; signal = request.signal; return new Promise(() => {}); } }
+    });
+    assert.equal(result.error_code, 'timeout');
+    assert.equal(signal.aborted, true);
+    assert.equal(calls, 1);
+  } finally { fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('hot ambiguity, timeout and errors stop before dormant search; exact IDs respect freeze', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-heat-fail-'));
+  try {
+    seedTask(hub, 1, 'Hot one', recent);
+    seedTask(hub, 2, 'Hot two', recent);
+    seedTask(hub, 3, 'Kafka ingestion');
+    seedTask(hub, 4, 'Archived Kafka');
+    transitionHubTaskStatus(hub, { taskId: 4, action: 'close' });
+    transitionHubTaskStatus(hub, { taskId: 4, action: 'archive' });
+    for (const [decision, complete] of [
+      ['ambiguous', async () => ({ ok: true, content: '{"decision":"ambiguous","task_id":null,"candidates":[1,2]}' })],
+      [null, async () => { throw new Error('offline'); }],
+      [null, async () => ({ ok: false, error_code: 'timeout' })]
+    ]) {
+      let calls = 0;
+      const result = await runHubColdRouter({
+        hubRoot: hub, taskHeat: { ...heat, hotMaxTasks: 2 }, nowMs, userPrompt: 'Resume Kafka',
+        llmClient: { complete: args => { calls++; return complete(args); } }
+      });
+      assert.equal(result.decision, decision);
+      assert.equal(calls, 1);
+    }
+    const exact = input => runHubColdRouter({
+      hubRoot: hub, taskHeat: heat, nowMs, userPrompt: input,
+      llmClient: { complete: () => assert.fail('exact ID must not call the model') }
+    });
+    assert.equal((await exact('继续任务 #3')).pool, 'dormant');
+    assert.equal((await exact('continue task #4')).error_code, 'task_not_active');
+    transitionHubTaskStatus(hub, { taskId: 3, action: 'close' });
+    assert.equal((await exact('continue task #3')).error_code, 'task_not_active');
+  } finally { fs.rmSync(hub, { recursive: true, force: true }); }
+});
 
 test('auto-commit uses explicit authored adoption and allows technical detail from the confirmed assistant proposal', async () => {
   const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-auto-'));

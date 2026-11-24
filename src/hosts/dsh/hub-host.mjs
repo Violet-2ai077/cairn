@@ -4,7 +4,7 @@ import {
   buildHubTaskCatalog, buildScopedAuthorityContract, buildAntiRecencyContract, readHubTasksIndex,
   readSessionBinding, writeSessionBinding, clearSessionBinding, isHubInitialized,
   readScopedHead, projectReadOnlyLedger, upsertHubTask, appendHubTaskTurnPair, initHubStore, parseTaskMarker, readHubTaskThread,
-  transitionHubTaskStatus, revertScopedCommit
+  transitionHubTaskStatus, revertScopedCommit, bindHubRoutedTask
 } from '../../kernel/index.mjs';
 import { readScopedStaged, commitScopedStaged, dropScopedStaged } from '../../kernel/index.mjs';
 import { resolveStoreRoot } from '../../workers/store-root.mjs';
@@ -15,6 +15,7 @@ import { runHubStagingExtractor } from '../../workers/hub-staging-extractor.mjs'
 import { createHubTaskCompactionCoordinator } from '../../workers/hub-strict-compactor.mjs';
 import { createHubWriteCoordinator } from '../../workers/hub-write-coordinator.mjs';
 import { readProjectsIndex } from '../../kernel/hub-store.mjs';
+import { listHubTaskPools, resolveTaskHeatPolicy, selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
 
 function createHubHostLlmClient(ctx, route) {
@@ -42,6 +43,17 @@ function stripTrailingSystemReminders(text) {
   return cleaned.trim();
 }
 
+function routingUserPrompt(messages, turnNumber, currentTurn) {
+  if (currentTurn?.turn === turnNumber && currentTurn?.authoredUser?.trim()) return currentTurn.authoredUser.trim();
+  const message = (messages ?? []).findLast(item => item?.source?.kind === 'user');
+  const messageTurn = message?.turn ?? message?.source?.turn;
+  if (messageTurn != null && turnNumber != null && messageTurn !== turnNumber) return '';
+  const content = message?.content;
+  return stripTrailingSystemReminders(Array.isArray(content)
+    ? content.filter(block => block?.type == null || block.type === 'text').map(block => block?.text ?? '').join('')
+    : content);
+}
+
 export async function createHubDshHost(ctx, config = {}) {
   const hubRoot = resolveStoreRoot({ storeRoot: config.storeRoot });
   const disposers = [];
@@ -53,6 +65,10 @@ export async function createHubDshHost(ctx, config = {}) {
   const sessionJobs = new Map();
   const compactionCoordinator = createHubTaskCompactionCoordinator({ hubRoot, cooldownMs: config.autoCompactCooldownMs ?? 300000 });
   const writeCoordinator = createHubWriteCoordinator();
+  const taskHeat = resolveTaskHeatPolicy(config.autopilot);
+  const routingUnresolved = state => taskHeat.enabled && ['ambiguous', 'error'].includes(state?.route?.result);
+  const taskList = filter => listHubTaskPools(readHubTasksIndex(hubRoot).tasks, { policy: taskHeat })
+    .filter(task => !filter || task.status === filter);
   const clientFor = route => config.llmClient ?? createHubHostLlmClient(ctx, route);
   const routeForTurn = (sessionId, turn) => {
     const entry = modelRoutes.get(sessionId);
@@ -88,7 +104,8 @@ export async function createHubDshHost(ctx, config = {}) {
     const stop = ctx.systemPrompt.context({ name: 'cairn:user-and-global-catalog', order: 300, interpolate: false, text: context => {
       const projects = new Map(readProjectsIndex(hubRoot).projects.map(project => [project.project_id, project.name]));
       const taskIndex = readHubTasksIndex(hubRoot);
-      const tasks = taskIndex.tasks.map(task => ({ ...task, project_name: task.project_id ? projects.get(task.project_id) ?? task.project_id : null }));
+      const { hot } = selectHubTaskPools(taskIndex.tasks, { policy: taskHeat });
+      const tasks = hot.map(task => ({ ...task, project_name: projects.get(task.project_id) }));
       const userHead = readScopedHead(hubRoot, { scope: 'user' });
       const taskMarkerContract = `${buildAntiRecencyContract()}\n\nHub 建档规则：任务 marker 是宿主归档与建档的唯一触发器。继续已有任务时沿用其编号；用户明确开启不同新任务时输出 <|task:${taskIndex.next_task_id}|>（下一个从未使用的 ID）。空 Hub 的首个任务因此输出 <|task:1|>。若无法区分已有任务则输出 <|task:UNRESOLVED|> 并澄清，不得猜测。`;
       return [taskMarkerContract, buildScopedAuthorityContract({ userLedgerSnapshot: projectReadOnlyLedger(userHead, { includeTombstones: true }), includeProject: false }), buildHubTaskCatalog(tasks)].filter(Boolean).join('\n\n');
@@ -97,6 +114,11 @@ export async function createHubDshHost(ctx, config = {}) {
     const stopProject = ctx.systemPrompt.context({ name: 'cairn:locked-project-context', order: 310, interpolate: false, text: context => {
       const sessionId = sessionIdFrom(context);
       const state = sessionId ? stateFor(sessionId) : null;
+      if (routingUnresolved(state)) {
+        return 'Cairn 路由尚未确认。若用户想继续旧任务，请澄清目标；已关闭或归档的任务需显式重开。在目标未确认前输出 <|task:UNRESOLVED|>，不要新建任务。';
+      }
+      if (state?.taskId && !readHubTasksIndex(hubRoot).tasks.some(task =>
+        task.id === state.taskId && task.project_id === state.selectedProjectId && task.status === 'active')) return '';
       const parts = [];
       if (state?.selectedProjectId) {
         const project = readProjectsIndex(hubRoot).projects.find(item => item.project_id === state.selectedProjectId);
@@ -126,33 +148,54 @@ export async function createHubDshHost(ctx, config = {}) {
       }
       if (currentTurn && currentTurn.turn === turnNumber && !currentTurn.modelRoute) currentTurn.modelRoute = routeForTurn(sessionId, turnNumber);
       let state = stateFor(sessionId);
-      if (state.route && state.route.result !== 'ambiguous') return decision;
+      if (state.route && ((state.route.result !== 'ambiguous' && !routingUnresolved(state)) ||
+          (taskHeat.enabled && state.route.turn === turnNumber))) return decision;
+      const tasks = readHubTasksIndex(hubRoot).tasks;
+      const userPrompt = routingUserPrompt(payload?.messages, turnNumber, currentTurn);
       const existing = readSessionBinding(hubRoot, sessionId);
       if (existing?.task_id !== null && existing?.task_id !== undefined) {
-        const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === existing.task_id && item.status === 'active');
+        const task = tasks.find(item => item.id === existing.task_id && item.status === 'active');
         if (task && task.project_id === existing.project_id) {
-          state = { ...state, selectedProjectId: existing.project_id, taskId: task.id, bindingSource: existing.source, route: { result: 'explicit_binding', elapsed_ms: 0 } };
-          sessions.set(sessionId, state); return decision;
+          try {
+            if (taskHeat.enabled && selectHubTaskPools(tasks, { policy: taskHeat }).dormant.some(item => item.id === task.id)) {
+              bindHubRoutedTask(hubRoot, { sessionId, taskId: task.id, projectId: task.project_id, source: existing.source, wake: true });
+            }
+            state = { ...state, selectedProjectId: existing.project_id, taskId: task.id, bindingSource: existing.source, route: { result: 'explicit_binding', elapsed_ms: 0 } };
+            sessions.set(sessionId, state); return decision;
+          } catch {
+            sessions.set(sessionId, { ...state, selectedProjectId: null, taskId: null, bindingSource: null, route: { result: 'error', turn: turnNumber, elapsed_ms: 0, error_code: 'route_binding_invalidated' } });
+            return decision;
+          }
         }
       }
       const cwdHint = resolveGitProjectHint(cwdFrom(payload));
-      const userPrompt = (payload?.messages ?? []).filter(message => message?.source?.kind === 'user').map(message => typeof message.content === 'string' ? message.content : Array.isArray(message.content) ? message.content.map(b => b.text ?? '').join('') : '').join('\n');
-      if (!readHubTasksIndex(hubRoot).tasks.some(task => task.status === 'active')) {
+      if ((!taskHeat.enabled && !tasks.some(task => task.status === 'active')) || (!tasks.length && !userPrompt)) {
         sessions.set(sessionId, { ...state, selectedProjectId: cwdHint?.project_id ?? null, cwdHint: cwdHint?.project_id ?? null, route: { result: 'new', elapsed_ms: 0 } });
         return decision;
       }
+      if (!userPrompt) return decision;
       const start = Date.now();
-      const result = await runHubColdRouter({ hubRoot, userPrompt, cwdProjectHint: cwdHint?.project_id ?? null, llmClient: clientFor(route), signal: payload.signal });
+      let result = await runHubColdRouter({
+        hubRoot, userPrompt, cwdProjectHint: cwdHint?.project_id ?? null, llmClient: clientFor(route),
+        signal: payload.signal, taskHeat, timeoutMs: config.autopilot?.taskHeat?.routeTimeoutMs
+      });
       if (payload.signal?.aborted) throw payload.signal.reason ?? new Error('Aborted');
       const elapsed = Date.now() - start;
-      if (result.decision === 'match') {
-        state = { ...state, selectedProjectId: result.project_id, taskId: result.task_id, cwdHint: cwdHint?.project_id ?? null, bindingSource: 'cold_router_match', route: { result: 'match', elapsed_ms: elapsed } };
-        initHubStore(hubRoot);
-        writeSessionBinding(hubRoot, sessionId, { project_id: result.project_id, task_id: result.task_id, source: 'cold_router_match' });
+      let bindingSource = null;
+      if (result.ok && result.decision === 'match') {
+        bindingSource = result.pool === 'dormant' ? 'dormant_wake' : 'cold_router_match';
+        try {
+          bindHubRoutedTask(hubRoot, { sessionId, taskId: result.task_id, projectId: result.project_id, source: bindingSource, wake: result.pool === 'dormant' });
+        } catch {
+          result = { ok: false, error_code: 'route_binding_invalidated' };
+        }
+      }
+      if (result.ok && result.decision === 'match') {
+        state = { ...state, selectedProjectId: result.project_id, taskId: result.task_id, cwdHint: cwdHint?.project_id ?? null, bindingSource, route: { result: 'match', elapsed_ms: elapsed } };
       } else {
-        const selectedProjectId = result.decision === 'new' ? cwdHint?.project_id ?? null : null;
-        state = { ...state, selectedProjectId, taskId: null, cwdHint: cwdHint?.project_id ?? null, bindingSource: null, route: { result: result.ok ? result.decision : 'error', elapsed_ms: elapsed } };
-        if (selectedProjectId) { initHubStore(hubRoot); writeSessionBinding(hubRoot, sessionId, { project_id: selectedProjectId, task_id: null, source: 'cwd_new' }); }
+        const selectedProjectId = result.ok && result.decision === 'new' ? cwdHint?.project_id ?? null : null;
+        state = { ...state, selectedProjectId, taskId: null, cwdHint: cwdHint?.project_id ?? null, bindingSource: null, route: { result: result.ok ? result.decision : 'error', elapsed_ms: elapsed, turn: turnNumber } };
+        if (selectedProjectId && tasks.length) { initHubStore(hubRoot); writeSessionBinding(hubRoot, sessionId, { project_id: selectedProjectId, task_id: null, source: 'cwd_new' }); }
       }
       sessions.set(sessionId, state);
       return decision;
@@ -189,7 +232,7 @@ export async function createHubDshHost(ctx, config = {}) {
       const state = stateFor(sessionId);
       const marker = parseTaskMarker(turn.assistant.trim());
       turns.delete(sessionId);
-      if (!marker.valid || marker.is_unresolved || (event.data?.reason?.kind && event.data.reason.kind !== 'completed')) return;
+      if (routingUnresolved(state) || !marker.valid || marker.is_unresolved || (event.data?.reason?.kind && event.data.reason.kind !== 'completed')) return;
       const taskId = marker.task_number;
       try {
         initHubStore(hubRoot);
@@ -199,7 +242,8 @@ export async function createHubDshHost(ctx, config = {}) {
         if (task && task.project_id !== (state.selectedProjectId ?? null)) return;
         const projectId = state.selectedProjectId ?? null;
         const { appended } = appendHubTaskTurnPair(hubRoot, {
-          taskId, projectId, sessionId, turn: turn.turn, user: turn.user.trim(), assistant: marker.answer
+          taskId, projectId, sessionId, turn: turn.turn, user: turn.user.trim(), assistant: marker.answer,
+          activity: Boolean(turn.authoredUser.trim())
         });
         if (!appended) return;
         state.taskId = taskId; state.bindingSource = state.bindingSource ?? 'task_marker'; sessions.set(sessionId, state);
@@ -230,7 +274,7 @@ export async function createHubDshHost(ctx, config = {}) {
   if (ctx.tools?.register) {
     const definitions = [
       { name: 'cairn_status', description: 'Read-only status of the centralized Cairn Hub.', parameters: { type: 'object', properties: {} }, async execute() { return JSON.stringify(readStatus()); } },
-      { name: 'cairn_tasks', description: 'List active tasks in the centralized Cairn Hub.', parameters: { type: 'object', properties: {} }, async execute() { return JSON.stringify(readHubTasksIndex(hubRoot).tasks.filter(task => task.status === 'active')); } },
+      { name: 'cairn_tasks', description: 'List active tasks and their derived routing pools in the centralized Cairn Hub.', parameters: { type: 'object', properties: {} }, async execute() { return JSON.stringify(taskList('active')); } },
       { name: 'cairn_checkout', description: 'Preview or bind a task to this session. HUMAN AUTHORITY RED LINE: only bind when explicitly instructed.', parameters: { type: 'object', properties: { task_id: { type: 'integer' }, preview: { type: 'boolean' }, clear: { type: 'boolean' } } }, async execute(args = {}, runCtx = {}) { const id = runCtx.agent?.session?.id; if (!id) return 'session_id_unavailable'; if (args.clear) { clearSessionBinding(hubRoot, id); sessions.delete(id); return 'Session checkout cleared.'; } const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === args.task_id); if (!task) return `task_not_found:${args.task_id}`; const checkout = compileHubTaskCheckout({ hubRoot, taskId: task.id }); if (args.preview) return checkout.text; if (task.status !== 'active') return `task_not_active:${task.id}; reopen first`; writeSessionBinding(hubRoot, id, { project_id: task.project_id, task_id: task.id, source: 'tool_checkout' }); sessions.set(id, { ...stateFor(id), selectedProjectId: task.project_id, taskId: task.id, bindingSource: 'tool_checkout' }); return `Checked out task ${task.id}.`; } },
       { name: 'cairn_compact', description: 'Compact a task-local Hub history. HUMAN AUTHORITY RED LINE: only compact when explicitly instructed by the user.', parameters: { type: 'object', properties: { task_id: { type: 'integer' }, full: { type: 'boolean' }, confirmed: { type: 'boolean' } }, required: ['confirmed'] }, async execute(args = {}, runCtx = {}) { if (args.confirmed !== true) return 'Explicit confirmation required.'; const sessionId = runCtx.agent?.session?.id; const id = args.task_id ?? stateFor(sessionId).taskId; if (!id) return 'no_active_task'; const llmClient = clientFor(modelRoutes.get(sessionId)?.route); return JSON.stringify(await workerLlmCallContext.run({ sessionId }, () => compactionCoordinator.run({ taskId: id, source: 'manual', mode: args.full ? 'full' : 'incremental', llmClient }))); } },
       ...['close', 'archive', 'reopen'].map(action => ({ name: `cairn_${action}_task`, description: `Change task lifecycle with ${action}. HUMAN AUTHORITY RED LINE: only perform when explicitly instructed by the user.`, parameters: { type: 'object', properties: { task_id: { type: 'integer' }, confirmed: { type: 'boolean' } }, required: ['task_id', 'confirmed'] }, async execute(args = {}) { if (args.confirmed !== true) return 'Explicit confirmation required.'; const result = transitionHubTaskStatus(hubRoot, { taskId: args.task_id, action }); if (action !== 'reopen') clearTaskSessionState(args.task_id); return JSON.stringify(result); } })),
@@ -247,7 +291,7 @@ export async function createHubDshHost(ctx, config = {}) {
     }
   }
   if (commands?.register) {
-    const stop = commands.register({ name: 'cairn', description: 'Manage centralized Cairn Hub state', input: { hint: 'status | tasks | inspect | doctor | checkout <id|--clear> [--preview] | undo <user|project [id]> <seq> [--preview] <reason>' }, async handler({ rawInput, agent }) {
+    const stop = commands.register({ name: 'cairn', description: 'Manage centralized Cairn Hub state', input: { hint: 'status | tasks [--all|--status <status>] | inspect | doctor | checkout <id|--clear> [--preview] | undo <user|project [id]> <seq> [--preview] <reason>' }, async handler({ rawInput, agent }) {
       const args = String(rawInput ?? 'status').trim().split(/\s+/u).filter(Boolean);
       const sessionId = agent?.session?.id;
       if (args[0] === 'undo' || args[0] === 'revert') {
@@ -305,7 +349,12 @@ export async function createHubDshHost(ctx, config = {}) {
         const fingerprint = state.selectedProjectId ? `ws_${crypto.createHash('sha256').update(state.selectedProjectId).digest('hex').slice(0, 8)}` : null;
         return { kind: 'success', text: JSON.stringify({ hub_initialized: isHubInitialized(hubRoot), workspace_fingerprint: fingerprint, cwd_hint_mode: state.cwdHint ? 'git_project_hint' : 'general', selected_project_fingerprint: fingerprint, binding_source: state.bindingSource, last_route: state.route, auto_compaction: state.taskId ? compactionCoordinator.getTaskStatus(state.taskId) : { status: 'idle' }, session_id_present: Boolean(sessionId) }, null, 2) };
       }
-      if (args[0] === 'tasks') return { kind: 'success', text: JSON.stringify(readHubTasksIndex(hubRoot).tasks.filter(task => task.status === 'active'), null, 2) };
+      if (args[0] === 'tasks') {
+        const showAll = args[1] === '--all' && args.length === 2;
+        const filter = args[1] === '--status' && args.length === 3 ? args[2] : args.length === 1 ? 'active' : null;
+        if (!showAll && !['active', 'done', 'archived'].includes(filter)) return { kind: 'error', text: 'Use tasks [--all|--status <active|done|archived>]' };
+        return { kind: 'success', text: JSON.stringify(taskList(filter), null, 2) };
+      }
       return { kind: 'success', text: JSON.stringify(readStatus(), null, 2) };
     } });
     if (typeof stop === 'function') disposers.push(stop);

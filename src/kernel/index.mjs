@@ -52,6 +52,7 @@ export {
   writeHubTaskCompaction,
   readSessionBinding,
   writeSessionBinding,
+  bindHubRoutedTask,
   clearSessionBinding,
   transitionHubTaskStatus,
   normalizeProjectId,

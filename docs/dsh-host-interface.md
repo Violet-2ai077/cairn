@@ -22,6 +22,12 @@ The example patch opts into Project auto-commit; existing configs remain stage-o
 
 To preview compensation, use `/cairn undo project <project-id> <commit-seq> --preview <reason>` (or `/cairn undo user <commit-seq> --preview <reason>`). Remove `--preview` to apply. The CLI equivalent is `cairn revert <commit-seq> --scope project --project <project-id> --reason "<reason>" [--preview]`. Both require an explicit scope and commit sequence; use `cairn log --scope project --project <project-id> --json` to find the sequence. Replay/sync and policy behavior are covered offline; these instructions do not claim a new live rc.5 smoke test.
 
+### M4.2 Slice B Hub operation
+
+- `autopilot.enabled` defaults to false. When enabled, `taskHeat.enabled` defaults to true with `hotMaxTasks: 24`, `idleDays: 14`, `dormantMaxCandidates: 5` and one shared `routeTimeoutMs: 2500` budget. The Hub routes only the current authored user input; it neither concatenates older user turns nor uses synthetic reminder text.
+- Cold entry supports exact references such as `continue task #42` or `继续任务 #42`. A frozen target needs explicit reopen. Dormant matches are bound in `agent/pre-step` so that the same turn can mount the selected Project Ledger and Task Checkout; general tasks mount only Task Checkout. Ambiguity, deadline, or router error does not start a dormant lookup. This slice does not switch already-bound sessions mid-conversation.
+- `/cairn tasks` displays lifecycle and derived pool under the running host policy; use `--all` to include frozen tasks. A standalone CLI does not read the dsh patch, so `cairn tasks --all --task-heat` applies the default heat policy to the view; mirror custom host settings with `--hot-max-tasks` and `--idle-days`. Without `--task-heat` all active rows are shown as hot. These views are read-only.
+
 | Dimension | Verified Fact |
 | --- | --- |
 | **Target `dsh` Baseline** | `@deepseek-ai/dsh` `0.2.2-rc.5` |

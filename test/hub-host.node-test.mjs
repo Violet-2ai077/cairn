@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHubDshHost } from '../src/hosts/dsh/hub-host.mjs';
-import { initHubStore, readProjectsIndex, upsertHubTask, appendHubTaskTurn, readHubTaskThread, writeSessionBinding, stageScopedOperators, commitScopedStaged, readScopedLedgerLog } from '../src/kernel/hub-store.mjs';
+import { initHubStore, readProjectsIndex, upsertHubTask, appendHubTaskTurn, readHubTaskThread, writeSessionBinding, stageScopedOperators, commitScopedStaged, readScopedLedgerLog, readSessionBinding, readHubTasksIndex, transitionHubTaskStatus } from '../src/kernel/hub-store.mjs';
 
 function mockCtx() {
   const contexts = [];
@@ -21,6 +21,69 @@ function mockCtx() {
     llm: { async *stream() { yield { type: 'text-delta', text: '' }; } }
   };
 }
+
+test('Hub budgets its catalog and routes only the current authored input; dormant checkout mounts in the wake turn', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-host-heat-'));
+  const ctx = mockCtx();
+  const calls = [];
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true, taskHeat: { hotMaxTasks: 1 } },
+    llmClient: { complete: async request => {
+      calls.push(request);
+      return { ok: true, content: calls.length === 1 ? '{"decision":"new","task_id":null}' : '{"decision":"match","task_id":2,"project_id":"p_old"}' };
+    } }
+  });
+  try {
+    upsertHubTask(hub, { id: 1, title: 'Hot only' });
+    appendHubTaskTurn(hub, { task_id: 1, content: 'Hot body' });
+    upsertHubTask(hub, { id: 2, project_id: 'p_old', title: 'Kafka ingest' });
+    appendHubTaskTurn(hub, { task_id: 2, project_id: 'p_old', content: 'Kafka checkout detail', timestamp: '2000-01-01T00:00:00Z' });
+    upsertHubTask(hub, { id: 3, title: 'Frozen' });
+    transitionHubTaskStatus(hub, { taskId: 3, action: 'close' });
+    const { proposal } = stageScopedOperators(hub, { scope: 'project', projectId: 'p_old', ops: [{ op: 'ASSERT', key: 'mode', option_code: 'safe', summary: 'Project policy sentinel' }] });
+    commitScopedStaged(hub, { scope: 'project', projectId: 'p_old', proposal_id: proposal.proposal_id });
+    const session = { id: 'wake' };
+    const catalog = ctx.contexts[0].text({ session });
+    assert.match(catalog, /Hot only/u);
+    assert.doesNotMatch(catalog, /Kafka ingest|Frozen|last_activity_at/u);
+    assert.equal(ctx.contexts[1].text({ session }), '');
+    const messages = [
+      { source: { kind: 'user' }, content: 'Historical input sentinel' },
+      { source: { kind: 'user' }, content: 'Resume Kafka\n<system-reminder>Generated sentinel</system-reminder>' },
+      { source: { kind: 'runtime-context' }, content: 'Synthetic sentinel' }
+    ];
+    await ctx.handlers.get('agent/pre-step')({ session, turn: 2, messages }, async () => ({ kind: 'enter' }));
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every(call => call.messages[0].content === 'Resume Kafka'));
+    const checkout = ctx.contexts[1].text({ session });
+    assert.match(checkout, /Kafka checkout detail/u);
+    assert.match(checkout, /Project policy sentinel/u);
+    assert.equal(readSessionBinding(hub, session.id).task_id, 2);
+    assert.notEqual(readHubTasksIndex(hub).tasks[1].last_activity_at, '2000-01-01T00:00:00Z');
+    const list = await ctx.registeredCommands[0].handler({ rawInput: 'tasks --all' });
+    assert.deepEqual(JSON.parse(list.text).map(task => [task.id, task.status, task.pool]), [[1, 'active', 'dormant'], [2, 'active', 'hot'], [3, 'done', 'excluded']]);
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('Hub rechecks lifecycle when a dormant task closes between the router and wake write', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-host-wake-race-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, {
+    storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: async () => {
+      transitionHubTaskStatus(hub, { taskId: 1, action: 'close' });
+      return { ok: true, content: '{"decision":"match","task_id":1,"project_id":"p_old"}' };
+    } }
+  });
+  try {
+    upsertHubTask(hub, { id: 1, project_id: 'p_old', title: 'Kafka' });
+    appendHubTaskTurn(hub, { task_id: 1, project_id: 'p_old', content: 'old task', timestamp: '2000-01-01T00:00:00Z' });
+    const session = { id: 'lost-race' };
+    await ctx.handlers.get('agent/pre-step')({ session, messages: [{ source: { kind: 'user' }, content: 'Resume Kafka' }] }, async () => ({ kind: 'enter' }));
+    assert.equal(readSessionBinding(hub, session.id), null);
+    assert.doesNotMatch(ctx.contexts[1].text({ session }), /Current Project Ledger|Task Checkout/u);
+    assert.equal(readHubTasksIndex(hub).tasks[0].last_activity_at, '2000-01-01T00:00:00Z');
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
 
 test('Hub host withholds cwd project ledger until pre-step locks the project and keeps task ledgers isolated', async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-hub-host-'));
@@ -149,8 +212,10 @@ test('Hub passes only authored user evidence to enabled Project auto-commit', as
     const scope = { scope: 'project', projectId: readProjectsIndex(hub).projects[0].project_id };
     assert.equal(readScopedLedgerLog(hub, scope).length, 0);
     assert.equal(readHubTaskThread(hub, 1)[0].content, '');
+    assert.equal(readHubTasksIndex(hub).tasks[0].last_activity_at, null);
     await finish(2, 'user');
     assert.equal(readScopedLedgerLog(hub, scope)[0].mode, 'auto');
+    assert.notEqual(readHubTasksIndex(hub).tasks[0].last_activity_at, null);
   } finally { await host.dispose(); fs.rmSync(temp, { recursive: true, force: true }); }
 });
 

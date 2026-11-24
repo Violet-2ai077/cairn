@@ -24,6 +24,7 @@ import { resolveStoreRoot } from '../src/workers/store-root.mjs';
 import { compileHubTaskCheckout } from '../src/workers/hub-task-checkout.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
 import { runHubStrictCompactor } from '../src/workers/hub-strict-compactor.mjs';
+import { listHubTaskPools, resolveTaskHeatPolicy } from '../src/kernel/task-heat.mjs';
 import {
   initHubStore, isHubInitialized, readHubTasksIndex, readProjectsIndex,
   readScopedHead, readScopedLedgerLog, readScopedStaged, commitScopedStaged, revertScopedCommit, syncScopedLedger,
@@ -43,6 +44,7 @@ function printUsage(writeOut) {
       '  cairn commit [proposal_id] [--rebase] [--actor <id>] [--step <step>] [--cwd <dir>] [--json]',
       '  cairn drop   [proposal_id] [--cwd <dir>] [--json]',
       '  cairn tasks  [--all | --status <active|done|archived>] [--cwd <dir>] [--json]',
+      '  cairn tasks  [--task-heat [--hot-max-tasks <n>] [--idle-days <n>]] [--store <path>]',
       '  cairn close <id> | archive <id> | reopen <id> [--cwd <dir>] [--json]',
       '  cairn doctor [--cwd <dir>] [--json]'
       ,'  cairn checkout <id|--clear> [--preview] [--cwd <dir>]'
@@ -83,6 +85,9 @@ export function runCairnCli(
         clear: { type: 'boolean', default: false },
         all: { type: 'boolean', default: false },
         status: { type: 'string' },
+        'task-heat': { type: 'boolean', default: false },
+        'hot-max-tasks': { type: 'string' },
+        'idle-days': { type: 'string' },
         help: { type: 'boolean', short: 'h', default: false }
       }
     });
@@ -382,8 +387,13 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
       const filter = values.all ? null : values.status ?? 'active';
       if (filter && !['active', 'done', 'archived'].includes(filter)) throw new Error(`Invalid task status: ${filter}`);
       const index = readHubTasksIndex(hubRoot);
-      const tasks = filter ? index.tasks.filter(task => task.status === filter) : index.tasks;
-      emit({ ...index, tasks, filter: filter ?? 'all' }); return 0;
+      const policy = resolveTaskHeatPolicy({ enabled: values['task-heat'], taskHeat: {
+        hotMaxTasks: Number(values['hot-max-tasks']), idleDays: Number(values['idle-days'])
+      } });
+      const tasks = listHubTaskPools(index.tasks, { policy }).filter(task => !filter || task.status === filter);
+      if (asJson) emit({ ...index, tasks, filter: filter ?? 'all' });
+      else stdout(tasks.map(task => `- [${task.status} / ${task.pool}] ${task.id}: ${task.title}`).join('\n') || 'No tasks in this lifecycle filter.');
+      return 0;
     }
     if (['close', 'archive', 'reopen'].includes(command)) {
       const id = Number(targetArg);
