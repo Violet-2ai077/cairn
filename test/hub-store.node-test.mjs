@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, test } from 'node:test';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   appendHubTaskTurn,
@@ -29,6 +29,7 @@ import { foldScopedLedger } from '../src/kernel/scoped-ledger.mjs';
 import { buildScopedAuthorityContract } from '../src/kernel/contracts.mjs';
 import * as hubStore from '../src/kernel/hub-store.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
+import { withHubWriteLock } from '../src/kernel/hub-write-lock.mjs';
 
 const temporaryRoots = [];
 
@@ -40,6 +41,82 @@ function tempRoot() {
 
 const projectScope = { scope: 'project', projectId: 'p_alpha' };
 const assertion = (key, option_code = 'a') => ({ op: 'ASSERT', key, option_code, summary: option_code });
+
+const lockImport = 'import { withHubWriteLock as lock } from ' + JSON.stringify(new URL('../src/kernel/hub-write-lock.mjs', import.meta.url).href) + ';';
+const lockChild = (hub, source) => spawnSync(process.execPath, ['--input-type=module', '-e', lockImport + source, hub],
+  { encoding: 'utf8', timeout: 5000, windowsHide: true });
+
+test('a new Hub writer can take over after an abrupt owner exit, including a legacy PID lock', () => {
+  for (const legacy of [false, true]) {
+    const hub = tempRoot();
+    const result = lockChild(hub, legacy
+      ? "import fs from 'node:fs'; fs.writeFileSync(process.argv[1] + '/.write.lock', String(process.pid), { flag: 'wx' }); process.exit(19)"
+      : 'lock(process.argv[1], () => process.exit(19))');
+    assert.equal(result.status, 19, result.stderr);
+    assert.ok(fs.existsSync(path.join(hub, '.write.lock')));
+    initHubStore(hub);
+    assert.ok(isHubInitialized(hub));
+    assert.equal(fs.existsSync(path.join(hub, '.write.lock')), false);
+  }
+});
+
+test('a live owner is not evicted, even after a contender times out; nested writes remain valid', () => {
+  const hub = tempRoot();
+  const blocked = "try { lock(process.argv[1], () => console.log('entered')) } catch (error) { console.log(error.message) }";
+  withHubWriteLock(hub, () => {
+    const other = lockChild(hub, blocked);
+    assert.equal(other.status, 0, other.stderr);
+    assert.equal(other.stdout.trim(), 'hub_write_lock_busy');
+    const legacy = lockChild(hub, "import fs from 'node:fs'; try { fs.closeSync(fs.openSync(process.argv[1]+'/.write.lock','wx')); console.log('entered') } catch(e) { console.log(e.code) }");
+    assert.equal(legacy.status, 0, legacy.stderr);
+    assert.match(legacy.stdout.trim(), /^(EEXIST|EISDIR|EACCES|EPERM)$/u);
+    withHubWriteLock(hub, () => initHubStore(hub));
+  });
+  assert.ok(isHubInitialized(hub));
+});
+
+test('legacy live and ambiguous owners are not reclaimed based on age', async () => {
+  const results = await Promise.allSettled([String(process.pid), '', 'not-a-pid'].map(async value => {
+    const hub = tempRoot(), file = path.join(hub, '.write.lock');
+    fs.writeFileSync(file, value);
+    fs.utimesSync(file, new Date(0), new Date(0));
+    const body = "try { lock(process.argv[1], () => console.log('entered')) } catch (error) { console.log(error.message) }";
+    const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', lockImport + body, hub],
+      { timeout: 5000, windowsHide: true });
+    assert.equal(stdout.trim(), 'hub_write_lock_busy');
+    assert.equal(fs.readFileSync(file, 'utf8'), value);
+    assert.deepEqual(fs.readdirSync(hub), ['.write.lock']);
+  }));
+  for (const r of results) if (r.status === 'rejected') throw r.reason;
+});
+
+test('simultaneous contenders recover a dead writer without overlapping their critical sections', async () => {
+  const hub = tempRoot();
+  assert.equal(lockChild(hub, 'lock(process.argv[1], () => process.exit(19))').status, 19);
+  const barrier = tempRoot(), go = path.join(barrier, 'go');
+  const ready = Array.from({ length: 5 }, (_, i) => path.join(barrier, String(i)));
+  const script = lockImport + [
+    "import fs from 'node:fs'; const root = process.argv[1], probe = root + '/exclusive-probe';",
+    'const wait = new Int32Array(new SharedArrayBuffer(4));',
+    "fs.writeFileSync(process.argv[2], '');",
+    'while (!fs.existsSync(process.argv[3])) Atomics.wait(wait, 0, 0, 5);',
+    'for (let i = 0; i < 4; i++) lock(root, () => {',
+    "  fs.closeSync(fs.openSync(probe, 'wx'));",
+    '  Atomics.wait(wait, 0, 0, 8);',
+    '  fs.unlinkSync(probe);',
+    '});'
+  ].join('\n');
+  const children = Promise.allSettled(ready.map(file =>
+    promisify(execFile)(process.execPath, ['--input-type=module', '-e', script, hub, file, go], { timeout: 8000, windowsHide: true })));
+  const deadline = Date.now() + 5000;
+  while (!ready.every(file => fs.existsSync(file)) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+  const synchronized = ready.every(file => fs.existsSync(file));
+  fs.writeFileSync(go, '');
+  const results = await children;
+  for (const r of results) assert.equal(r.status, 'fulfilled', r.reason?.message);
+  assert.ok(synchronized);
+  assert.deepEqual(fs.readdirSync(hub), []);
+});
 
 test('task heat derives capacity, idle and frozen pools, with a deterministic ID tie-break', async () => {
   const { resolveTaskHeatPolicy, selectHubTaskPools } = await import('../src/kernel/task-heat.mjs');
