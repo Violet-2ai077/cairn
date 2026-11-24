@@ -6,13 +6,19 @@ export const textOf = msg => typeof msg?.content === 'string' ? msg.content
 export function collectToolEvidence(entry, event) {
   const data = event.data ?? {};
   if (event.type === 'tool/call') entry.toolNames.set(data.callId, data.name ?? data.toolName);
-  if (event.type !== 'tool/result') return;
+  if (event.type !== 'tool/result' || (event.surfaceOp && event.surfaceOp !== 'append')) return;
+  if (Number.isSafeInteger(event.seq)) {
+    if (event.seq <= (entry.lastToolSeq ?? -1)) return;
+    entry.lastToolSeq = event.seq;
+  }
   const msg = data.message ?? data;
   const name = entry.toolNames.get(msg.toolCallId ?? data.callId) ?? msg.name ?? 'tool';
   const ok = !(msg.isError || data.error);
   const snippet = distillToolEvent({ name, ok, output: textOf(msg) }, { maxPerToolChars: 500 });
-  entry.tools.push({ name, ok, seq: event.seq, output: snippet.split('\n').slice(1).join('\n').trim() });
+  const evidence = { name, ok, seq: event.seq, output: snippet.split('\n').slice(1).join('\n').trim() };
+  entry.tools.push(evidence);
   if (entry.tools.length > 8) entry.tools.splice(Math.max(0, entry.tools.findIndex(tool => tool.ok)), 1);
+  return evidence;
 }
 
 export function resumeUserText(original, selection, authored) {

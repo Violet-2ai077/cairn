@@ -31,6 +31,7 @@ export {
 
 export { compileTaskCheckout } from './task-checkout.mjs';
 export { compileHubTaskCheckout } from './hub-task-checkout.mjs';
+export { compileHubHandoff } from './hub-handoff.mjs';
 export { buildHubColdRouterPrompt, runHubColdRouter } from './hub-cold-router.mjs';
 export { resolveStoreRoot } from './store-root.mjs';
 export { runHubDoctor } from './hub-doctor.mjs';

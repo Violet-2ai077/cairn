@@ -491,7 +491,7 @@ export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessi
       writeJsonAtomic(resolveHubPaths(hubRoot).tasksIndexFile, index);
     }
   }
-  return { appended: missing.length > 0, roles: missing };
+  return { appended: missing.length > 0, roles: missing, prior_seq: records.length, end_seq: records.length + missing.length };
 });
 
 export function readHubTaskThread(hubRoot, taskId) {
@@ -558,12 +558,12 @@ export const finishHubScopedTurn = locked((hubRoot, { sessionId, turn, scope, us
     }).task;
   }
   if (!task || task.project_id !== scope.projectId || task.status !== 'active') return { status: 'task_invalidated' };
-  const { appended } = appendHubTaskTurnPair(hubRoot, { taskId, projectId: scope.projectId, sessionId, turn, user, assistant, tools });
+  const pair = appendHubTaskTurnPair(hubRoot, { taskId, projectId: scope.projectId, sessionId, turn, user, assistant, tools });
   const binding = current?.binding_epoch === scope.bindingEpoch ? current : writeSessionBindingUnlocked(hubRoot, sessionId, {
     project_id: scope.projectId, task_id: taskId, source: scope.bindingSource,
     bindingEpoch: scope.bindingEpoch, explicitPin: scope.explicitPin
   });
-  return { status: 'archived', appended, taskId, binding };
+  return { status: 'archived', ...pair, taskId, binding };
 });
 
 function receiptDir(root, sessionId) {
@@ -605,9 +605,59 @@ export const recordTurnReceipt = locked((root, sessionId, turn, fields) => {
   if (prior && fields.status === 'in_progress') return prior;
   if (prior?.status === 'archived' && fields.status && fields.status !== 'archived') return prior;
   const receipt = { turn, ...prior, ...fields, extraction: { ...prior?.extraction, ...fields.extraction } };
+  if (receipt.status === 'archived') delete receipt.observation_task_id;
   writeJsonAtomic(path.join(receiptDir(root, sessionId), turn + '.json'), receipt);
+  if (receipt.status === 'archived' && prior?.observation_task_id) {
+    fs.rmSync(observationFile(root, prior.observation_task_id, sessionId, turn), { force: true });
+  }
   return receipt;
 });
+
+function observationFile(root, taskId, sessionId, turn) {
+  const key = createHash('sha256').update(JSON.stringify([sessionId, turn])).digest('hex');
+  return path.join(resolveHubPaths(root).taskDir(taskId), 'observations', key + '.json');
+}
+
+// Link first; publish the bounded excerpt atomically. Session receipts never carry tool output.
+export const checkpointToolResult = locked((root, { taskId, projectId, bindingEpoch, source, request, tool }) => {
+  const { host, session_id: id, turn, step, journal_seq: seq } = source;
+  if (typeof host !== 'string' || !host || !Number.isSafeInteger(turn) || turn < 0 || !Number.isSafeInteger(step) ||
+      step < 1 || !Number.isSafeInteger(seq) || seq < 0 || typeof tool.ok !== 'boolean') return false;
+  const binding = readSessionBinding(root, id);
+  if (!bindingEpoch || binding?.binding_epoch !== bindingEpoch || binding.task_id !== taskId || binding.project_id !== projectId) return false;
+  if (!readHubTasksIndex(root).tasks.some(t => t.id === taskId && t.project_id === projectId && t.status === 'active')) return false;
+  const receipt = readTurnReceipts(root, id, turn);
+  if (receipt?.status !== 'in_progress') return false;
+  if (receipt.observation_task_id != null && receipt.observation_task_id !== taskId) return false;
+  const file = observationFile(root, taskId, id, turn);
+  const previous = readJson(file, null, 'observation_unreadable');
+  if (previous && (previous.binding_epoch !== bindingEpoch || previous.source.journal_seq >= seq)) return false;
+  if (receipt.observation_task_id == null) recordTurnReceipt(root, id, turn, { observation_task_id: taskId });
+  writeJsonAtomic(file, {
+    task_id: taskId, binding_epoch: bindingEpoch, observed_at: new Date().toISOString(),
+    source: { host, session_id: id, turn, step, journal_seq: seq },
+    request_excerpt: String(request).slice(0, 320),
+    last_tool: { name: String(tool.name).slice(0, 128), ok: tool.ok, output: String(tool.output).slice(0, 500) }
+  });
+  return true;
+});
+
+export function readTaskObservations(root, taskId) {
+  const dir = path.join(resolveHubPaths(root).taskDir(taskId), 'observations');
+  if (!fs.existsSync(dir)) return [];
+  const rows = [];
+  for (const name of fs.readdirSync(dir).filter(n => /^[0-9a-f]{64}\.json$/u.test(n)).sort()) {
+    let observation;
+    try { observation = readJson(path.join(dir, name), null, 'observation_unreadable'); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (!observation || observation.task_id !== taskId) continue;
+    const receipt = readTurnReceipts(root, observation.source.session_id, observation.source.turn);
+    if (receipt?.observation_task_id !== taskId || receipt.status === 'archived') continue;
+    const { request_excerpt, last_tool, source, observed_at } = observation;
+    rows.push({ observed_at, request_excerpt, last_tool, source, turn_status: receipt.status, disposition: 'verify_before_retry' });
+  }
+  return rows.sort((a, b) => b.observed_at.localeCompare(a.observed_at));
+}
 
 export const turnSourceDigest = (user, assistant) => createHash('sha256').update(JSON.stringify([user, assistant])).digest('hex');
 

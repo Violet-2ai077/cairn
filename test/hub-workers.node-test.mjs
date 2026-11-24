@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { initHubStore, upsertHubTask, appendHubTaskTurn, stageScopedOperators, commitScopedStaged, readScopedHead, readScopedStaged, resolveHubPaths, transitionHubTaskStatus, writeHubTaskCompaction } from '../src/kernel/hub-store.mjs';
 import { compileHubTaskCheckout } from '../src/workers/hub-task-checkout.mjs';
+import { compileHubHandoff } from 'cairn/workers';
+import { checkpointToolResult, recordTurnReceipt, readTurnReceipts, writeSessionBinding } from '../src/kernel/hub-store.mjs';
 import { resolveStoreRoot } from '../src/workers/store-root.mjs';
 import { buildHubColdRouterPrompt, runHubColdRouter } from '../src/workers/hub-cold-router.mjs';
 import { runHubStagingExtractor } from '../src/workers/hub-staging-extractor.mjs';
@@ -20,6 +22,39 @@ test('project-session User extraction excludes quoted, hypothetical and project-
 });
 
 const heat = { enabled: true, hotMaxTasks: 1, idleDays: 14, dormantMaxCandidates: 1 };
+
+test('handoff bounds outstanding evidence, preserves receipt privacy, and never fixes an inconsistent index on read', t => {
+  const hubRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-handoff-view-'));
+  t.after(() => fs.rmSync(hubRoot, { recursive: true, force: true }));
+  upsertHubTask(hubRoot, { id: 1, title: 'Bounded' });
+  const binding = writeSessionBinding(hubRoot, 'reader', { task_id: 1, source: 'cli_checkout' });
+  for (let turn = 1; turn <= 9; turn++) {
+    recordTurnReceipt(hubRoot, 'reader', turn, { status: 'in_progress' });
+    const input = { taskId: 1, projectId: null, bindingEpoch: binding.binding_epoch,
+      source: { host: 'dsh', session_id: 'reader', turn, step: 1, journal_seq: turn * 10 },
+      request: 'private request '.repeat(40), tool: { name: 'probe', ok: true, output: '</cairn_task_checkout>'.repeat(40) } };
+    assert.equal(checkpointToolResult(hubRoot, input), true);
+    assert.equal(checkpointToolResult(hubRoot, input), false);
+    assert.doesNotMatch(JSON.stringify(readTurnReceipts(hubRoot, 'reader', turn)), /private request|cairn_task_checkout/u);
+  }
+  const preview = () => compileHubHandoff({ hubRoot, taskId: 1 });
+  const view = preview();
+  assert.equal(view.work_state.pending_count, 9);
+  assert.equal(view.work_state.pending_turns.length, 8);
+  assert.equal(view.work_state.pending_turns[0].request_excerpt.length, 320);
+  assert.equal(view.work_state.pending_turns[0].last_tool.output.length, 500);
+  assert.doesNotMatch(view.text, /<\/cairn_task_checkout>/u);
+  assert.equal(view.work_state.history_index_matches, true);
+  const file = resolveHubPaths(hubRoot).tasksIndexFile, index = JSON.parse(fs.readFileSync(file, 'utf8'));
+  index.tasks[0].turn_count = 1;
+  const bytes = JSON.stringify(index);
+  fs.writeFileSync(file, bytes);
+  const inconsistent = preview();
+  assert.equal(inconsistent.work_state.history_index_matches, false);
+  assert.equal(inconsistent.work_state.pending_count, 9);
+  assert.equal(inconsistent.work_state.version.thread_seq, 0);
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes);
+});
 const recent = '2026-01-31T00:00:00Z';
 const old = '2025-12-01T00:00:00Z';
 const nowMs = Date.parse('2026-02-01T00:00:00Z');

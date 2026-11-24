@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { buildAntiRecencyContract, buildHubTaskCatalog, buildScopedAuthorityContract, parseTaskMarker, projectReadOnlyLedger } from '../../kernel/index.mjs';
-import { finishHubScopedTurn, readHubTasksIndex, readProjectsIndex, readScopedHead, readSessionBinding, readSessionChoice, recordTurnReceipt, replaceSessionChoice, turnSourceDigest } from '../../kernel/hub-store.mjs';
+import { buildAntiRecencyContract, buildHubTaskCatalog, parseTaskMarker } from '../../kernel/index.mjs';
+import { checkpointToolResult, finishHubScopedTurn, readHubTasksIndex, readProjectsIndex, readSessionBinding, readSessionChoice, recordTurnReceipt, replaceSessionChoice, turnSourceDigest } from '../../kernel/hub-store.mjs';
 import { textOf, collectToolEvidence, resumeUserText } from './turn-journal.mjs';
 import { selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { mentionsCompetingTopic, runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
+import { readHandoffInputs, renderHandoffAuthority, renderHandoffObservations } from '../../workers/hub-handoff.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
 import { genericResume, pickTask, resumeIntent } from './task-picker.mjs';
 
@@ -53,24 +54,27 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     turns.set(id, entry);
     return entry;
   }
-  function makeSnapshot(state, target, ticket, hot, projects) {
-    const user = readScopedHead(hubRoot);
-    const project = target.projectId ? readScopedHead(hubRoot, { scope: 'project', projectId: target.projectId }) : null;
+  function makeSnapshot(state, target, ticket, hot, projects, task) {
+    const inputs = readHandoffInputs(hubRoot, task, target.projectId);
+    const v = inputs.version;
     const cached = state.snapshot?.bindingEpoch === target.bindingEpoch ? state.snapshot : null;
-    if (cached && cached.userRevision === user.revision && cached.projectRevision === (project?.revision ?? null)) return cached;
-    const checkout = cached ? cached.checkout : (target.taskId
+    const sameHistory = cached && cached.seenSeq === v.thread_seq;
+    if (sameHistory && cached.userRevision === v.user_revision && cached.projectRevision === v.project_revision && cached.observations === v.observations_sha256) return cached;
+    const checkout = sameHistory ? cached.checkout : (target.taskId
       ? compileHubTaskCheckout({ hubRoot, taskId: target.taskId, maxTailChars })
       : null);
     const chosen = target.taskId ?? ticket?.taskId;
     const catalog = cached?.catalog ?? buildHubTaskCatalog(hot.map(task => ({ ...task, project_name: projects.get(task.project_id) })));
     const text = [
       `### Cairn current scope\nEarlier Cairn Project Ledgers and Task Checkouts do not apply to this turn. Project: ${target.projectId ?? 'general'}.\nRequired tail marker for this request: <|task:${chosen}|>.`,
-      buildScopedAuthorityContract({ userLedgerSnapshot: projectReadOnlyLedger(user), projectLedgerSnapshot: project ? projectReadOnlyLedger(project) : null, projectName: projects.get(target.projectId), includeProject: Boolean(project) }),
+      renderHandoffAuthority(inputs, projects.get(target.projectId)),
       checkout?.ok ? `<cairn_task_checkout task_id="${target.taskId}" project_id="${target.projectId ?? 'general'}">\n${checkout.text}\n</cairn_task_checkout>` : '',
-      catalog
+      renderHandoffObservations(inputs), catalog
     ].filter(Boolean).join('\n\n');
     return Object.freeze({
-      bindingEpoch: target.bindingEpoch, userRevision: user.revision, projectRevision: project?.revision ?? null,
+      bindingEpoch: target.bindingEpoch, userRevision: v.user_revision, projectRevision: v.project_revision,
+      seenSeq: sameHistory ? cached.seenSeq : (checkout?.total_record_count ?? 0),
+      observations: v.observations_sha256,
       checkout: checkout ? Object.freeze(checkout) : null,
       catalog,
       text
@@ -148,14 +152,16 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     if (projectMention && explicit && projectMention !== projectId) return deny('project_mismatch');
     if (bound && bound.project_id !== projectId && !policy.crossProject) return deny('cross_project_disabled');
     const taskId = result.task_id ?? null;
-    if (taskId && !readHubTasksIndex(hubRoot).tasks.some(task => task.id === taskId && task.project_id === projectId && task.status === 'active')) return deny('task_invalidated');
+    const currentIndex = readHubTasksIndex(hubRoot);
+    const selected = taskId ? currentIndex.tasks.find(t => t.id === taskId && t.project_id === projectId && t.status === 'active') : null;
+    if (taskId && !selected) return deny('task_invalidated');
     const allocate = result.decision === 'new';
-    const nextId = recovery?.id ?? readHubTasksIndex(hubRoot).next_task_id;
+    const nextId = recovery?.id ?? currentIndex.next_task_id;
     if (allocate && (nextId < 1 || nextId > 999)) return deny('task_ids_exhausted');
     const ticket = allocate ? Object.freeze({ taskId: nextId, turnKey: entry.turnKey }) : null;
     const same = !allocate && taskId === bound?.id && projectId === bound.project_id;
     const target = { projectId, taskId, bindingEpoch: same ? expectedEpoch : randomUUID() };
-    const snapshot = makeSnapshot(state, target, ticket, hot, projects);
+    const snapshot = makeSnapshot(state, target, ticket, hot, projects, selected);
     return scoped({ result: result.decision, pool: result.pool ?? null, elapsed_ms: Date.now() - started }, {
       ...target, snapshot, newTaskTicket: ticket, explicitPin: same && state.explicitPin,
       humanChoice: Boolean(picked),
@@ -218,7 +224,13 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     if (!entry || (data.turn != null && data.turn !== entry.turn)) return;
     const msg = data.message ?? data;
     if (Number.isSafeInteger(event.seq)) entry.firstSeq ??= event.seq;
-    collectToolEvidence(entry, event);
+    const tool = collectToolEvidence(entry, event);
+    const pinned = entry.scope;
+    if (tool && event.surfaceOp === 'append' && pinned?.taskId && pinned.expectedEpoch === pinned.bindingEpoch && data.turn === entry.turn && Number.isSafeInteger(event.seq)) {
+      checkpointToolResult(hubRoot, { taskId: pinned.taskId, projectId: pinned.projectId, bindingEpoch: pinned.bindingEpoch,
+        source: { host: 'dsh', session_id: sessionId, turn: entry.turn, step: data.step ?? entry.step, journal_seq: event.seq },
+        request: userText(entry), tool });
+    }
     if (event.type === 'user/message' && msg.source?.kind === 'user' && event.surfaceOp === 'append') {
       const authored = stripReminders(textOf(msg));
       if (authored) entry.authored = [entry.authored, authored].filter(Boolean).join('\n\n');
@@ -268,7 +280,9 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     receipt('archived', 'confirmed_marker', { task_id: result.taskId, ...(result.appended ? { extraction: { [scope.projectId ? 'project' : 'user']: 'pending' } } : {}) });
     syncBinding(sessionId, result.binding);
     state.lastProcessedTurnKey = scope.turnKey;
-    state.snapshot = scope.snapshot;
+    // Native history contains our own answer. Advancing past an intervening peer append would lose its evidence.
+    state.snapshot = scope.snapshot.seenSeq === result.prior_seq
+      ? Object.freeze({ ...scope.snapshot, seenSeq: result.end_seq }) : scope.snapshot;
     state.presentedSnapshot = scope.snapshot;
     if (result.appended) onArchive({ sessionId, turn: entry.turn, scope, taskId: result.taskId, user, assistant: marker.answer });
   }

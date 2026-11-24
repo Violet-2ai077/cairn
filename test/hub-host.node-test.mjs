@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createHubDshHost } from '../src/hosts/dsh/hub-host.mjs';
 import { initHubStore, readProjectsIndex, upsertHubTask, appendHubTaskTurn, readHubTaskThread, writeSessionBinding, stageScopedOperators, commitScopedStaged, readScopedLedgerLog, readSessionBinding, readHubTasksIndex, transitionHubTaskStatus } from '../src/kernel/hub-store.mjs';
 
@@ -94,6 +95,110 @@ function scopedSession(ctx, id) {
     slash: rawInput => ctx.registeredCommands[0].handler({ rawInput, agent: { session } })
   };
 }
+
+test('an independent checkout distinguishes observed results from accepted turns before and after interruption', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-handoff-'));
+  const ctx = mockCtx(), s = scopedSession(ctx, 'writer');
+  let workerCalls = 0;
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: async () => { workerCalls++; return { ok: true, content: '{"ops":[]}' }; } } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, title: 'Export', project_id: 'p' });
+  upsertHubTask(hub, { id: 2, title: 'Other' });
+  for (const opts of [{}, { scope: 'project', projectId: 'p' }]) {
+    const { proposal } = stageScopedOperators(hub, { ...opts, ops: [{ op: 'ASSERT', key: 'runner', option_code: opts.scope ? 'project_rule' : 'user_rule', summary: 'Runner choice' }] });
+    assert.equal(commitScopedStaged(hub, { ...opts, proposal_id: proposal.proposal_id }).committed, true);
+  }
+  const cli = (id = 1, json = true) => execFileSync(process.execPath, [
+    fileURLToPath(new URL('../bin/cairn.mjs', import.meta.url)), 'checkout', String(id), '--store', hub, '--preview', ...(json ? ['--json'] : [])
+  ], { encoding: 'utf8' });
+  const view = () => JSON.parse(cli()).work_state;
+  const send = (type, seq, data) => ctx.handlers.get('session/event')(s.session, { type, seq, surfaceOp: 'append', data });
+  const result = (turn, seq, content) => send('tool/result', seq, { turn, step: 1, message: { toolCallId: 'c', content, isError: true } });
+  await s.slash('checkout 1');
+  await s.start(1, 'check the export');
+  send('tool/call', 10, { turn: 1, step: 1, callId: 'c', toolName: 'probe_csv' });
+  result(1, 12, 'HEADER_MISSING');
+  result(1, 11, 'older');
+  result(1, 12, 'conflicting replay');
+  const live = view();
+  assert.deepEqual(view(), live);
+  assert.equal(live.pending_turns.length, 1);
+  const pending = live.pending_turns[0];
+  assert.equal(pending.turn_status, 'in_progress');
+  assert.equal(pending.disposition, 'verify_before_retry');
+  assert.equal(pending.request_excerpt, 'check the export');
+  assert.deepEqual(pending.last_tool, { name: 'probe_csv', ok: false, output: 'HEADER_MISSING' });
+  assert.deepEqual(pending.source, { host: 'dsh', session_id: 'writer', turn: 1, step: 1, journal_seq: 12 });
+  assert.equal(live.authority.user.active[0].option_code, 'user_rule');
+  assert.equal(live.authority.project.active[0].option_code, 'project_rule');
+  assert.equal(live.last_filed_tool, null);
+  assert.doesNotMatch(cli(2), /HEADER_MISSING|project_rule/u);
+  s.end(1, 'incomplete', 'interrupted');
+  assert.equal(view().pending_turns[0].turn_status, 'interrupted');
+  assert.equal(view().task.status, 'active');
+  assert.equal(readHubTaskThread(hub, 1).length, 0);
+  assert.equal(workerCalls, 0);
+  assert.match(cli(1, false), /HEADER_MISSING/u);
+  await s.start(2, 'inspect only');
+  assert.match(s.view(), /HEADER_MISSING/u);
+  result(2, 17, 'verified separately');
+  s.end(2, 'checked\n<|task:1|>');
+  assert.deepEqual(view().pending_turns.map(row => row.source.turn), [1]);
+  assert.equal(view().last_filed_tool.journal_seq, 17);
+  assert.equal(view().last_filed_tool.output, 'verified separately');
+  assert.equal(readHubTaskThread(hub, 1).at(-1).meta.tools[0].output, 'verified separately');
+  await s.start(3, 'another check');
+  await s.slash('checkout 2');
+  result(3, 25, 'late result after rebind');
+  assert.doesNotMatch(cli(1) + cli(2), /late result after rebind/u);
+});
+
+test('peer writes during a frozen turn are visible at the next authored turn', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-peer-')), ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, title: 'Shared' });
+  const a = scopedSession(ctx, 'a'), b = scopedSession(ctx, 'b');
+  await a.slash('checkout 1'); await b.slash('checkout 1');
+  await a.start(1, 'look'); const frozen = a.view();
+  await b.start(1, 'peer request'); b.end(1, 'external sentinel\n<|task:1|>');
+  assert.equal(a.view(), frozen);
+  a.end(1, 'mine\n<|task:1|>');
+  await a.start(2, 'next');
+  assert.match(a.view(), /external sentinel/u);
+});
+
+test('provisional routing and replacement events cannot file evidence; a peer sees only an appended bound result', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-observation-scope-')), ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, title: 'Shared' });
+  const writer = scopedSession(ctx, 'writer'), peer = scopedSession(ctx, 'peer');
+  const observe = (turn, seq, content, surfaceOp = 'append') => ctx.handlers.get('session/event')(writer.session,
+    { type: 'tool/result', seq, surfaceOp, data: { turn, step: 1, message: { name: 'probe', content } } });
+  await writer.start(1, 'Continue task #1');
+  observe(1, 4, 'unbound result');
+  writer.end(1, 'unconfirmed', 'interrupted');
+  await peer.slash('checkout 1');
+  await peer.start(1, 'inspect');
+  const frozen = peer.view();
+  assert.doesNotMatch(frozen, /unbound result/u);
+  await writer.slash('checkout 1');
+  await writer.start(2, 'inspect');
+  observe(2, 7, 'bound result');
+  observe(2, 8, 'replacement text', { op: 'replace', startSeq: 7, endSeq: 7 });
+  assert.equal(peer.view(), frozen);
+  writer.end(2, 'wrong target\n<|task:2|>');
+  peer.end(1, 'read\n<|task:1|>');
+  await peer.start(2, 'inspect again');
+  assert.match(peer.view(), /"turn_status":"unassigned"/u);
+  assert.match(peer.view(), /"output":"bound result"/u);
+  assert.doesNotMatch(peer.view(), /unbound result|replacement text/u);
+  assert.equal(readHubTaskThread(hub, 1).length, 2);
+});
 
 test('native task picker pauses an unbound generic continue and mounts the human choice in the same request', async t => {
   const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-'));

@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { readHubTaskThread, readHubTasksIndex, readScopedHead } from '../src/kernel/hub-store.mjs';
+import { fileURLToPath } from 'node:url';
+import { readHubTaskThread, readHubTasksIndex, readScopedHead, readSessionBinding } from '../src/kernel/hub-store.mjs';
 
 const requested = process.argv[2] ?? process.env.DSH_BIN;
 if (!requested) throw new Error('Pass the installed dsh/lib/bin.js path, or set DSH_BIN.');
@@ -17,11 +18,11 @@ const trace = path.join(tmp, 'trace.jsonl');
 const env = Object.fromEntries(Object.entries(process.env).filter(([k]) =>
   /^(?:path|pathext|systemroot|windir|comspec|temp|tmp|home|userprofile|appdata|localappdata|programfiles.*|systemdrive|lang)$/iu.test(k)));
 const entries = () => fs.readFileSync(trace, 'utf8').trim().split('\n').map(s => JSON.parse(s));
-function run(phase, input, sessionId, workdir = cwd) {
+function run(phase, input, sessionId, workdir = cwd, expectedExit = 0) {
   const args = [bin, '--profile', 'headless', '--patch', patch, ...(sessionId ? ['--session-id', sessionId] : []), input];
   const res = spawnSync(process.execPath, args, { cwd: workdir, encoding: 'utf8', timeout: 60000, windowsHide: true,
     env: { ...env, DSH_HOME: path.join(tmp, 'dsh'), CAIRN_DSH_BIN: bin, CAIRN_SMOKE_PHASE: phase, CAIRN_SMOKE_TRACE: trace } });
-  assert.equal(res.status, 0, res.error?.message ?? (res.stderr + res.stdout));
+  assert.equal(res.status, expectedExit, res.error?.message ?? (res.stderr + res.stdout));
   return res.stdout;
 }
 try {
@@ -92,6 +93,32 @@ try {
   run('memory-other', 'New task: list available workflows.', null, other);
   assert.deepEqual(entries().filter(e => e.preference).map(e => e.preference),
     [{ user: 'zh', project: 'en' }, { user: 'zh', project: null }]);
+  const priorRecords = readHubTaskThread(hub, 1).length;
+  const binding = readSessionBinding(hub, id);
+  const input = 'Inspect the current CSV output.';
+  run('handoff-crash', input, id, cwd, 23);
+  const preview = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/cairn.mjs', import.meta.url)),
+    'checkout', '1', '--preview', '--json', '--store', hub], { encoding: 'utf8', windowsHide: true });
+  assert.equal(preview.status, 0, preview.stderr);
+  const { work_state: packet, total_record_count } = JSON.parse(preview.stdout);
+  const [pending] = packet.pending_turns;
+  assert.equal(packet.pending_count, 1);
+  assert.equal(pending.source.session_id, id);
+  assert.deepEqual(pending.source, entries().find(e => e.nativeResult)?.nativeResult);
+  assert.ok(Number.isSafeInteger(pending.source.journal_seq));
+  assert.equal(pending.turn_status, 'in_progress');
+  assert.equal(pending.request_excerpt, input);
+  assert.equal(pending.last_tool.name, 'probe_csv');
+  assert.equal(pending.last_tool.ok, false);
+  assert.match(pending.last_tool.output, /CSV_HEADER_EXPECTED/u);
+  assert.equal(pending.disposition, 'verify_before_retry');
+  assert.equal(packet.task.status, 'active');
+  assert.ok(packet.authority.project.active.some(d => d.option_code === 'pnpm'));
+  assert.ok(packet.authority.project.tombstones.some(d => d.option_code === 'npm'));
+  assert.equal(total_record_count, priorRecords);
+  assert.deepEqual(readSessionBinding(hub, id), binding);
+  assert.equal(entries().filter(e => e.phase === 'handoff-crash' && e.event === 'verify-tool').length, 1);
+  console.log('PASS: dsh exited after the tool result, before turn/end; an independent CLI checkout retained evidence, not a completion or retry.');
   console.log('PASS: memory review follows the answer, survives restart, and injects the project exception only in its own checkout.');
   console.log('PASS: real dsh tool failure, Project supersession, native compaction, restart and natural-language checkout (offline provider).');
   console.log('PASS: native userQuestions selection and restarted text fallback; no business request before selection, original verification runs after selection.');

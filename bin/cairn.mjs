@@ -21,7 +21,7 @@ import {
 } from '../src/kernel/index.mjs';
 import { compileTaskCheckout, runStrictCompactor, createOpenAICompatibleClient, runWorkspaceDoctor } from '../src/workers/index.mjs';
 import { resolveStoreRoot } from '../src/workers/store-root.mjs';
-import { compileHubTaskCheckout } from '../src/workers/hub-task-checkout.mjs';
+import { compileHubHandoff } from '../src/workers/hub-handoff.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
 import { runHubStrictCompactor } from '../src/workers/hub-strict-compactor.mjs';
 import { listHubTaskPools, resolveTaskHeatPolicy } from '../src/kernel/task-heat.mjs';
@@ -429,12 +429,12 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
       if (!Number.isSafeInteger(taskId) || taskId < 1) throw new Error('Use checkout <id|--clear> [--preview]');
       const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === taskId);
       if (!task) throw new Error(`Task not found: ${taskId}`);
-      const checkout = compileHubTaskCheckout({ hubRoot, taskId });
-      if (values.preview) { emit(checkout); return 0; }
+      const checkout = compileHubHandoff({ hubRoot, taskId });
+      if (values.preview) { emit(asJson ? checkout : checkout.text); return 0; }
       if (!sessionId) throw new Error('checkout binding requires --session <id>; use --preview for read-only output');
       if (task.status !== 'active') throw new Error(`task_not_active:${taskId}:${task.status}; run 'cairn reopen ${taskId}' first`);
       const binding = writeSessionBinding(hubRoot, sessionId, { project_id: task.project_id, task_id: taskId, source: 'cli_checkout' });
-      emit({ binding, checkout }); return 0;
+      emit(asJson ? { binding, checkout } : 'Checked out task ' + taskId + '.'); return 0;
     }
     if (command === 'compact') throw new Error('Hub compaction runner is not wired in this build.');
     throw new Error(`Unsupported Hub command: ${command}`);

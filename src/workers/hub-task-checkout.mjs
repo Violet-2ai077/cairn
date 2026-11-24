@@ -14,6 +14,8 @@ export function compileHubTaskCheckout({ hubRoot, taskId, maxTailChars = 6000 } 
   if (!task) return { ok: false, status: 'not_found', task_id: Number(taskId), text: '' };
   const compact = String(readHubTaskCompaction(hubRoot, task.id) ?? '').trim();
   const thread = readHubTaskThread(hubRoot, task.id);
+  const filed = thread.findLast(row => row.role === 'assistant' && row.meta?.tools?.length);
+  const tool = filed?.meta.tools.at(-1);
   const cursor = Math.max(0, Math.min(Number.isSafeInteger(task.compacted_record_count) ? task.compacted_record_count : 0, thread.length));
   const tail = maxTailChars > 0 ? distillTaskThread(thread.slice(cursor), { maxThreadChars: maxTailChars }) : { distilled_text: '', record_count: 0 };
   const parts = [`# Task Checkout ${task.id}`, AUTHORITY_BOUNDARY];
@@ -26,6 +28,11 @@ export function compileHubTaskCheckout({ hubRoot, taskId, maxTailChars = 6000 } 
     project_id: task.project_id,
     compacted_record_count: cursor,
     total_record_count: thread.length,
+    last_filed_tool: tool ? {
+      thread_seq: filed.seq, turn: filed.turn, session_id: filed.meta.dsh_session_id ?? null,
+      journal_seq: tool.seq ?? null, name: String(tool.name ?? 'tool').slice(0, 128),
+      ok: typeof tool.ok === 'boolean' ? tool.ok : null, output: String(tool.output ?? '').slice(0, 500)
+    } : null,
     text: parts.join('\n\n')
   };
 }

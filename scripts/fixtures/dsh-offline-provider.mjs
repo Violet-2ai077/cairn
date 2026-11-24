@@ -19,6 +19,11 @@ export function apply(ctx) {
     return { answers: [{ id: question.id, selected: [option.label] }] };
   }, { global: true });
   if (phase === 'picker-menu') ctx.on('agent/created', ({ agent }) => { log({ menuSession: agent.session.id }); }, { global: true });
+  if (phase === 'handoff-crash') ctx.on('session/event', (session, event) => {
+    if (event.type === 'tool/result' && event.surfaceOp === 'append') log({ nativeResult: {
+      host: 'dsh', session_id: session.id, turn: event.data.turn, step: event.data.step, journal_seq: event.seq
+    } });
+  }, { global: true });
   ctx.tools.register({ name: 'probe_csv', description: 'Run the smoke CSV test', parameters: { type: 'object', properties: {} },
     output: { schema: { type: 'string' }, render: (_, text) => [{ type: 'text', text }] },
     execute() {
@@ -81,7 +86,8 @@ export function apply(ctx) {
         const pickerAction = ['picker-native', 'picker-reply'].includes(phase) && task === 1 && checkout.includes('CSV_HEADER_EXPECTED') &&
           (phase === 'picker-native' ? req.messages.some(m => m.source?.kind === 'user' && body(m).includes('继续，把失败的测试修掉'))
             : snapshot.includes('<cairn_resume_request>') && snapshot.includes('继续，把失败的测试修掉'));
-        if ((phase === 'a' || pickerAction) && !calledTool) {
+        if (phase === 'handoff-crash' && calledTool) process.exit(23);
+        if ((phase === 'a' || phase === 'handoff-crash' || pickerAction) && !calledTool) {
           calledTool = true;
           yield { type: 'block-start', index: 0, blockType: 'tool-call' };
           yield { type: 'tool-call-delta', index: 0, id: 'smoke-csv', name: 'probe_csv', argumentsDelta: '{}' };

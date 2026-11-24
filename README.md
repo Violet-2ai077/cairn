@@ -48,6 +48,17 @@ cairn/
 
 ---
 
+## Inspecting a task
+
+To inspect a task without starting dsh or changing a session binding:
+
+```sh
+cairn checkout 1 --store /path/to/hub --preview
+cairn checkout 1 --store /path/to/hub --preview --json
+```
+
+Both show the applicable rules, filed history and any checkpointed tool results for turns that were not filed. A result from an interrupted turn is evidence to verify, not a completed task or an instruction to repeat the tool. See [the handoff format](docs/architecture.md#read-only-task-handoff-hub).
+
 ## Running Tests
 
 Cairn uses Node.js built-in test runner (`node:test` and `node:assert/strict`) with zero external runtime dependencies:
