@@ -25,7 +25,7 @@ export function resolveMidSessionPolicy(autopilot) {
   };
 }
 
-export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, maxTailChars, stripReminders, onArchive, ask }) {
+export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, maxTailChars, stripReminders, onArchive, ask, handleMemoryInput }) {
   const sessions = new Map();
   const turns = new Map();
   function stateFor(id) {
@@ -87,6 +87,8 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     });
     const deny = (reason, display = '未能确认本轮任务。请指定任务名称或任务号；没有执行操作。') =>
       scoped({ result: 'clarify', reason }, { display });
+    const memory = await handleMemoryInput?.(sessionId, entry.input, entry.turn, () => turns.get(sessionId) === entry && !payload.signal?.aborted);
+    if (memory) return deny('memory_command', memory);
     const started = Date.now();
     const index = readHubTasksIndex(hubRoot);
     const tasks = index.tasks;
@@ -234,7 +236,7 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     turns.delete(sessionId);
     const state = stateFor(sessionId);
     const scope = entry.scope;
-    const user = scope?.resumed ? resumeUserText(scope.resumed.input, entry.input, entry.authored) : entry.authored || entry.input;
+    const user = userText(entry);
     if (!user || state.lastProcessedTurnKey === entry.turnKey) return;
     const receipt = (status, reason, extra) => recordTurnReceipt(hubRoot, sessionId, entry.turn, {
       status, reason, first_seq: entry.firstSeq ?? null, end_seq: event.seq ?? null,
@@ -281,16 +283,36 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     return text + guidance + '\n\n<cairn_resume_request>\n以下是用户先前提出、现在已确认归属的原请求：\n' +
       JSON.stringify(scope.resumed.input).replaceAll('<', '\\u003c') + '\n</cairn_resume_request>';
   }
-  return { sessions, turns, syncBinding, preStep, event, context, blockedReply };
+  function userText(entry) {
+    return entry.scope?.resumed ? resumeUserText(entry.scope.resumed.input, entry.input, entry.authored) : entry.authored || entry.input;
+  }
+  return { sessions, turns, syncBinding, preStep, event, context, blockedReply, userText };
 }
 
-export const HUB_TURN_CONTRACT = buildAntiRecencyContract();
+export const HUB_TURN_CONTRACT = buildAntiRecencyContract() +
+  '\n用户的本轮表达偏好可用于当前回答，不因此改写长期默认。先完成业务请求；长期偏好的提案、范围确认与生效回执由宿主另行处理，勿声称已保存或代用户确认。';
 
-export async function* hideHubStreamMarker(stream, entry) {
+export async function* hideHubStreamMarker(stream, entry, { strip = true, footer = '' } = {}) {
   const step = entry.step;
   entry.streamMarkers.delete(step);
   const blocks = new Map();
+  const previousText = [];
+  let toolCall = false;
+  let held;
+  function* finishBlock(note) {
+    const { chunk, marker, fullMarker, sent, metadata } = held;
+    const text = marker.answer + note + (strip ? '' : '\n<|task:' + marker.task_number + '|>');
+    entry.streamMarkers.set(step, { ...fullMarker, display_text: [...previousText, text].join('\n').trim() });
+    if (text.length > sent) yield { type: 'text-delta', index: chunk.index, text: text.slice(sent) };
+    yield { ...chunk, block: { ...chunk.block, text } };
+    yield* metadata;
+    previousText.push(chunk.block.text);
+    held = null;
+  }
   for await (const chunk of stream) {
+    if (held && chunk.type === 'usage') { held.metadata.push(chunk); continue; }
+    if (held) yield* finishBlock(!toolCall && chunk.type === 'finish' && chunk.reason?.kind === 'stop' ? footer : '');
+    if (chunk.blockType === 'tool-call' || chunk.block?.type === 'tool-call') toolCall = true;
     if (chunk.type === 'text-delta') {
       const block = blocks.get(chunk.index) ?? { raw: '', sent: 0 };
       block.raw += chunk.text;
@@ -304,15 +326,24 @@ export async function* hideHubStreamMarker(stream, entry) {
       const block = blocks.get(chunk.index);
       const raw = chunk.block.text;
       const marker = parseTaskMarker(raw);
-      const text = marker.valid ? marker.display_text : raw;
+      const fullMarker = footer && marker.valid && previousText.length ? parseTaskMarker([...previousText, raw].join('\n')) : marker;
+      if (footer && fullMarker.valid && marker.task_number === (entry.scope.taskId ?? entry.scope.newTaskTicket?.taskId) &&
+          marker.answer.length >= (block?.sent ?? 0)) {
+        held = { chunk, marker, fullMarker, sent: block?.sent ?? 0, metadata: [] };
+        blocks.delete(chunk.index);
+        continue;
+      }
+      const text = marker.valid && strip ? marker.display_text : raw;
       if (marker.valid && marker.display_text.length >= (block?.sent ?? 0)) entry.streamMarkers.set(step, marker);
       else entry.streamMarkers.delete(step);
       const remainder = text.slice(block?.sent ?? 0);
       if (remainder) yield { type: 'text-delta', index: chunk.index, text: remainder };
       blocks.delete(chunk.index);
+      if (footer) previousText.push(raw);
       yield { ...chunk, block: { ...chunk.block, text } };
       continue;
     }
     yield chunk;
   }
+  if (held) yield* finishBlock('');
 }

@@ -14,6 +14,9 @@ import { runHubDoctor } from '../../workers/hub-doctor.mjs';
 import { runHubStagingExtractor } from '../../workers/hub-staging-extractor.mjs';
 import { createHubTaskCompactionCoordinator, exclusionWatchlist } from '../../workers/hub-strict-compactor.mjs';
 import { explicitUserDefaults } from '../../workers/hub-auto-commit.mjs';
+import { draftPreference, splitMemoryIntent } from '../../workers/memory-intent.mjs';
+import { openMemoryReview, prepareMemoryReview, readMemoryReview } from '../../kernel/memory-review.mjs';
+import { memoryCommand, memoryReply, memoryNotice } from './memory-dialog.mjs';
 import { appendCompactionDirective } from './compaction-directive.mjs';
 import { createHubWriteCoordinator } from '../../workers/hub-write-coordinator.mjs';
 import { readProjectsIndex, readTurnReceipts, recordTurnReceipt, recoverMarkerlessTurn, turnSourceDigest } from '../../kernel/hub-store.mjs';
@@ -77,6 +80,19 @@ export async function createHubDshHost(ctx, config = {}) {
   const clientFor = route => config.llmClient ?? createHubHostLlmClient(ctx, route);
   const midSession = resolveMidSessionPolicy(config.autopilot);
   const turnRuntime = midSession.enabled ? createHubTurnRuntime({
+    async handleMemoryInput(sessionId, text, turn, current) {
+      const args = memoryReply(text);
+      if (!args) return null;
+      await sessionJobs.get(sessionId);
+      if (!current()) return '已取消；未确认记忆。';
+      if (args[0] === null) {
+        const id = (turn - 1) + '.1';
+        const last = turn > 0 && readMemoryReview(hubRoot, sessionId, id);
+        if (!last || last.scopes.length !== 2 || readMemoryReview(hubRoot, sessionId, (turn - 1) + '.2')) return null;
+        args[0] = id;
+      }
+      return memoryCommand(hubRoot, sessionId, args).text;
+    },
     ask: request => ctx.get?.('userQuestions')?.ask(request),
     hubRoot, policy: midSession, taskHeat, clientFor, maxTailChars: config.maxTailChars ?? 6000,
     stripReminders: stripTrailingSystemReminders,
@@ -116,8 +132,23 @@ export async function createHubDshHost(ctx, config = {}) {
   }
   function queueArchived({ sessionId, taskId, projectId, project, turn, sourceStep, user, assistant, authoredUser, client }) {
     enqueueSessionJob(sessionId, async () => {
-      const scopes = [{ scope: projectId ? 'project' : 'user', projectId, user, assistant }];
-      const defaults = projectId && explicitUserDefaults(authoredUser);
+      const plan = midSession.enabled ? splitMemoryIntent(authoredUser, projectId) : null;
+      const scopes = plan?.filtered ? (plan.remaining ? [{ scope: projectId ? 'project' : 'user', projectId, user: plan.remaining, assistant: '' }] : [])
+        : [{ scope: projectId ? 'project' : 'user', projectId, user, assistant }];
+      if (plan?.filtered) recordTurnReceipt(hubRoot, sessionId, turn, {
+        memory_review_ids: plan.cards.map((_, i) => turn + '.' + (i + 1)),
+        ...(!scopes.length && { extraction: { [projectId ? 'project' : 'user']: plan.cards.length ? 'memory_review' : 'no_ops' } })
+      });
+      for (const [i, card] of (plan?.cards ?? []).entries()) {
+        const id = turn + '.' + (i + 1);
+        const row = openMemoryReview(hubRoot, sessionId, id, card, projectId);
+        if (row.status !== 'preparing') continue;
+        let op = null, failure = 'no_proposal';
+        try { op = await workerLlmCallContext.run({ sessionId }, () => draftPreference(client, card)); }
+        catch { failure = 'worker_failed'; }
+        prepareMemoryReview(hubRoot, sessionId, id, op, failure);
+      }
+      const defaults = !midSession.enabled && projectId && explicitUserDefaults(authoredUser);
       if (defaults) scopes.push({ scope: 'user', projectId: null, user: defaults, assistant: '' });
       for (const input of scopes) {
         let outcome;
@@ -125,7 +156,7 @@ export async function createHubDshHost(ctx, config = {}) {
           const result = await workerLlmCallContext.run({ sessionId }, () => runHubStagingExtractor({
             hubRoot, scope: input.scope, projectId: input.projectId, project,
             turnInput: { turn, user: input.user, assistant: input.assistant },
-            authoredUserText: authoredUser, autopilot: config.autopilot, source_step: sourceStep,
+            authoredUserText: plan?.filtered ? input.user : authoredUser, autopilot: config.autopilot, source_step: sourceStep,
             actor_id: config.actorId ?? 'dsh-host', llmClient: client
           }));
           outcome = result.ok ? result.autoCommit?.status ?? (result.staged ? 'staged' : 'no_ops')
@@ -289,8 +320,11 @@ export async function createHubDshHost(ctx, config = {}) {
         const blocked = !request?.purpose && turnRuntime?.blockedReply(request?.sessionId);
         if (blocked) return menuStream(blocked, config.stripMarkerInStream === false);
         const stream = next(request);
-        if (request?.purpose || config.stripMarkerInStream === false || !entry?.scope || entry.signal !== request.signal) return stream;
-        return hideHubStreamMarker(stream, entry);
+        if (request?.purpose || !entry?.scope || entry.signal !== request.signal) return stream;
+        const input = turnRuntime.userText(entry);
+        const footer = memoryNotice(splitMemoryIntent(input, entry.scope.projectId).cards, entry.turn);
+        const strip = config.stripMarkerInStream !== false;
+        return strip || footer ? hideHubStreamMarker(stream, entry, { strip, footer }) : stream;
       }, { prepend: true, global: true });
       if (typeof stopStream === 'function') disposers.push(stopStream);
     }
@@ -397,6 +431,10 @@ export async function createHubDshHost(ctx, config = {}) {
     const stop = commands.register({ name: 'cairn', description: 'Manage centralized Cairn Hub state', input: { hint: 'status | turns [turn] | recover <turn> <task-id> | tasks [--all|--status <status>] | inspect | doctor | checkout <id|--clear> [--preview] | undo <user|project [id]> <seq> [--preview] <reason>' }, async handler({ rawInput, agent }) {
       const args = String(rawInput ?? 'status').trim().split(/\s+/u).filter(Boolean);
       const sessionId = agent?.session?.id;
+      if (midSession.enabled && args[0] === 'memory') {
+        await sessionJobs.get(sessionId);
+        return memoryCommand(hubRoot, sessionId, args.slice(1));
+      }
       if (args[0] === 'undo' || args[0] === 'revert') {
         const scope = args[1];
         const offset = scope === 'project' ? 3 : 2;

@@ -343,12 +343,83 @@ test('indirect competing-topic evidence asks the router; ambiguity never binds, 
   assert.equal(readHubTasksIndex(hub).tasks.length, 2);
 });
 
+test('memory intake separates temporary, ambiguous and mixed scopes without extracting examples', async () => {
+  const { splitMemoryIntent } = await import('../src/workers/memory-intent.mjs');
+  const parse = text => splitMemoryIntent(text, 'alpha');
+  assert.deepEqual(parse('这次用英文。'), { cards: [], remaining: '', filtered: true });
+  assert.deepEqual(parse('以后默认用中文。').cards, [{ quote: '以后默认用中文', scopes: ['user', 'project'] }]);
+  assert.deepEqual(parse('所有项目默认中文，但这个项目用英文。').cards, [
+    { quote: '所有项目默认中文', scopes: ['user'] }, { quote: '这个项目用英文', scopes: ['project'] }
+  ]);
+  assert.equal(parse('所有项目默认中文，这次用英文。').cards.length, 1);
+  assert.deepEqual(parse('For all projects, reply in Chinese, but for this project, reply in English.').cards.map(c => c.scopes),
+    [['user'], ['project']]);
+  assert.deepEqual(parse('查一下所有项目的测试状态。修完以后跑测试。').cards, []);
+  assert.deepEqual(parse('这次，回复用英文。'), { cards: [], remaining: '', filtered: true });
+  for (const hypothetical of ['如果以后默认中文，会怎样？', '例如：“所有项目默认中文”。', '> 所有项目默认中文']) {
+    assert.deepEqual(parse(hypothetical).cards, []);
+  }
+});
+
+test('the preference worker cannot invent an option, write multiple facts, choose a scope or supersede a rule', async () => {
+  const { draftPreference } = await import('../src/workers/memory-intent.mjs');
+  const clause = { quote: '以后默认用中文' };
+  const draft = ops => draftPreference({ complete: async () => ({ ok: true, content: JSON.stringify({ ops }) }) }, clause);
+  const op = { op: 'ASSERT', key: 'reply_language', option_code: 'zh' };
+  for (const ops of [[{ ...op, option_code: 'en' }], [op, op], [{ ...op, id: 'D9' }],
+    [{ ...op, scope: 'user' }], [{ ...op, op: 'SUPERSEDE' }]]) assert.equal(await draft(ops), null);
+  assert.deepEqual(await draft([{ ...op, summary: 'untrusted paraphrase' }]), { ...op, summary: clause.quote });
+});
+
+test('an ambiguous preference never enters either ledger before its scoped human reply, including skip, failure and stale revision', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-memory-ask-'));
+  const ctx = mockCtx(), s = scopedSession(ctx, 'scope-question');
+  const { readScopedHead, readScopedStaged } = await import('../src/kernel/hub-store.mjs');
+  let fail = false;
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () =>
+    fail ? { ok: false } : { ok: true, content: '{"ops":[{"op":"ASSERT","key":"reply_language","option_code":"zh"}]}' } } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, project_id: 'alpha' });
+  upsertHubTask(hub, { id: 2, project_id: 'beta' });
+  await s.slash('checkout 1');
+  const project = { scope: 'project', projectId: 'alpha' };
+  const offer = async turn => {
+    await s.start(turn, '以后默认用中文。');
+    s.end(turn, 'current answer\n<|task:1|>');
+    await ctx.handlers.get('session/flush')(s.session);
+  };
+  await offer(1);
+  assert.match((await s.slash('memory 1.1')).text, /仅本项目 \/ 所有项目；待确认/u);
+  assert.equal(readScopedStaged(hub).proposals.length + readScopedStaged(hub, project).proposals.length, 0);
+  await s.slash('checkout 2');
+  assert.equal((await s.slash('memory 1.1 project')).kind, 'error');
+  assert.match((await s.slash('memory 1.1 skip')).text, /已跳过/u);
+  await s.slash('checkout 1');
+  await offer(2);
+  await s.start(3, '仅本项目');
+  const stream = ctx.handlers.get('llm/stream')({ sessionId: s.session.id }, () => assert.fail('do not ask again'));
+  const reply = (await Array.fromAsync(stream)).find(c => c.type === 'block-end').block.text;
+  assert.match(reply, /已生效/u);
+  s.end(3, reply);
+  assert.equal(readScopedHead(hub, project).active[0].option_code, 'zh');
+  assert.equal(readScopedHead(hub).revision, 0);
+  await offer(4);
+  stageScopedOperators(hub, { ops: [{ op:'ASSERT', key:'format', option_code:'plain', summary:'plain' }] });
+  commitScopedStaged(hub);
+  assert.match((await s.slash('memory 4.1 user')).text, /未覆盖/u);
+  assert.equal(readScopedHead(hub).revision, 1);
+  fail = true;
+  await offer(5);
+  assert.match((await s.slash('memory 5.1 user')).text, /提取失败，未保存/u);
+  assert.equal(readScopedHead(hub).revision, 1);
+});
+
 test('an explicit cross-project preference inside a project is separately staged, without promoting project text', async t => {
   const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-two-scopes-'));
   const ctx = mockCtx();
   const requests = [];
   const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async req => {
-    const user = req.system.includes('User-scope extraction boundary');
+    const user = req.system.startsWith('Prepare one non-authoritative preference');
     requests.push({ user, text: req.messages[0].content });
     return { ok: true, content: JSON.stringify({ ops: [{ op: 'ASSERT', key: user ? 'language' : 'test_runner', option_code: user ? 'zh' : 'pnpm', summary: 'rule' }] }) };
   } } });
@@ -364,6 +435,99 @@ test('an explicit cross-project preference inside a project is separately staged
   assert.equal(readScopedHead(hub).revision, 0);
   assert.doesNotMatch(requests.find(r => r.user).text, /pnpm/u);
   assert.deepEqual(readScopedStaged(hub, { scope: 'project', projectId: 'alpha' }).proposals.map(p => p.ops[0].key), ['test_runner']);
+});
+
+test('memory feedback follows the business answer; project exception and user default require distinct human receipts', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-memory-'));
+  const { readScopedHead } = await import('../src/kernel/hub-store.mjs');
+  const { readMemoryReview } = await import('../src/kernel/memory-review.mjs');
+  t.after(() => fs.rmSync(hub, { recursive: true, force: true }));
+  const requests = [];
+  const config = { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async req => {
+    requests.push(req.messages[0].content);
+    return { ok: true, content: JSON.stringify({ ops: [{ op: 'ASSERT', key: 'reply_language',
+      option_code: req.messages[0].content.includes('英文') ? 'en' : 'zh', summary: 'not authoritative' }] }) };
+  } } };
+  const ctx = mockCtx(), s = scopedSession(ctx, 'remember');
+  const host = await createHubDshHost(ctx, config);
+  const project = { scope: 'project', projectId: 'alpha' };
+  const answer = async (turn, input) => {
+    await s.start(turn, input);
+    const text = 'business completed\n<|task:1|>';
+    const stream = ctx.handlers.get('llm/stream')({ sessionId: s.session.id }, async function* () {
+      yield { type: 'block-start', index: 0, blockType: 'text' };
+      yield { type: 'text-delta', index: 0, text };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    });
+    const display = (await Array.fromAsync(stream)).find(c => c.type === 'block-end').block.text;
+    s.end(turn, display);
+    await ctx.handlers.get('session/flush')(s.session);
+    return display;
+  };
+  try {
+    upsertHubTask(hub, { id: 1, project_id: 'alpha' });
+    upsertHubTask(hub, { id: 2, project_id: 'beta' });
+    await s.slash('checkout 1');
+    assert.equal(await answer(1, '这次用英文。'), 'business completed');
+    assert.equal(requests.length, 0);
+    const notice = await answer(2, '所有项目默认中文，但这个项目用英文。');
+    assert.match(notice, /^business completed[\s\S]*2\.1「所有项目默认中文」：所有项目[\s\S]*2\.2「这个项目用英文」：仅本项目/u);
+    assert.deepEqual(requests.map(x => JSON.parse(x)), ['所有项目默认中文', '这个项目用英文']);
+    assert.equal(readHubTaskThread(hub, 1).at(-1).content, 'business completed');
+    assert.equal(readScopedHead(hub).revision, 0);
+    assert.equal(readScopedHead(hub, project).revision, 0);
+    await s.slash('commit user');
+    assert.equal(readScopedHead(hub).revision, 0, 'bulk commit must not bypass an item-specific review');
+    assert.equal((await s.slash('memory 2.1 project')).kind, 'error');
+  } finally { await host.dispose(); }
+  const fresh = mockCtx(), r = scopedSession(fresh, 'remember');
+  const restarted = await createHubDshHost(fresh, config);
+  try {
+    assert.match((await r.slash('memory')).text, /reply_language=zh/u);
+    assert.equal((await scopedSession(fresh, 'different').slash('memory 2.1 user')).kind, 'error');
+    await r.start(3, '记忆 2.1 所有项目');
+    const stream = fresh.handlers.get('llm/stream')({ sessionId: r.session.id }, () => assert.fail('no model for a memory reply'));
+    const display = (await Array.fromAsync(stream)).find(c => c.type === 'block-end').block.text;
+    assert.match(display, /已生效/u);
+    r.end(3, display);
+    assert.equal(readScopedHead(hub).active[0].summary, '所有项目默认中文');
+    assert.equal(readScopedHead(hub, project).revision, 0);
+    assert.match((await r.slash('memory 2.1 user')).text, /已生效/u);
+    assert.equal(readScopedHead(hub).revision, 1);
+    assert.match((await r.slash('memory 2.2 project')).text, /已生效/u);
+    assert.equal(readScopedHead(hub, project).active[0].option_code, 'en');
+    await r.slash('checkout 2');
+    await r.start(4, 'do work');
+    assert.match(r.view(), /所有项目默认中文/u);
+    assert.doesNotMatch(r.view(), /这个项目用英文/u);
+    r.end(4, 'done\n<|task:2|>');
+    assert.equal(readMemoryReview(hub, r.session.id, '2.2').status, 'committed');
+  } finally { await restarted.dispose(); }
+});
+
+test('the memory notice waits for a terminal stop, preserves usage and the archived multi-block answer with visible markers', async () => {
+  const { hideHubStreamMarker } = await import('../src/hosts/dsh/hub-turn-runtime.mjs');
+  for (const reason of ['stop', 'tool-calls', 'error']) {
+    const footer = '\n\nmemory notice';
+    const entry = { step: 1, streamMarkers: new Map(), scope: { taskId: 7 } };
+    async function* reply() {
+      for (const [index, text] of ['first', 'last\n<|task:7|>'].entries()) {
+        yield { type: 'block-start', index, blockType: 'text' };
+        yield { type: 'text-delta', index, text };
+        yield { type: 'block-end', index, block: { type: 'text', text } };
+      }
+      yield { type: 'usage', usage: { outputTokens: 5 } };
+      yield { type: 'finish', reason: { kind: reason } };
+    }
+    const chunks = await Array.fromAsync(hideHubStreamMarker(reply(), entry, { strip: false, footer }));
+    const visible = chunks.filter(c => c.type === 'block-end').map(c => c.block.text).join('\n');
+    assert.equal(visible.includes(footer), reason === 'stop');
+    assert.deepEqual(chunks.slice(-3).map(c => c.type), ['block-end', 'usage', 'finish']);
+    assert.ok(visible.endsWith('<|task:7|>'));
+    assert.equal(entry.streamMarkers.get(1).display_text, visible);
+    assert.equal(entry.streamMarkers.get(1).answer, 'first\nlast');
+  }
 });
 
 test('human recovery rereads only a verified completed markerless journal turn; no rebind or retroactive staging', async t => {

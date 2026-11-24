@@ -2,7 +2,7 @@ const adoption = /^(?:(?:确认|同意)[，,:：]\s*)?(?:就(?:用|采用|选)|(
 const tentative = /[?？]|(?:如果|假设|是否|试试|暂且|暂不|不(?:要|用|采用|选)|别用|撤回|再考虑)|\b(?:if|maybe|might|perhaps|not|never|instead of|try|temporarily|disregard|scratch that|consider)\b/iu;
 const label = /(?:方案\s*|\b(?:option|plan)\s+)([a-z0-9]+)(?![a-z0-9])/iu;
 
-function plainLines(text) {
+export function plainLines(text) {
   let fence = null;
   const lines = [];
   for (const line of String(text ?? '').split(/\r?\n/u)) {

@@ -62,6 +62,8 @@ With dsh installed, `node scripts/smoke-dsh.mjs /absolute/path/to/dsh/lib/bin.js
 
 With Hub Autopilot enabled as in the example patch, an unbound “继续” asks which task to resume instead of guessing. Pick a task in the dsh client, or reply “CSV 那个” to the text menu; Cairn then resumes the original request without asking you to repeat it. See [choosing which task to resume](docs/dsh-host-interface.md#choosing-which-task-to-resume).
 
+Long-term preferences are separate from task selection. “这次用英文” applies to this answer only. “以后默认用中文” in a project offers a scoped memory choice **after** the business answer. See [confirming a preference](docs/dsh-host-interface.md#confirming-a-preference) for the exact replies and how to check whether a rule actually took effect.
+
 ---
 
 ## Documentation

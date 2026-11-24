@@ -53,6 +53,8 @@ Project hints are found by read-only upward `.git` traversal. The deterministic 
 
 User- and project-scoped ledgers have independent revision/ID sequences and staged queues. A `general` session stages only to User scope and uses the strict cross-project preference extraction boundary. CLI checkout preview is read-only; persisting a binding requires `--session <id>`. Session bindings are never global anchors.
 
+The dsh Hub turn runtime stores preference reviews separately under `sessions/memory/<session-hash>/<turn>.<item>.json`. These local records contain the isolated user clause, allowed scopes, original project, base revisions, and outcome. They are not injected into other sessions. Known-scope drafts have a protected staging reference; a human reply can commit only the referenced item. An unresolved draft has no ledger entry. The existing write lock and source-specific commit log let a repeated confirmation finish the same write without duplicating it. Task routing choices, task history, and User/Project HEADs retain their separate roles.
+
 Every workspace managed by Cairn stores its state in a human-inspectable, plain-text `.cairn/` directory:
 
 ```text

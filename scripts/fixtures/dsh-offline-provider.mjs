@@ -56,6 +56,10 @@ export function apply(ctx) {
       } else if (req.purpose === 'cairn-worker' && system.startsWith('Route the opening')) {
         const projectId = /"project_id"\s*:\s*"([^"]+)"/u.exec(system)?.[1];
         text = JSON.stringify(phase === 'resume' ? { decision: 'match', task_id: 1, project_id: projectId } : { decision: 'new', task_id: null });
+      } else if (req.purpose === 'cairn-worker' && system.startsWith('Prepare one non-authoritative preference')) {
+        const quote = body(req.messages.at(-1));
+        log({ draft: JSON.parse(quote) });
+        text = JSON.stringify({ ops: [{ op: 'ASSERT', key: 'reply_language', option_code: quote.includes('英文') ? 'en' : 'zh' }] });
       } else if (req.purpose === 'cairn-worker') {
         const op = phase === 'a' ? { op: 'ASSERT', key: 'test_runner', option_code: 'npm', summary: 'Use npm' }
           : { op: 'SUPERSEDE', target_id: 'D1', option_code: 'pnpm', summary: 'Use pnpm', reason };
@@ -65,6 +69,11 @@ export function apply(ctx) {
       else {
         const task = Number(/Required tail marker for this request: <\|task:(\d+)\|>/u.exec(snapshot)?.[1]);
         const ledger = JSON.parse(/### Current Project Ledger[^\n]*\n(\{[\s\S]*?\n\})/u.exec(snapshot)?.[1] ?? '{}');
+        if (phase === 'memory-same' || phase === 'memory-other') {
+          const user = JSON.parse(/### User Ledger\n(\{[\s\S]*?\n\})/u.exec(snapshot)?.[1] ?? '{}');
+          const language = head => head.active?.find(d => d.key === 'reply_language')?.option_code ?? null;
+          log({ preference: { user: language(user), project: language(ledger) } });
+        }
         const checkout = /<cairn_task_checkout [^>]+>([\s\S]*?)<\/cairn_task_checkout>/u.exec(snapshot)?.[1] ?? '';
         log({ sessionId: req.sessionId, snapshot: { task, blocker: checkout.includes('CSV_HEADER_EXPECTED'),
           current: ledger.active?.some(d => d.option_code === 'pnpm') ?? false,

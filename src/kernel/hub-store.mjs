@@ -228,7 +228,7 @@ function stageScopedOperatorsUnlocked(hubRoot, { scope = 'user', projectId = nul
 }
 
 export const commitScopedStaged = locked(commitScopedStagedUnlocked);
-function commitScopedStagedUnlocked(hubRoot, { scope = 'user', projectId = null, proposal_id = null, actor_id = null, rebase = false, timestamp = null, mode = 'manual' } = {}) {
+function commitScopedStagedUnlocked(hubRoot, { scope = 'user', projectId = null, proposal_id = null, actor_id = null, rebase = false, timestamp = null, mode = 'manual', reviewKey = null } = {}) {
   const paths = resolveHubPaths(hubRoot).ledgerPaths({ scope, projectId });
   const options = { scope, projectId };
   const initialized = fs.existsSync(paths.ledgerFile) || fs.existsSync(paths.headFile) || fs.existsSync(paths.stagedFile);
@@ -240,7 +240,11 @@ function commitScopedStagedUnlocked(hubRoot, { scope = 'user', projectId = null,
   if (mode === 'auto' && (scope !== 'project' || !proposal_id || rebase)) {
     return { committed: false, reason: 'auto_commit_requires_project_proposal', conflict: false, commits: [], head };
   }
-  const selected = proposal_id === null ? staged.proposals : staged.proposals.filter(proposal => proposal.proposal_id === proposal_id);
+  const selected = staged.proposals.filter(p => (!p.admission?.review_key || (p.admission.review_key === reviewKey && p.proposal_id === proposal_id)) &&
+    (proposal_id === null || p.proposal_id === proposal_id));
+  if (!selected.length && staged.proposals.some(p => p.admission?.review_key && (!proposal_id || p.proposal_id === proposal_id))) {
+    return { committed: false, reason: 'memory_review_required', conflict: false, commits: [], head, remaining_proposals: staged.proposals.length };
+  }
   if (proposal_id !== null && selected.length === 0) return { committed: false, reason: 'proposal_not_found', conflict: false, commits: [], head, remaining_proposals: staged.proposals.length };
   if (selected.length === 0) return { committed: false, reason: 'nothing_to_commit', conflict: false, commits: [], head, remaining_proposals: 0 };
   const commits = [];
@@ -290,13 +294,13 @@ function commitScopedStagedUnlocked(hubRoot, { scope = 'user', projectId = null,
 }
 
 export const dropScopedStaged = locked(dropScopedStagedUnlocked);
-function dropScopedStagedUnlocked(hubRoot, { scope = 'user', projectId = null, proposal_id = null } = {}) {
+function dropScopedStagedUnlocked(hubRoot, { scope = 'user', projectId = null, proposal_id = null, reviewKey = null } = {}) {
   const paths = resolveHubPaths(hubRoot).ledgerPaths({ scope, projectId });
   if ([paths.headFile, paths.ledgerFile, paths.stagedFile].some(file => fs.existsSync(file))) requireSyncedLedger(hubRoot, { scope, projectId });
   const staged = readScopedStaged(hubRoot, { scope, projectId });
   const before = staged.proposals.length;
-  if (proposal_id === null) staged.proposals = [];
-  else staged.proposals = staged.proposals.filter(proposal => proposal.proposal_id !== proposal_id);
+  staged.proposals = staged.proposals.filter(p => (p.admission?.review_key && (p.admission.review_key !== reviewKey || proposal_id !== p.proposal_id)) ||
+    (proposal_id !== null && p.proposal_id !== proposal_id));
   if (before !== staged.proposals.length) writeJsonAtomic(paths.stagedFile, staged);
   return { dropped: before !== staged.proposals.length, dropped_count: before - staged.proposals.length, remaining_proposals: staged.proposals.length, next_proposal_seq: staged.next_proposal_seq };
 }

@@ -35,7 +35,7 @@ To preview compensation, use `/cairn undo project <project-id> <commit-seq> --pr
 - With Hub Autopilot mid-session switching enabled, natural return requests such as “回到昨天的 CSV 导出问题” and “Back to the CSV export issue” re-enter routing. A return with no matching task asks for clarification rather than creating one. Routine follow-ups still keep the current task; explicit IDs and cross-project restrictions are unchanged.
 - `/cairn turns` shows the last 20 turn receipts for **this dsh session**; `/cairn turns <turn>` reads a specific receipt, including after resume. An admitted turn without a terminal event remains `in_progress`. Terminal states include `archived`, `interrupted`, and `unassigned`; per-scope extraction distinguishes `pending`, `no_ops`, `staged`, commit outcomes, and failures. These local receipts hold journal references and metadata, not prompt/output bodies. Confirmed task history separately includes up to eight bounded tool-result excerpts, preferring failures.
 - In the original (or resumed) session, a human can issue `/cairn recover <turn> <task-id>` for a **completed, markerless** turn. It re-reads the native journal, verifies the authored input and final answer against the receipt digest, and appends historical records only to an active task in the same project scope. It does not rebind the session, run extraction, or change either ledger. Interrupted, ambiguous, and conflicting-marker turns cannot be claimed this way.
-- In a locked project, an explicit cross-project preference clause can also be submitted to the User extractor. That request contains only the matching authored clause(s), not project/assistant history. User proposals always require manual commit; questions, quoted examples, and ambiguous local scope are not a reason to auto-promote a project decision.
+- With mid-session switching enabled, recognized preferences use the item-specific review described below. The compatibility path can separately stage an explicitly cross-project clause in the User ledger. Neither path automatically commits User defaults.
 - Both task compactors now process contiguous bounded batches, including splits of oversized records. The old summary and cursor are left untouched until **all** batches succeed. To regenerate a summary produced by an older version, use `/cairn compact <id> --full` on an active task; there is no automatic rewrite of historical summaries.
 - Hub native dsh compaction adds the exclusion directive even when marker stripping or Autopilot is off. rc.5 closes over the original mutable auxiliary request options in its terminal waterfall callback: replace its messages array, not the frozen journal messages or the main model request.
 
@@ -50,6 +50,20 @@ With Hub Autopilot and mid-session switching enabled (as in the example patch), 
 - While the menu is outstanding, the local Hub holds the original text and candidate IDs under `sessions/choices/`, keyed by session. This lets the text path resume after process restart with the same dsh session ID. A choice does not grant new authority: the checkout restores the task context, and only the original request and later authored instructions are filed with the final answer, never the menu reply. Selection alone neither commits a ledger change nor binds a task; the completed answer must still pass the task-marker check.
 
 The headless smoke check also exercises the real dsh question service with a scripted answerer, then repeats the scenario without an answerer across a process restart. In both cases the provider must receive the original verification request and the selected task's failure evidence before it runs the test tool. This is not a manual Web/TUI rendering check.
+
+#### Confirming a preference
+
+In the example Hub configuration the business model handles the original request first. On a terminal answer with the expected task marker the host can append a separate memory notice. The notice is not archived as part of the business answer and is **not** a saved-rule receipt. Only a successfully archived turn can generate a review. No review blocks ordinary follow-ups.
+
+| Authored instruction | Long-term behavior |
+| --- | --- |
+| 这次用英文。 | No review or ledger proposal for this instruction. |
+| 以后默认用中文。 | In a locked project, offer project-only or all projects. If this is the sole item, the next reply may be just “仅本项目” or “所有项目”. In a general session there is no project option. |
+| 所有项目默认中文，但这个项目用英文。 | Offer two numbered items with fixed scopes. Approve either, both, or neither. |
+
+Send `查看记忆` (or `/cairn memory`) to see outstanding session items, including the authored clause and proposed key/value. For item `4.1`, send `记忆 4.1 所有项目`, `记忆 4.1 仅本项目` or `记忆 4.1 跳过`. The slash equivalents are `/cairn memory 4.1 user|project|skip`; omit the last argument to read that item's status, including a failed extraction. The ID belongs to the **original dsh session**, including after restart. Ordinary “确认” is not consent. An item targeting a project cannot be approved from a different project binding.
+
+Only the isolated authored clause goes to the out-of-band preference worker. It may propose one new ASSERT; it cannot select a scope, replace an existing preference, or commit. Reviews with an explicit scope use protected staging; unresolved reviews enter neither ledger until a person chooses. Bulk commit/drop and Project auto-commit do not act on reviews. A changed ledger revision or an existing active key will not be silently overwritten. A failure or skipped item leaves the business answer intact. Scope recognition is conservative, not a general natural-language classifier. The optional headless smoke uses a scripted provider and checks the actual User and Project snapshots supplied on subsequent checkouts.
 
 #### Original rc.5 turn-boundary measurements
 

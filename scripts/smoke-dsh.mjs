@@ -17,9 +17,9 @@ const trace = path.join(tmp, 'trace.jsonl');
 const env = Object.fromEntries(Object.entries(process.env).filter(([k]) =>
   /^(?:path|pathext|systemroot|windir|comspec|temp|tmp|home|userprofile|appdata|localappdata|programfiles.*|systemdrive|lang)$/iu.test(k)));
 const entries = () => fs.readFileSync(trace, 'utf8').trim().split('\n').map(s => JSON.parse(s));
-function run(phase, input, sessionId) {
+function run(phase, input, sessionId, workdir = cwd) {
   const args = [bin, '--profile', 'headless', '--patch', patch, ...(sessionId ? ['--session-id', sessionId] : []), input];
-  const res = spawnSync(process.execPath, args, { cwd, encoding: 'utf8', timeout: 60000, windowsHide: true,
+  const res = spawnSync(process.execPath, args, { cwd: workdir, encoding: 'utf8', timeout: 60000, windowsHide: true,
     env: { ...env, DSH_HOME: path.join(tmp, 'dsh'), CAIRN_DSH_BIN: bin, CAIRN_SMOKE_PHASE: phase, CAIRN_SMOKE_TRACE: trace } });
   assert.equal(res.status, 0, res.error?.message ?? (res.stderr + res.stdout));
   return res.stdout;
@@ -72,6 +72,27 @@ try {
   run('picker-reply', 'CSV 那个', entries().find(e => e.menuSession).menuSession);
   assert.ok(entries().some(e => e.phase === 'picker-reply' && e.event === 'verify-tool'));
   assert.equal(readHubTaskThread(hub, 1).at(-2).content, original);
+  const review = run('memory-offer', '所有项目默认中文，但这个项目用英文。', id);
+  assert.match(review, /长期记忆尚未生效/u);
+  const token = /(\d+)\.1「所有项目默认中文」/u.exec(review)?.[1];
+  assert.ok(token, review);
+  assert.deepEqual(entries().filter(e => e.phase === 'memory-offer' && e.draft).map(e => e.draft),
+    ['所有项目默认中文', '这个项目用英文']);
+  assert.equal(readScopedHead(hub).revision, 0);
+  assert.equal(readHubTaskThread(hub, 1).at(-1).content, 'Done');
+  assert.match(run('memory-user', '记忆 ' + token + '.1 所有项目', id), /已生效/u);
+  assert.match(run('memory-project', '记忆 ' + token + '.2 仅本项目', id), /已生效/u);
+  assert.equal(entries().some(e => ['memory-user', 'memory-project'].includes(e.phase) && e.snapshot), false);
+  assert.equal(readScopedHead(hub).active[0].option_code, 'zh');
+  assert.equal(readScopedHead(hub, { scope: 'project', projectId }).active.find(d => d.key === 'reply_language').option_code, 'en');
+  run('memory-same', 'Check the preference in this checkout.', id);
+  const other = path.join(tmp, 'second-repo');
+  fs.mkdirSync(other);
+  assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: other, windowsHide: true }).status, 0);
+  run('memory-other', 'New task: list available workflows.', null, other);
+  assert.deepEqual(entries().filter(e => e.preference).map(e => e.preference),
+    [{ user: 'zh', project: 'en' }, { user: 'zh', project: null }]);
+  console.log('PASS: memory review follows the answer, survives restart, and injects the project exception only in its own checkout.');
   console.log('PASS: real dsh tool failure, Project supersession, native compaction, restart and natural-language checkout (offline provider).');
   console.log('PASS: native userQuestions selection and restarted text fallback; no business request before selection, original verification runs after selection.');
 } finally {
