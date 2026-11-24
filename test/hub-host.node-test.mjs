@@ -95,6 +95,142 @@ function scopedSession(ctx, id) {
   };
 }
 
+test('native compaction gets the scoped boundary without mutating history, even with stream stripping off', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-native-boundary-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, stripMarkerInStream: false });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  for (const projectId of ['alpha', 'beta']) {
+    upsertHubTask(hub, { id: projectId === 'alpha' ? 1 : 2, project_id: projectId });
+    const opts = { scope: 'project', projectId };
+    stageScopedOperators(hub, { ...opts, ops: [{ op: 'ASSERT', key: projectId + '_rule', option_code: 'yes', summary: 'rule' }] });
+    commitScopedStaged(hub, opts);
+  }
+  await scopedSession(ctx, 'native').slash('checkout 1');
+  const history = Object.freeze({ role: 'assistant', content: 'previous text' });
+  const tail = Object.freeze({ role: 'user', content: Object.freeze([{ type: 'text', text: 'summarize' }, { type: 'image' }]) });
+  const req = Object.freeze({ purpose: 'compaction', sessionId: 'native', messages: Object.freeze([history, tail]) });
+  const patched = await ctx.handlers.get('llm/stream')(req, r => r);
+  assert.equal(patched.messages[0], history);
+  assert.equal(tail.content.length, 2);
+  assert.match(JSON.stringify(patched.messages[1]), /alpha_rule/u);
+  assert.doesNotMatch(JSON.stringify(patched.messages[1]), /beta_rule/u);
+  assert.match(JSON.stringify(patched.messages[1]), /task.local|任务局部/u);
+  const native = { ...req };
+  ctx.handlers.get('llm/stream')(native, () => native);
+  assert.match(JSON.stringify(native.messages[1]), /alpha_rule/u);
+});
+
+test('natural return routes before answering; unassigned, interrupted and failed extraction outcomes survive restart', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-resume-'));
+  t.after(() => fs.rmSync(hub, { recursive: true, force: true }));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: async req => ({ ok: true, content: req.system.startsWith('Route the opening')
+      ? '{"decision":"match","task_id":2,"project_id":null}' : 'bad-json' }) } });
+  try {
+    upsertHubTask(hub, { id: 1, title: 'Login' });
+    upsertHubTask(hub, { id: 2, title: 'CSV export' });
+    const a = scopedSession(ctx, 'return');
+    await a.slash('checkout 1');
+    await a.start(1, 'Back to the CSV export issue from yesterday');
+    assert.match(a.view(), /Required tail marker.*task:2/u);
+    a.end(1, 'no marker');
+    assert.equal(readSessionBinding(hub, 'return').task_id, 1);
+    await a.start(2, '回到昨天的 CSV 导出问题');
+    a.end(2, 'partial', 'interrupted');
+    await a.start(3, '回到昨天的 CSV 导出问题');
+    a.emit('tool/result', { turn: 3, message: { toolCallId: 'test', isError: true, content: 'FAIL csv-header' } });
+    a.end(3, 'done\n<|task:2|>');
+    await ctx.handlers.get('session/flush')(a.session);
+    assert.equal(readHubTaskThread(hub, 2).length, 2);
+    assert.match((await a.slash('checkout 2 --preview')).text, /FAIL csv-header/u);
+  } finally { await host.dispose(); }
+  const fresh = mockCtx();
+  const restarted = await createHubDshHost(fresh, { storeRoot: hub, autopilot: { enabled: true } });
+  try {
+    const a = scopedSession(fresh, 'return');
+    const report = async n => JSON.parse((await a.slash('turns ' + n)).text);
+    assert.equal((await report(1)).reason, 'marker_missing');
+    assert.equal((await report(2)).status, 'interrupted');
+    assert.equal((await report(3)).extraction.user, 'strict_json_parse_failed');
+    assert.doesNotMatch(JSON.stringify(await report(3)), /csv-header|bad-json/u);
+  } finally { await restarted.dispose(); }
+});
+
+test('indirect competing-topic evidence asks the router; ambiguity never binds, creates or reuses the previous checkout', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-topic-'));
+  const ctx = mockCtx();
+  let calls = 0;
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () => {
+    calls++; return { ok: true, content: '{"decision":"new","task_id":null}' };
+  } } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, title: 'Login tokens' });
+  upsertHubTask(hub, { id: 2, title: 'CSV export' });
+  writeSessionBinding(hub, 'indirect', { task_id: 1, source: 'cold_router_match' });
+  const a = scopedSession(ctx, 'indirect');
+  await a.start(1, 'Where did we leave the CSV export work?');
+  assert.equal(calls, 1);
+  assert.match(a.view(), /UNRESOLVED/u);
+  a.end(1, 'I guessed\n<|task:1|>');
+  assert.equal(readHubTaskThread(hub, 1).length, 0);
+  assert.equal(readHubTasksIndex(hub).tasks.length, 2);
+});
+
+test('an explicit cross-project preference inside a project is separately staged, without promoting project text', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-two-scopes-'));
+  const ctx = mockCtx();
+  const requests = [];
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async req => {
+    const user = req.system.includes('User-scope extraction boundary');
+    requests.push({ user, text: req.messages[0].content });
+    return { ok: true, content: JSON.stringify({ ops: [{ op: 'ASSERT', key: user ? 'language' : 'test_runner', option_code: user ? 'zh' : 'pnpm', summary: 'rule' }] }) };
+  } } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, project_id: 'alpha' });
+  const a = scopedSession(ctx, 'scopes');
+  await a.slash('checkout 1');
+  await a.start(1, '以后所有项目都用中文汇报；这个仓库的测试用 pnpm。');
+  a.end(1, '好的\n<|task:1|>');
+  await ctx.handlers.get('session/flush')(a.session);
+  const { readScopedStaged, readScopedHead } = await import('../src/kernel/hub-store.mjs');
+  assert.deepEqual(readScopedStaged(hub).proposals.map(p => p.ops[0].key), ['language']);
+  assert.equal(readScopedHead(hub).revision, 0);
+  assert.doesNotMatch(requests.find(r => r.user).text, /pnpm/u);
+  assert.deepEqual(readScopedStaged(hub, { scope: 'project', projectId: 'alpha' }).proposals.map(p => p.ops[0].key), ['test_runner']);
+});
+
+test('human recovery rereads only a verified completed markerless journal turn; no rebind or retroactive staging', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-claim-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: () => assert.fail('manual attribution must not call a model') } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  const a = scopedSession(ctx, 'lost-turn');
+  for (const [id, project_id] of [[1,'a'], [2,'a'], [3,'b']]) upsertHubTask(hub, { id, project_id });
+  await a.slash('checkout 1');
+  await a.start(1, 'the original input');
+  const events = [
+    { type: 'user/message', data: { source: { kind: 'user' }, content: 'the original input' } },
+    { type: 'user/message', data: { source: { kind: 'runtime-context' }, content: 'synthetic secret' } },
+    { type: 'assistant/message', data: { turn: 1, step: 1, message: { content: 'terminal answer' } } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } }
+  ].map((event, seq) => ({ seq, surfaceOp: 'append', ...event }));
+  a.session.eventAt = n => events[n];
+  for (const event of events) ctx.handlers.get('session/event')(a.session, event);
+  assert.equal((await a.slash('recover 1 3')).kind, 'error');
+  events[0].data.content = 'wrong journal';
+  assert.equal((await a.slash('recover 1 2')).kind, 'error');
+  events[0].data.content = 'the original input';
+  assert.equal((await a.slash('recover 1 2')).kind, 'success');
+  assert.equal((await a.slash('recover 1 2')).kind, 'success');
+  assert.equal((await a.slash('recover 1 1')).kind, 'error');
+  assert.deepEqual(readHubTaskThread(hub, 2).map(r => r.content), ['the original input', 'terminal answer']);
+  assert.equal(readSessionBinding(hub, 'lost-turn').task_id, 1);
+  assert.equal(JSON.parse((await a.slash('turns 1')).text).reason, 'manual_recovery');
+});
+
 test('Slice C dormant cross-project switch is opt-in, binds after confirmation, and old workers keep their scoped ledger', async () => {
   for (const crossProject of [false, true]) {
     const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-scope-cross-'));
@@ -241,7 +377,8 @@ test('Slice C honors both off switches even with crossProject enabled', async ()
       await a.start(1, 'Continue task #2');
       assert.doesNotMatch(a.view(), /project_id="p_b"/u);
       assert.equal(readSessionBinding(hub, 'disabled').task_id, 1);
-      assert.equal(ctx.handlers.has('llm/stream'), false);
+      const request = { sessionId: 'disabled', messages: [] };
+      assert.equal(ctx.handlers.get('llm/stream')(request, r => r), request, 'no answer-stream interception when switching is off');
     } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
   }
 });

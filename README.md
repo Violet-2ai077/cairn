@@ -37,13 +37,13 @@ cairn/
 │   │   ├── marker.mjs                #   parseTaskMarker (closed-fence fix), stripTaskMarker, buildLightTaskCatalog
 │   │   ├── contracts.mjs             #   4 parameterized prompt contract builders
 │   │   └── index.mjs                 #   Unified kernel exports
-│   ├── workers/                      # Out-of-band async LLM workers placeholder
+│   ├── workers/                      # Routing, staged extraction, compaction and checkout
 │   │   └── index.mjs
 │   └── hosts/
-│       └── dsh/                      # Reference Host #1 (dsh 0.2.2-rc.1) adapter placeholder
+│       └── dsh/                      # Reference Host #1 (dsh 0.2.2-rc.5): Hub and workspace adapters
 │           └── index.mjs
 └── test/
-    └── kernel.node-test.mjs          # Complete unit test suite for all kernel primitives
+    └── *.node-test.mjs               # Kernel, stores, workers, CLI, and dsh integration
 ```
 
 ---
@@ -57,6 +57,8 @@ npm test
 # or directly:
 node --test test/kernel.node-test.mjs
 ```
+
+With dsh installed, `node scripts/smoke-dsh.mjs /absolute/path/to/dsh/lib/bin.js` additionally verifies the real headless host across native compaction and process restart, with a local deterministic provider. See [dsh continuity and recovery](docs/dsh-host-interface.md#continuity-fixes-and-recovery) for turn diagnostics, markerless recovery, and rebuilding old summaries.
 
 ---
 

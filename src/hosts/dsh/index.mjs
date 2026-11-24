@@ -8,6 +8,7 @@
 // - ctx.tools.register & optional ctx.commands.register('/cairn'): human-authority-gated state management
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { appendCompactionDirective } from './compaction-directive.mjs';
 import {
   isCairnInitialized,
   initCairnStore,
@@ -200,47 +201,7 @@ export function injectStrictBoundaryIntoCompactionMessages(messages, workspaceRo
   const watchlist = buildGlobalExclusionWatchlistSection(head);
   const boundaryDirective = watchlist ? `${strictPrompt}\n\n${watchlist}` : strictPrompt;
 
-  const nextMessages = [...messages];
-  let targetIdx = -1;
-  for (let i = nextMessages.length - 1; i >= 0; i--) {
-    if (nextMessages[i]?.role === 'user') {
-      targetIdx = i;
-      break;
-    }
-  }
-  if (targetIdx === -1) {
-    targetIdx = nextMessages.length - 1;
-  }
-
-  const targetMsg = nextMessages[targetIdx];
-  let nextContent;
-
-  if (typeof targetMsg.content === 'string') {
-    nextContent = `${targetMsg.content}\n\n${boundaryDirective}`;
-  } else if (Array.isArray(targetMsg.content)) {
-    nextContent = targetMsg.content.map((block, idx) => {
-      if (idx === targetMsg.content.length - 1 && block?.type === 'text') {
-        return Object.freeze({
-          ...block,
-          text: `${block.text}\n\n${boundaryDirective}`
-        });
-      }
-      return block;
-    });
-    if (!nextContent.some(b => b?.type === 'text')) {
-      nextContent.push(Object.freeze({ type: 'text', text: boundaryDirective }));
-    }
-    Object.freeze(nextContent);
-  } else {
-    nextContent = Object.freeze([{ type: 'text', text: boundaryDirective }]);
-  }
-
-  nextMessages[targetIdx] = Object.freeze({
-    ...targetMsg,
-    content: nextContent
-  });
-
-  return Object.freeze(nextMessages);
+  return appendCompactionDirective(messages, boundaryDirective);
 }
 
 function executeCairnCliCommand(workspaceRoot, args) {

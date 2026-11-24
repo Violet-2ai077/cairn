@@ -193,7 +193,8 @@ export function distillTaskThread(
     const role = String(rec.role ?? 'assistant').toLowerCase();
     const seqTag = rec.seq !== undefined ? `#${rec.seq}` : '';
     const turnTag = rec.turn !== undefined ? `turn=${rec.turn}` : '';
-    const header = `[${[seqTag, turnTag, role].filter(Boolean).join(' ')}]`;
+    const recovered = rec.meta?.attribution === 'manual_recovery' ? 'recovered historical turn' : '';
+    const header = `[${[seqTag, turnTag, role, recovered].filter(Boolean).join(' ')}]`;
 
     let body = '';
     if (role === 'assistant') {

@@ -18,6 +18,14 @@ function plainLines(text) {
   return lines;
 }
 
+// In a locked project, only send explicitly cross-project user clauses to the User extractor.
+export function explicitUserDefaults(text) {
+  const cue = /(?:所有|全部|各个|每个|任何|跨)的?(?:项目|仓库)|\b(?:across (?:all (?:my )?|my )?|(?:in|for) (?:all (?:my )?|every |each |any ))(?:projects?|repos?|repositor(?:y|ies))\b/iu;
+  const localOrHypothetical = /这个?(?:项目|仓库)|本(?:项目|仓库)|如果|假设|是否|[?？]|\b(?:this (?:repo(?:sitory)?|project)|if|maybe|suppose)\b/iu;
+  return plainLines(text).flatMap(line => line.split(/[;；。]|(?<=[.!?])\s+/u))
+    .map(clause => clause.trim()).filter(clause => cue.test(clause) && !localOrHypothetical.test(clause)).join('\n');
+}
+
 const canonical = text => String(text ?? '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 const namesOption = (text, code) => {
   const normalized = canonical(code);

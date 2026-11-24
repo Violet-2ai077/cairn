@@ -41,6 +41,22 @@ async function withTempWorkspace(fn) {
 }
 
 describe('Cairn Milestone 1 Slice 2: Asynchronous Workers Layer (src/workers/)', () => {
+  test('workspace incremental compaction never jumps a requested fromSeq across uncovered records', async () => {
+    await withTempWorkspace(async workspaceRoot => {
+      initCairnStore(workspaceRoot);
+      for (const content of ['covered', 'IMPORTANT_BLOCKER', 'latest']) appendTaskTurn(workspaceRoot, { task_id: 1, role: 'user', content });
+      writeTaskCompaction(workspaceRoot, 1, 'old summary', { compactedRecordCount: 1 });
+      const requests = [];
+      const result = await runStrictCompactor({ workspaceRoot, taskId: 1, fromSeq: 2,
+        distillOptions: { maxThreadChars: 40 }, llmClient: { complete: async ({ messages }) => {
+          requests.push(messages[0].content);
+          return { ok: true, content: messages[0].content.includes('IMPORTANT_BLOCKER') ? 'IMPORTANT_BLOCKER' : 'routine' };
+        } } });
+      assert.equal(requests.length, 2);
+      assert.equal(result.compacted_record_count, 3);
+      assert.match(readTaskCompaction(workspaceRoot, 1), /IMPORTANT_BLOCKER/u);
+    });
+  });
   test('6. task checkout compiles compact plus uncaptured tail, retains newest text, clamps stale cursors, and stays read-only', async () => {
     await withTempWorkspace(async tmpDir => {
       initCairnStore(tmpDir);

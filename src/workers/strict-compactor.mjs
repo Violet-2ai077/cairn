@@ -16,7 +16,7 @@ import {
   buildStrictCompactorPrompt
 } from '../kernel/index.mjs';
 import { createOpenAICompatibleClient } from './llm-client.mjs';
-import { distillTaskThread } from './distill.mjs';
+import { summarizeBatches } from './compaction-batches.mjs';
 
 export function buildGlobalExclusionWatchlistSection(head) {
   if (!head) return '';
@@ -106,7 +106,7 @@ export async function runStrictCompactor({
     targetRecords = allRecords;
   } else {
     // Incremental mode: slice from explicit `fromSeq` or persisted `compacted_record_count`
-    if (typeof fromSeq === 'number') {
+    if (typeof fromSeq === 'number' && fromSeq < prevCompactedCount) {
       targetRecords = allRecords.filter(
         (r, idx) => (typeof r.seq === 'number' ? r.seq : idx + 1) > fromSeq
       );
@@ -133,64 +133,11 @@ export async function runStrictCompactor({
   const watchlistSection = buildGlobalExclusionWatchlistSection(head);
   const systemPrompt = watchlistSection ? `${basePrompt}\n\n${watchlistSection}` : basePrompt;
 
-  const distilled = distillTaskThread(targetRecords, distillOptions);
-
-  const userParts = [];
-  if (mode === 'incremental' && existingCompact && existingCompact.trim().length > 0) {
-    userParts.push(
-      `### 既有任务局部摘要（previous_compact_note）\n${existingCompact.trim()}`,
-      `### 新增任务对话记录（new_task_records）\n${distilled.distilled_text}`,
-      '请将既有任务局部摘要与新增任务对话记录合并为一份更新后的任务局部交接摘要（若既有摘要或新增记录中含有任何工作区全局规则，必须在本次输出中一并彻底剔除）。'
-    );
-  } else {
-    userParts.push(`### 任务历史对话记录（task_records）\n${distilled.distilled_text}`);
-  }
-
-  const client = llmClient ?? createOpenAICompatibleClient();
-  const retryLimit = Number.isInteger(maxEmptyRetries) ? Math.max(0, maxEmptyRetries) : 1;
-  let llmRes;
-  let attempts = 0;
-  do {
-    if (signal?.aborted) {
-      return {
-        ok: false,
-        skipped: false,
-        reason: 'aborted',
-        llm_called: attempts > 0,
-        attempts,
-        raw_response_length: 0,
-        task_id: id,
-        compacted_record_count: prevCompactedCount,
-        compact_markdown: existingCompact,
-        error_code: 'aborted'
-      };
-    }
-    attempts++;
-    try {
-      llmRes = await client.complete({
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userParts.join('\n\n') }],
-        temperature: 0,
-        reasoningEffort,
-        signal
-      });
-    } catch (error) {
-      if (!signal?.aborted) throw error;
-      return {
-        ok: false,
-        skipped: false,
-        reason: 'aborted',
-        llm_called: true,
-        attempts,
-        raw_response_length: 0,
-        task_id: id,
-        compacted_record_count: prevCompactedCount,
-        compact_markdown: existingCompact,
-        error_code: 'aborted'
-      };
-    }
-    if (!llmRes.ok || String(llmRes.content ?? '').trim()) break;
-  } while (attempts <= retryLimit && !signal?.aborted);
+  const { attempts, response: llmRes } = await summarizeBatches({
+    records: targetRecords, previous: mode === 'full' ? '' : existingCompact,
+    client: llmClient ?? createOpenAICompatibleClient(), system: systemPrompt,
+    signal, reasoningEffort, maxEmptyRetries, options: distillOptions
+  });
 
   const rawResponse = llmRes?.raw_response;
   const finishReason = Array.isArray(rawResponse?.choices)

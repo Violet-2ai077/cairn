@@ -38,6 +38,16 @@ export function shortlistDormant({ userPrompt, tasks, limit }) {
     .slice(0, limit).map(({ task }) => task);
 }
 
+// Metadata can trigger a route check, never a binding. Require two terms
+// that are absent from the held task to avoid paying for ordinary follow-ups.
+export function mentionsCompetingTopic(input, bound, tasks) {
+  const query = terms(input);
+  for (const token of terms(bound.title)) query.delete(token);
+  if (query.size < 2) return false;
+  return tasks.some(task => task.id !== bound.id && task.status === 'active' &&
+    [...terms(task.title)].filter(token => query.has(token)).length >= 2);
+}
+
 export function buildHubColdRouterPrompt(tasks, { cwdProjectHint = null } = {}) {
   const cards = buildHubRoutingCards(tasks);
   return `Route the opening request to an active task, or classify as new/ambiguous. cwdProjectHint is only a soft prior, never a forced match. Return strict JSON: {"decision":"match|new|ambiguous","task_id":number|null,"project_id":string|null,"candidates":[number],"reason":"short"}. Match requires unique semantic evidence; ambiguity must not default.

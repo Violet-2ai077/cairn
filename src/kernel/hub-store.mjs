@@ -458,7 +458,7 @@ function appendHubTaskTurnUnlocked(hubRoot, { task_id, project_id = null, turn, 
   return { record, task: indexTask };
 }
 
-export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessionId, turn, user, assistant, activity = true }) => {
+export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessionId, turn, user, assistant, tools = [], activity = true, recovered = false }) => {
   const records = readHubTaskThread(hubRoot, taskId);
   const turnRecords = records.filter(record => record.turn === turn && record.meta?.dsh_session_id === sessionId);
   const texts = { user, assistant };
@@ -472,6 +472,8 @@ export const appendHubTaskTurnPair = locked((hubRoot, { taskId, projectId, sessi
   const missing = roles.filter(role => !turnRecords.some(record => record.role === role));
   for (const role of missing) {
     const meta = { dsh_session_id: sessionId, ...(activity ? {} : { cairn_activity: false }) };
+    if (role === 'assistant' && tools.length) meta.tools = tools;
+    if (recovered) meta.attribution = 'manual_recovery';
     appendHubTaskTurnUnlocked(hubRoot, { task_id: taskId, project_id: projectId, turn, role, content: texts[role], meta });
   }
   if (!missing.length) {
@@ -533,7 +535,9 @@ function writeSessionBindingUnlocked(hubRoot, sessionId, { project_id = null, ta
   return { ...binding };
 }
 
-export const finishHubScopedTurn = locked((hubRoot, { sessionId, turn, scope, user, assistant }) => {
+export const finishHubScopedTurn = locked((hubRoot, { sessionId, turn, scope, user, assistant, tools }) => {
+  const receipt = readTurnReceipts(hubRoot, sessionId, turn);
+  if (receipt?.status === 'recovering' || receipt?.reason === 'manual_recovery') return { status: 'already_claimed' };
   const current = readSessionBinding(hubRoot, sessionId, { includeCleared: true });
   if ((current?.binding_epoch ?? null) !== scope.expectedEpoch && current?.binding_epoch !== scope.bindingEpoch) {
     return { status: 'epoch_conflict' };
@@ -550,12 +554,55 @@ export const finishHubScopedTurn = locked((hubRoot, { sessionId, turn, scope, us
     }).task;
   }
   if (!task || task.project_id !== scope.projectId || task.status !== 'active') return { status: 'task_invalidated' };
-  const { appended } = appendHubTaskTurnPair(hubRoot, { taskId, projectId: scope.projectId, sessionId, turn, user, assistant });
+  const { appended } = appendHubTaskTurnPair(hubRoot, { taskId, projectId: scope.projectId, sessionId, turn, user, assistant, tools });
   const binding = current?.binding_epoch === scope.bindingEpoch ? current : writeSessionBindingUnlocked(hubRoot, sessionId, {
     project_id: scope.projectId, task_id: taskId, source: scope.bindingSource,
     bindingEpoch: scope.bindingEpoch, explicitPin: scope.explicitPin
   });
   return { status: 'archived', appended, taskId, binding };
+});
+
+function receiptDir(root, sessionId) {
+  const binding = resolveHubPaths(root).sessionBindingFile(sessionId);
+  return path.join(path.dirname(binding), 'turns', path.basename(binding, '.json'));
+}
+
+export function readTurnReceipts(root, sessionId, turn = null) {
+  const dir = receiptDir(root, sessionId);
+  if (turn !== null) {
+    if (!Number.isSafeInteger(turn) || turn < 0) throw new Error('invalid_turn');
+    return readJson(path.join(dir, turn + '.json'), null, 'turn_receipt_unreadable');
+  }
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter(name => /^\d+\.json$/u.test(name))
+    .map(name => Number.parseInt(name, 10)).sort((a, b) => b - a).slice(0, 20)
+    .map(n => readTurnReceipts(root, sessionId, n));
+}
+
+export const recordTurnReceipt = locked((root, sessionId, turn, fields) => {
+  const prior = readTurnReceipts(root, sessionId, turn);
+  if (prior?.reason === 'manual_recovery' || (prior?.status === 'recovering' && fields.reason !== 'manual_recovery')) return prior;
+  if (prior && fields.status === 'in_progress') return prior;
+  if (prior?.status === 'archived' && fields.status && fields.status !== 'archived') return prior;
+  const receipt = { turn, ...prior, ...fields, extraction: { ...prior?.extraction, ...fields.extraction } };
+  writeJsonAtomic(path.join(receiptDir(root, sessionId), turn + '.json'), receipt);
+  return receipt;
+});
+
+export const turnSourceDigest = (user, assistant) => createHash('sha256').update(JSON.stringify([user, assistant])).digest('hex');
+
+export const recoverMarkerlessTurn = locked((root, sessionId, turn, taskId, source) => {
+  const receipt = readTurnReceipts(root, sessionId, turn);
+  if (receipt?.reason === 'manual_recovery' && receipt.task_id === taskId) return;
+  if (!receipt || !['unassigned', 'recovering'].includes(receipt.status) || receipt.reason !== 'marker_missing' ||
+      (receipt.status === 'recovering' && receipt.task_id !== taskId)) throw new Error('turn_not_recoverable');
+  const task = readHubTasksIndex(root).tasks.find(item => item.id === taskId);
+  if (!task || task.status !== 'active' || task.project_id !== receipt.project_id) throw new Error('recovery_scope_mismatch');
+  if (!source || turnSourceDigest(source.user, source.assistant) !== receipt.source_digest) throw new Error('journal_mismatch');
+  // Reserve the target before the first append: a crash can retry this target, never a second one.
+  recordTurnReceipt(root, sessionId, turn, { status: 'recovering', task_id: taskId });
+  appendHubTaskTurnPair(root, { ...source, sessionId, turn, taskId, projectId: task.project_id, activity: false, recovered: true });
+  recordTurnReceipt(root, sessionId, turn, { status: 'archived', reason: 'manual_recovery', extraction: { [task.project_id ? 'project' : 'user']: 'not_requested' } });
 });
 
 export const bindHubRoutedTask = locked((hubRoot, { sessionId, taskId, projectId, source = 'cold_router_match', wake = false, at = new Date().toISOString() }) => {

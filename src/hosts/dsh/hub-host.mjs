@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
-  buildHubTaskCatalog, buildScopedAuthorityContract, buildAntiRecencyContract, readHubTasksIndex,
+  buildHubTaskCatalog, buildScopedAuthorityContract, buildAntiRecencyContract, buildStrictCompactorPrompt, readHubTasksIndex,
   readSessionBinding, writeSessionBinding, clearSessionBinding, isHubInitialized,
   readScopedHead, projectReadOnlyLedger, upsertHubTask, appendHubTaskTurnPair, initHubStore, parseTaskMarker, readHubTaskThread,
   transitionHubTaskStatus, revertScopedCommit, bindHubRoutedTask
@@ -12,9 +12,12 @@ import { runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
 import { runHubDoctor } from '../../workers/hub-doctor.mjs';
 import { runHubStagingExtractor } from '../../workers/hub-staging-extractor.mjs';
-import { createHubTaskCompactionCoordinator } from '../../workers/hub-strict-compactor.mjs';
+import { createHubTaskCompactionCoordinator, exclusionWatchlist } from '../../workers/hub-strict-compactor.mjs';
+import { explicitUserDefaults } from '../../workers/hub-auto-commit.mjs';
+import { appendCompactionDirective } from './compaction-directive.mjs';
 import { createHubWriteCoordinator } from '../../workers/hub-write-coordinator.mjs';
-import { readProjectsIndex } from '../../kernel/hub-store.mjs';
+import { readProjectsIndex, readTurnReceipts, recordTurnReceipt, recoverMarkerlessTurn, turnSourceDigest } from '../../kernel/hub-store.mjs';
+import { collectToolEvidence, recoverJournalText } from './turn-journal.mjs';
 import { listHubTaskPools, resolveTaskHeatPolicy, selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
 import { createHubTurnRuntime, hideHubStreamMarker, HUB_TURN_CONTRACT, resolveMidSessionPolicy } from './hub-turn-runtime.mjs';
@@ -111,11 +114,23 @@ export async function createHubDshHost(ctx, config = {}) {
   }
   function queueArchived({ sessionId, taskId, projectId, project, turn, sourceStep, user, assistant, authoredUser, client }) {
     enqueueSessionJob(sessionId, async () => {
-      await workerLlmCallContext.run({ sessionId }, () => runHubStagingExtractor({
-        hubRoot, scope: projectId ? 'project' : 'user', projectId, project, turnInput: { turn, user, assistant },
-        authoredUserText: authoredUser, autopilot: config.autopilot, source_step: sourceStep,
-        actor_id: config.actorId ?? 'dsh-host', llmClient: client
-      }));
+      const scopes = [{ scope: projectId ? 'project' : 'user', projectId, user, assistant }];
+      const defaults = projectId && explicitUserDefaults(authoredUser);
+      if (defaults) scopes.push({ scope: 'user', projectId: null, user: defaults, assistant: '' });
+      for (const input of scopes) {
+        let outcome;
+        try {
+          const result = await workerLlmCallContext.run({ sessionId }, () => runHubStagingExtractor({
+            hubRoot, scope: input.scope, projectId: input.projectId, project,
+            turnInput: { turn, user: input.user, assistant: input.assistant },
+            authoredUserText: authoredUser, autopilot: config.autopilot, source_step: sourceStep,
+            actor_id: config.actorId ?? 'dsh-host', llmClient: client
+          }));
+          outcome = result.ok ? result.autoCommit?.status ?? (result.staged ? 'staged' : 'no_ops')
+            : ['strict_json_parse_failed', 'missing_ops_array', 'all_ops_rejected'].includes(result.error_code) ? result.error_code : 'worker_failed';
+        } catch { outcome = 'worker_failed'; }
+        recordTurnReceipt(hubRoot, sessionId, turn, { status: 'archived', task_id: taskId, extraction: { [input.scope]: outcome } });
+      }
       const current = readHubTasksIndex(hubRoot).tasks.find(item => item.id === taskId);
       if (!current || current.status !== 'active') return;
       const records = readHubTaskThread(hubRoot, taskId).slice(current.compacted_record_count);
@@ -254,11 +269,23 @@ export async function createHubDshHost(ctx, config = {}) {
       return decision;
     }, { global: true });
     if (typeof stopPreStep === 'function') disposers.push(stopPreStep);
-    if (turnRuntime && config.stripMarkerInStream !== false) {
+    {
       const stopStream = ctx.on('llm/stream', (request, next) => {
-        const entry = turnRuntime.turns.get(request?.sessionId);
+        const entry = turnRuntime?.turns.get(request?.sessionId);
+        if (request?.purpose === 'compaction') {
+          const projectId = entry ? entry.scope?.projectId : request.sessionId && readSessionBinding(hubRoot, request.sessionId)?.project_id;
+          const directive = [buildStrictCompactorPrompt(), exclusionWatchlist(readScopedHead(hubRoot),
+            projectId && readScopedHead(hubRoot, { scope: 'project', projectId })),
+            'Earlier task checkouts are historical. Do not merge task progress across scopes or carry old project rules into the next task.'].filter(Boolean).join('\n\n');
+          const messages = appendCompactionDirective(request.messages, directive);
+          // rc.5's terminal waterfall callback closes over this options object, not next(arg).
+          // Its auxiliary request is mutable; only replace the array, never a journal message.
+          if (Object.isFrozen(request)) return next({ ...request, messages });
+          request.messages = messages;
+          return next(request);
+        }
         const stream = next(request);
-        if (request?.purpose || !entry?.scope || entry.signal !== request.signal) return stream;
+        if (request?.purpose || config.stripMarkerInStream === false || !entry?.scope || entry.signal !== request.signal) return stream;
         return hideHubStreamMarker(stream, entry);
       }, { prepend: true, global: true });
       if (typeof stopStream === 'function') disposers.push(stopStream);
@@ -276,12 +303,17 @@ export async function createHubDshHost(ctx, config = {}) {
       const sessionId = session?.id ?? session?.sessionId;
       if (!sessionId || !event?.type) return;
       if (turnRuntime) {
-        try { turnRuntime.event(sessionId, event); } catch { /* Rejected archival never enters the worker queue. */ }
+        try { turnRuntime.event(sessionId, event); } catch {
+          if (event.type === 'turn/end' && Number.isSafeInteger(event.data?.turn)) {
+            recordTurnReceipt(hubRoot, sessionId, event.data.turn, { status: 'unassigned', reason: 'archive_failed', end_seq: event.seq ?? null });
+          }
+        }
         return;
       }
       const turn = event.type === 'turn/start' || !turns.has(sessionId)
-        ? { turn: event.data?.turn ?? 1, user: '', authoredUser: '', assistant: '', modelRoute: routeForTurn(sessionId, event.data?.turn ?? 1) }
+        ? { turn: event.data?.turn ?? 1, firstSeq: event.seq, user: '', authoredUser: '', assistant: '', tools: [], toolNames: new Map(), modelRoute: routeForTurn(sessionId, event.data?.turn ?? 1) }
         : turns.get(sessionId);
+      collectToolEvidence(turn, event);
       if (event.type === 'user/message' || event.type === 'assistant/message') {
         const message = event.data?.message ?? event.data;
         const content = typeof message?.content === 'string' ? message.content : Array.isArray(message?.content) ? message.content.map(block => block?.text ?? '').join('\n') : '';
@@ -291,34 +323,48 @@ export async function createHubDshHost(ctx, config = {}) {
           if (!source || source === 'user') turn.user += `\n${clean}`;
           if (source === 'user' && (event.surfaceOp === undefined || event.surfaceOp === 'append')) turn.authoredUser += `\n${clean}`;
         }
-        else turn.assistant += `\n${content}`;
+        else { turn.assistant += `\n${content}`; turn.finalSeq = event.seq; }
       }
       turns.set(sessionId, turn);
       if (event.type !== 'turn/end') return;
       const state = stateFor(sessionId);
       const marker = parseTaskMarker(turn.assistant.trim());
       turns.delete(sessionId);
-      if (routingUnresolved(state) || !marker.valid || marker.is_unresolved || (event.data?.reason?.kind && event.data.reason.kind !== 'completed')) return;
+      const receipt = (status, reason, extra) => recordTurnReceipt(hubRoot, sessionId, turn.turn, {
+        status, reason, first_seq: turn.firstSeq ?? null, end_seq: event.seq ?? null, ...extra
+      });
+      if (event.data?.reason?.kind && event.data.reason.kind !== 'completed') {
+        if (turn.authoredUser.trim()) receipt('interrupted', 'not_completed');
+        return;
+      }
+      if (routingUnresolved(state) || !marker.valid || marker.is_unresolved) {
+        if (!turn.authoredUser.trim()) return;
+        if (routingUnresolved(state) || marker.is_unresolved) return receipt('unassigned', 'unresolved');
+        if (marker.display_text.includes('<|task:')) return receipt('unassigned', 'marker_invalid');
+        return receipt('unassigned', 'marker_missing', { project_id: state.selectedProjectId ?? null,
+          final_seq: turn.finalSeq ?? null, source_digest: turnSourceDigest(turn.authoredUser.trim(), marker.display_text) });
+      }
       const taskId = marker.task_number;
       try {
         initHubStore(hubRoot);
         const projectHint = resolveGitProjectHint(cwdFrom(session));
         const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === taskId);
         if (!task) upsertHubTask(hubRoot, { id: taskId, project_id: state.selectedProjectId, project: projectHint?.project_id === state.selectedProjectId ? projectHint : null, title: turn.user.trim().slice(0, 120) || `Task ${taskId}` });
-        if (task && task.project_id !== (state.selectedProjectId ?? null)) return;
+        if (task && task.project_id !== (state.selectedProjectId ?? null)) return receipt('unassigned', 'project_mismatch');
         const projectId = state.selectedProjectId ?? null;
         const { appended } = appendHubTaskTurnPair(hubRoot, {
           taskId, projectId, sessionId, turn: turn.turn, user: turn.user.trim(), assistant: marker.answer,
-          activity: Boolean(turn.authoredUser.trim())
+          activity: Boolean(turn.authoredUser.trim()), tools: turn.tools
         });
         if (!appended) return;
+        receipt('archived', 'confirmed_marker', { task_id: taskId, extraction: { [projectId ? 'project' : 'user']: 'pending' } });
         state.taskId = taskId; state.bindingSource = state.bindingSource ?? 'task_marker'; sessions.set(sessionId, state);
         writeSessionBinding(hubRoot, sessionId, { project_id: projectId, task_id: taskId, source: state.bindingSource });
         const client = clientFor(turn.modelRoute ?? routeForTurn(sessionId, turn.turn));
         const project = projectId && projectHint?.project_id === projectId ? projectHint : null;
         queueArchived({ sessionId, taskId, projectId, project, turn: turn.turn, sourceStep: `turn_${turn.turn}`,
           user: turn.user.trim(), assistant: marker.answer, authoredUser: turn.authoredUser, client });
-      } catch { /* Invalid task markers cannot produce cross-project writes. */ }
+      } catch { receipt('unassigned', 'archive_failed'); }
     }, { global: true });
     if (typeof stopEvent === 'function') disposers.push(stopEvent);
   }
@@ -344,7 +390,7 @@ export async function createHubDshHost(ctx, config = {}) {
     }
   }
   if (commands?.register) {
-    const stop = commands.register({ name: 'cairn', description: 'Manage centralized Cairn Hub state', input: { hint: 'status | tasks [--all|--status <status>] | inspect | doctor | checkout <id|--clear> [--preview] | undo <user|project [id]> <seq> [--preview] <reason>' }, async handler({ rawInput, agent }) {
+    const stop = commands.register({ name: 'cairn', description: 'Manage centralized Cairn Hub state', input: { hint: 'status | turns [turn] | recover <turn> <task-id> | tasks [--all|--status <status>] | inspect | doctor | checkout <id|--clear> [--preview] | undo <user|project [id]> <seq> [--preview] <reason>' }, async handler({ rawInput, agent }) {
       const args = String(rawInput ?? 'status').trim().split(/\s+/u).filter(Boolean);
       const sessionId = agent?.session?.id;
       if (args[0] === 'undo' || args[0] === 'revert') {
@@ -379,6 +425,21 @@ export async function createHubDshHost(ctx, config = {}) {
         const llmClient = clientFor(modelRoutes.get(sessionId)?.route);
         const result = await workerLlmCallContext.run({ sessionId }, () => compactionCoordinator.run({ taskId: requested, source: 'manual', mode: args.includes('--full') ? 'full' : 'incremental', llmClient }));
         return { kind: result.ok ? 'success' : 'error', text: JSON.stringify(result) };
+      }
+      if (args[0] === 'recover') {
+        if (!sessionId || args.length !== 3 || !args.slice(1).every(arg => /^\d+$/u.test(arg))) return { kind: 'error', text: 'Use recover <turn> <task-id> in the original session.' };
+        const turn = Number(args[1]), taskId = Number(args[2]);
+        try {
+          const receipt = readTurnReceipts(hubRoot, sessionId, turn);
+          const source = receipt?.reason === 'marker_missing' ? recoverJournalText(agent.session, receipt, stripTrailingSystemReminders) : null;
+          recoverMarkerlessTurn(hubRoot, sessionId, turn, taskId, source);
+          return { kind: 'success', text: 'Recovered task history only; binding and ledgers unchanged.' };
+        } catch (error) { return { kind: 'error', text: error.message }; }
+      }
+      if (args[0] === 'turns') {
+        if (!sessionId || args.length > 2 || (args[1] && !/^\d+$/u.test(args[1]))) return { kind: 'error', text: 'Use turns [turn] in a session.' };
+        const receipts = readTurnReceipts(hubRoot, sessionId, args[1] ? Number(args[1]) : null);
+        return { kind: receipts === null ? 'error' : 'success', text: JSON.stringify(receipts, null, 2) };
       }
       if (args[0] === 'doctor') return { kind: 'success', text: JSON.stringify(runHubDoctor({ hubRoot }), null, 2) };
       if (args[0] === 'status') return { kind: 'success', text: JSON.stringify(readStatus(), null, 2) };

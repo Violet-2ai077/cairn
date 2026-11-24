@@ -25,7 +25,7 @@ cairn/
 │   │   └── index.mjs    #   Kernel barrel export
 │   ├── workers/         # Layer 2: Out-of-band async LLM workers (llm-client, distill, staging-extractor, strict-compactor, cold-router)
 │   └── hosts/
-│       └── dsh/         # Layer 3: Thin runtime host adapter for DeepSeek Harness (dsh 0.2.2-rc.1 / Cordis 4.1.0)
+│       └── dsh/         # Layer 3: Thin runtime host adapter for DeepSeek Harness (dsh 0.2.2-rc.5 / Cordis 4.1.0)
 ├── docs/
 │   ├── architecture.md               # .cairn/ disk model & 3-layer design
 │   ├── dsh-host-interface.md         # Factual dsh Cordis hooks & verified integration surface
@@ -71,9 +71,5 @@ cairn/
 
 ## 5. Current Status & Next Development Entry Point
 
-- **Completed**:
-  - `src/kernel/ledger.mjs`, `src/kernel/marker.mjs`, `src/kernel/contracts.mjs`, and `test/kernel.node-test.mjs` (100% passing).
-  - Architecture spec ([`docs/architecture.md`](docs/architecture.md)) and factual `dsh` hook reference ([`docs/dsh-host-interface.md`](docs/dsh-host-interface.md)).
-- **Next Step**:
-  1. Build the `.cairn/` local filesystem store (`.cairn/head.json`, `.cairn/ledger.jsonl`, `.cairn/staged.json`, `.cairn/tasks/`) and async worker runners in `src/workers/`.
-  2. Implement the single-agent `dsh` Cordis plugin in `src/hosts/dsh/index.mjs` and verify the three interactive surface items listed in Section 3 of [`docs/dsh-host-interface.md`](docs/dsh-host-interface.md).
+- The filesystem stores, async workers and single-agent Cordis adapter are implemented. Without an explicit `workspaceRoot`, dsh uses the centralized Hub with separate User and Project ledgers; an explicit workspace root keeps the original workspace adapter.
+- Start with [the current dsh host behavior and recovery notes](docs/dsh-host-interface.md), `npm test`, and the optional real-host smoke documented there. Distinguish deterministic host verification from live-model routing and summary quality.

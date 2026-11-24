@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { buildAntiRecencyContract, buildHubTaskCatalog, buildScopedAuthorityContract, parseTaskMarker, projectReadOnlyLedger } from '../../kernel/index.mjs';
-import { finishHubScopedTurn, readHubTasksIndex, readProjectsIndex, readScopedHead, readSessionBinding } from '../../kernel/hub-store.mjs';
+import { finishHubScopedTurn, readHubTasksIndex, readProjectsIndex, readScopedHead, readSessionBinding, recordTurnReceipt, turnSourceDigest } from '../../kernel/hub-store.mjs';
+import { textOf, collectToolEvidence } from './turn-journal.mjs';
 import { selectHubTaskPools } from '../../kernel/task-heat.mjs';
-import { runHubColdRouter } from '../../workers/hub-cold-router.mjs';
+import { mentionsCompetingTopic, runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
 
@@ -10,9 +11,8 @@ const SWITCH = /^(?:(?:please\s+)?(?:switch\s+(?:to|topics?)|change\s+(?:topics?
 const EXACT = /(?:\btask\s*#?\s*|任务\s*#?\s*|<\|task:)([1-9]\d{0,2})(?!\d)/giu;
 const EXACT_START = /^(?:(?:please\s+)?(?:continue|resume|revisit|switch to|open|work on)\s+|(?:请\s*)?(?:继续|恢复|切到|切换到|回到|打开)\s*)?(?:task\s*#?\s*|任务\s*#?\s*|<\|task:)[1-9]\d{0,2}(?!\d)/iu;
 const clarification = 'Cairn 未确认本轮作用域，请澄清目标。旧作用域不适用于本轮；输出 <|task:UNRESOLVED|>，不要新建或续写任务。';
+const RETURN_TO = /^(?:(?:please\s+)?(?:(?:(?:let['’]s|can we)\s+)?(?:go\s+|come\s+|get\s+)?back to\b|(?:return to|revisit|resume|pick up)\s+\S)|(?:请|我们)?(?:再)?(?:回到|接着(?:昨天|之前|上次)|继续(?:昨天|之前|上次)))/iu;
 
-const textOf = msg => typeof msg?.content === 'string' ? msg.content
-  : (Array.isArray(msg?.content) ? msg.content.filter(block => block?.type === 'text').map(block => block.text).join('\n') : '');
 const scopeKey = (sessionId, turn) => createHash('sha256').update(JSON.stringify([sessionId, turn])).digest('hex');
 
 export function resolveMidSessionPolicy(autopilot) {
@@ -48,7 +48,7 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     return state;
   }
   function begin(id, turn) {
-    const entry = { turn, turnKey: scopeKey(id, turn), scope: null, step: 0, signal: null, pending: null, input: '', authored: '', terminal: null, streamMarkers: new Map() };
+    const entry = { turn, turnKey: scopeKey(id, turn), scope: null, step: 0, signal: null, pending: null, input: '', authored: '', terminal: null, streamMarkers: new Map(), toolNames: new Map(), tools: [] };
     turns.set(id, entry);
     return entry;
   }
@@ -93,7 +93,10 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     const bound = tasks.find(task => task.id === state.selectedTaskId && task.status === 'active' && task.project_id === state.selectedProjectId);
     const recovery = tasks.find(task => task.creation_turn_key === entry.turnKey && task.status === 'active');
     const ids = new Set([...entry.input.matchAll(EXACT)].map(m => Number(m[1])));
-    const explicit = EXACT_START.test(entry.input) || SWITCH.test(entry.input);
+    const requestToReturn = RETURN_TO.test(entry.input);
+    const returning = requestToReturn || state.route?.reason === 'ambiguous' ||
+      (bound && !state.explicitPin && mentionsCompetingTopic(entry.input, bound, tasks));
+    const explicit = EXACT_START.test(entry.input) || SWITCH.test(entry.input) || requestToReturn;
     let result;
     const hint = bound ? null : resolveGitProjectHint(cwd);
     const projectMention = /\bproject:([a-z0-9_-]+)\b/iu.exec(entry.input)?.[1];
@@ -103,16 +106,17 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       const task = tasks.find(item => item.id === [...ids][0] && item.status === 'active');
       if (!task) return deny('explicit_task_unavailable');
       result = { decision: 'match', task_id: task.id, project_id: task.project_id, pool: dormant.some(item => item.id === task.id) ? 'dormant' : 'hot' };
-    } else if (bound && !explicit) {
+    } else if (bound && !explicit && !returning) {
       result = { decision: 'keep', task_id: bound.id, project_id: bound.project_id };
     } else {
-      if (state.explicitPin && !explicit) return deny('pinned_task_unavailable');
+      if (state.explicitPin && !bound && !explicit) return deny('pinned_task_unavailable');
       result = await runHubColdRouter({
         hubRoot, userPrompt: entry.input, taskHeat, timeoutMs: policy.routeTimeoutMs, signal: payload.signal,
         cwdProjectHint: bound ? null : hint?.project_id ?? null, llmClient: clientFor(modelSelection)
       });
     }
     if (payload.signal?.aborted || turns.get(sessionId) !== entry) return deny('aborted');
+    if (returning && result.decision === 'new' && !SWITCH.test(entry.input)) return deny('ambiguous');
     if (!['match', 'keep', 'new'].includes(result.decision)) return deny(result.decision === 'ambiguous' ? 'ambiguous' : 'route_error');
     if (syncBinding(sessionId).bindingEpoch !== expectedEpoch) return deny('epoch_conflict');
     if (projectMention && explicit && !projects.has(projectMention)) return deny('unknown_project');
@@ -159,18 +163,22 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       if (turns.get(sessionId) === entry && !payload.signal?.aborted) {
         entry.scope = scope;
         stateFor(sessionId).route = scope.route;
+        recordTurnReceipt(hubRoot, sessionId, turn, { status: 'in_progress', reason: 'awaiting_turn_end', first_seq: entry.firstSeq ?? null });
       }
     }
   }
   function event(sessionId, event) {
     const data = event.data ?? {};
     if (event.type === 'turn/start') {
-      if (turns.get(sessionId)?.turn !== data.turn) begin(sessionId, data.turn);
+      const initial = turns.get(sessionId)?.turn === data.turn ? turns.get(sessionId) : begin(sessionId, data.turn);
+      if (Number.isSafeInteger(event.seq)) initial.firstSeq ??= event.seq;
       return;
     }
     const entry = turns.get(sessionId);
     if (!entry || (data.turn != null && data.turn !== entry.turn)) return;
     const msg = data.message ?? data;
+    if (Number.isSafeInteger(event.seq)) entry.firstSeq ??= event.seq;
+    collectToolEvidence(entry, event);
     if (event.type === 'user/message' && msg.source?.kind === 'user' && event.surfaceOp === 'append') {
       const authored = stripReminders(textOf(msg));
       if (authored) entry.authored = [entry.authored, authored].filter(Boolean).join('\n\n');
@@ -181,7 +189,7 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       } else {
         const text = textOf(msg).trim();
         const hidden = entry.streamMarkers.get(entry.step);
-        entry.terminal = { step: entry.step, marker: hidden?.display_text === text ? hidden : parseTaskMarker(text) };
+        entry.terminal = { step: entry.step, seq: event.seq, marker: hidden?.display_text === text ? hidden : parseTaskMarker(text) };
       }
     }
     if (event.type !== 'turn/end') return;
@@ -189,16 +197,26 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     const state = stateFor(sessionId);
     const scope = entry.scope;
     const user = entry.authored || entry.input;
-    if (!scope || !user || data.reason?.kind !== 'completed' || entry.signal?.aborted || scope.route.result === 'clarify' ||
-        state.lastProcessedTurnKey === scope.turnKey || entry.terminal?.step !== entry.step) return;
+    if (!user || state.lastProcessedTurnKey === entry.turnKey) return;
+    const receipt = (status, reason, extra) => recordTurnReceipt(hubRoot, sessionId, entry.turn, {
+      status, reason, first_seq: entry.firstSeq ?? null, end_seq: event.seq ?? null, ...extra
+    });
+    if (data.reason?.kind !== 'completed' || entry.signal?.aborted) return receipt('interrupted', 'not_completed');
+    if (!scope || scope.route.result === 'clarify') return receipt('unassigned', scope?.route.reason ?? 'scope_unavailable');
+    if (entry.terminal?.step !== entry.step) return receipt('unassigned', 'no_final_answer');
     const marker = entry.terminal.marker;
-    if (!marker.valid || marker.is_unresolved) return;
+    if (!marker.valid || marker.is_unresolved) {
+      if (marker.is_unresolved || marker.display_text?.includes('<|task:')) return receipt('unassigned', marker.is_unresolved ? 'unresolved' : 'marker_invalid');
+      return receipt('unassigned', 'marker_missing', { project_id: scope.projectId, final_seq: entry.terminal.seq ?? null,
+        source_digest: turnSourceDigest(user, marker.display_text) });
+    }
     if (marker.task_number !== (scope.taskId ?? scope.newTaskTicket?.taskId)) {
       state.pendingSwitch = Object.freeze({ taskId: marker.task_number, turn: entry.turn });
-      return;
+      return receipt('unassigned', 'marker_mismatch');
     }
-    const result = finishHubScopedTurn(hubRoot, { sessionId, turn: entry.turn, scope, user, assistant: marker.answer });
-    if (result.status !== 'archived') return;
+    const result = finishHubScopedTurn(hubRoot, { sessionId, turn: entry.turn, scope, user, assistant: marker.answer, tools: entry.tools });
+    if (result.status !== 'archived') return receipt('unassigned', result.status);
+    receipt('archived', 'confirmed_marker', { task_id: result.taskId, ...(result.appended ? { extraction: { [scope.projectId ? 'project' : 'user']: 'pending' } } : {}) });
     syncBinding(sessionId, result.binding);
     state.lastProcessedTurnKey = scope.turnKey;
     state.snapshot = scope.snapshot;

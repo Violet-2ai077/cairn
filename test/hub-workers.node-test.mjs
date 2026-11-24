@@ -10,6 +10,14 @@ import { buildHubColdRouterPrompt, runHubColdRouter } from '../src/workers/hub-c
 import { runHubStagingExtractor } from '../src/workers/hub-staging-extractor.mjs';
 import { runHubStrictCompactor, createHubTaskCompactionCoordinator } from '../src/workers/hub-strict-compactor.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
+import { explicitUserDefaults } from '../src/workers/hub-auto-commit.mjs';
+
+test('project-session User extraction excludes quoted, hypothetical and project-local candidates', () => {
+  const text = ['> Use npm in all projects', '~~~', 'Adopt npm in every project', '~~~',
+    'Should we do this across projects?', 'This repo is an exception across all projects.',
+    'Use Chinese for all my projects; use pnpm here.'].join('\n');
+  assert.equal(explicitUserDefaults(text), 'Use Chinese for all my projects');
+});
 
 const heat = { enabled: true, hotMaxTasks: 1, idleDays: 14, dormantMaxCandidates: 1 };
 const recent = '2026-01-31T00:00:00Z';
@@ -21,6 +29,28 @@ function seedTask(hub, id, title, timestamp = old) {
   upsertHubTask(hub, { id, title });
   appendHubTaskTurn(hub, { task_id: id, content: title, timestamp });
 }
+
+test('compaction covers the middle of a backlog and a single long record; a later failure never publishes a partial rebuild', async t => {
+  const hubRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-coverage-'));
+  t.after(() => fs.rmSync(hubRoot, { recursive: true, force: true }));
+  upsertHubTask(hubRoot, { id: 1, title: 'CSV export' });
+  for (let i = 0; i < 24; i++) {
+    const content = i === 14 ? 'x'.repeat(13000) + 'BLOCKER_X27' + 'y'.repeat(9000) : 'routine'.repeat(150);
+    appendHubTaskTurn(hubRoot, { task_id: 1, role: 'user', content });
+  }
+  writeHubTaskCompaction(hubRoot, 1, 'previous good summary', 1);
+  let calls = 0;
+  const run = complete => runHubStrictCompactor({ hubRoot, taskId: 1, mode: 'full', llmClient: { complete } });
+  const failed = await run(async () => ++calls === 2 ? { ok: false } : { ok: true, content: 'partial' });
+  assert.equal(failed.ok, false);
+  assert.match(compileHubTaskCheckout({ hubRoot, taskId: 1 }).text, /previous good summary/u);
+  assert.equal(compileHubTaskCheckout({ hubRoot, taskId: 1 }).compacted_record_count, 1);
+  const result = await run(async ({ messages }) => ({
+    ok: true, content: messages[0].content.includes('BLOCKER_X27') ? 'BLOCKER_X27' : 'routine'
+  }));
+  assert.equal(result.compacted_record_count, 24);
+  assert.match(compileHubTaskCheckout({ hubRoot, taskId: 1 }).text, /BLOCKER_X27/u);
+});
 
 test('dormant routing prescreens English and Chinese metadata, reads only shortlisted previews, and calls at most twice', async () => {
   const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-heat-'));

@@ -1,9 +1,9 @@
 import path from 'node:path';
 import { buildStrictCompactorPrompt, readHubTaskCompaction, readHubTaskThread, readHubTasksIndex, readScopedHead, projectReadOnlyLedger, writeHubTaskCompaction } from '../kernel/index.mjs';
-import { distillTaskThread } from './distill.mjs';
+import { summarizeBatches } from './compaction-batches.mjs';
 import { createOpenAICompatibleClient } from './llm-client.mjs';
 
-function exclusionWatchlist(...heads) {
+export function exclusionWatchlist(...heads) {
   const keys = new Set(); const options = new Set();
   for (const head of heads) {
     for (const item of [...(head?.active ?? []), ...(head?.tombstones ?? [])]) { if (item.key) keys.add(item.key); if (item.option_code) options.add(item.option_code); }
@@ -26,28 +26,16 @@ export async function runHubStrictCompactor({ hubRoot, taskId, mode = 'increment
   const projectHead = task.project_id ? projectReadOnlyLedger(readScopedHead(hubRoot, { scope: 'project', projectId: task.project_id }), { includeTombstones: true }) : null;
   const watchlist = exclusionWatchlist(userHead, projectHead);
   const system = [buildStrictCompactorPrompt({ taskId: id }), watchlist].filter(Boolean).join('\n\n');
-  const distilled = distillTaskThread(target);
-  const user = mode !== 'full' && compact ? `### Previous task-local summary\n${compact}\n\n### New task records\n${distilled.distilled_text}\n\nMerge without adding global rules.` : distilled.distilled_text;
-  const client = llmClient ?? createOpenAICompatibleClient();
-  let attempts = 0; let response;
-  do {
-    if (signal?.aborted) return { ok: false, reason: 'aborted', error_code: 'aborted', attempts, task_id: id, compacted_record_count: oldCount };
-    attempts++;
-    try { response = await client.complete({ system, messages: [{ role: 'user', content: user }], temperature: 0, signal }); }
-    catch (error) {
-      if (signal?.aborted) return { ok: false, reason: 'aborted', error_code: 'aborted', attempts, task_id: id, compacted_record_count: oldCount };
-      return { ok: false, reason: 'llm_error', error_code: 'llm_error', attempts, task_id: id, compacted_record_count: oldCount };
-    }
-    if (!response.ok) return { ok: false, reason: 'llm_error', error_code: response.error_code, attempts, task_id: id, compacted_record_count: oldCount };
-    if (String(response.content ?? '').trim()) break;
-  } while (attempts <= Math.max(0, maxEmptyRetries));
+  const { attempts, response } = await summarizeBatches({ records: target, previous: mode === 'full' ? '' : compact,
+    system, client: llmClient ?? createOpenAICompatibleClient(), signal, maxEmptyRetries });
+  if (signal?.aborted) return { ok: false, reason: 'aborted', error_code: 'aborted', attempts, task_id: id, compacted_record_count: oldCount };
+  if (!response.ok) return { ok: false, reason: 'llm_error', error_code: response.error_code, attempts, task_id: id, compacted_record_count: oldCount };
   const content = String(response.content ?? '').trim();
   if (!content) return { ok: false, reason: 'empty_compaction_output', attempts, raw_response_length: String(response.content ?? '').length, finish_reason: response.finish_reason ?? response.metadata?.finish_reason ?? null, task_id: id, compacted_record_count: oldCount };
   if (signal?.aborted) return { ok: false, reason: 'aborted', error_code: 'aborted', attempts, task_id: id, compacted_record_count: oldCount };
   const current = readHubTasksIndex(hubRoot).tasks.find(item => item.id === id);
   if (!current || current.status !== 'active') return { ok: false, skipped: true, reason: current ? 'task_not_active' : 'task_not_found', task_id: id, compacted_record_count: oldCount };
-  const nextCount = mode === 'full' ? records.length : Math.max(oldCount, ...target.map(record => Number(record.seq) || 0));
-  const updated = writeHubTaskCompaction(hubRoot, id, content, Math.min(records.length, nextCount));
+  const updated = writeHubTaskCompaction(hubRoot, id, content, records.length);
   return { ok: true, task_id: id, attempts, raw_response_length: String(response.content ?? '').length, compacted_record_count: updated.compacted_record_count, compact_markdown: content };
 }
 
