@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createEmptyLedger, projectReadOnlyLedger } from './ledger.mjs';
@@ -392,6 +392,7 @@ export function readHubTasksIndex(hubRoot) {
     turn_count: Number.isSafeInteger(task.turn_count) ? task.turn_count : 0,
     compacted_record_count: Number.isSafeInteger(task.compacted_record_count) ? task.compacted_record_count : 0,
     has_compact: Boolean(task.has_compact), updated_at: task.updated_at ?? null,
+    ...(task.creation_turn_key ? { creation_turn_key: task.creation_turn_key } : {}),
     // Pre-heat compaction overwrote updated_at, so it cannot date a compacted legacy task.
     last_activity_at: Object.hasOwn(task, 'last_activity_at') ? task.last_activity_at ?? null
       : !task.has_compact && task.turn_count > 0 ? task.updated_at ?? null : null
@@ -400,7 +401,7 @@ export function readHubTasksIndex(hubRoot) {
 }
 
 export const upsertHubTask = locked(upsertHubTaskUnlocked);
-function upsertHubTaskUnlocked(hubRoot, { id, project_id = null, title, birth_turn, status = 'active', updated_at, project = null } = {}) {
+function upsertHubTaskUnlocked(hubRoot, { id, project_id = null, title, birth_turn, status = 'active', updated_at, project = null, creation_turn_key = null } = {}) {
   if (!isHubInitialized(hubRoot)) initHubStore(hubRoot);
   const paths = resolveHubPaths(hubRoot);
   const index = readHubTasksIndex(hubRoot);
@@ -416,7 +417,7 @@ function upsertHubTaskUnlocked(hubRoot, { id, project_id = null, title, birth_tu
   if (existingIndex < 0 && status !== 'active') throw new Error('new_task_status_must_be_active');
   const task = existingIndex >= 0
     ? { ...index.tasks[existingIndex], title: title?.trim() || index.tasks[existingIndex].title, updated_at: now }
-    : { id: taskId, project_id: projectId, title: title?.trim() || `Task ${taskId}`, birth_turn: birth_turn ?? 1, status, turn_count: 0, compacted_record_count: 0, has_compact: false, updated_at: now, last_activity_at: null };
+    : { id: taskId, project_id: projectId, title: title?.trim() || `Task ${taskId}`, birth_turn: birth_turn ?? 1, status, turn_count: 0, compacted_record_count: 0, has_compact: false, updated_at: now, last_activity_at: null, ...(creation_turn_key ? { creation_turn_key } : {}) };
   if (existingIndex >= 0) index.tasks[existingIndex] = task;
   else { index.tasks.push(task); index.next_task_id = Math.max(index.next_task_id, taskId + 1); }
   index.tasks.sort((a, b) => a.id - b.id);
@@ -501,16 +502,21 @@ export function readHubTaskCompaction(hubRoot, taskId) {
   return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
 }
 
-export function readSessionBinding(hubRoot, sessionId) {
+export function readSessionBinding(hubRoot, sessionId, { includeCleared = false } = {}) {
   const file = resolveHubPaths(hubRoot).sessionBindingFile(sessionId);
   if (!fs.existsSync(file)) return null;
   const binding = readJson(file, null, 'session_binding_unreadable');
   if (binding?.session_id !== sessionId) throw new Error('session_binding_identity_mismatch');
-  return { project_id: normalizedProjectId(binding.project_id), task_id: binding.task_id === null ? null : normalizeTaskId(binding.task_id), source: String(binding.source ?? 'explicit'), updated_at: binding.updated_at ?? null };
+  if (binding.cleared && !includeCleared) return null;
+  const source = String(binding.source ?? 'explicit');
+  return { project_id: normalizedProjectId(binding.project_id), task_id: binding.task_id === null ? null : normalizeTaskId(binding.task_id), source, updated_at: binding.updated_at ?? null,
+    binding_epoch: binding.binding_epoch ?? binding.updated_at ?? 'legacy', explicit_pin: binding.explicit_pin ?? isExplicitBinding(source),
+    ...(binding.cleared ? { cleared: true } : {}) };
 }
 
+const isExplicitBinding = source => ['explicit', 'slash_checkout', 'cli_checkout', 'tool_checkout'].includes(source);
 export const writeSessionBinding = locked(writeSessionBindingUnlocked);
-function writeSessionBindingUnlocked(hubRoot, sessionId, { project_id = null, task_id = null, source = 'explicit' } = {}) {
+function writeSessionBindingUnlocked(hubRoot, sessionId, { project_id = null, task_id = null, source = 'explicit', bindingEpoch = randomUUID(), explicitPin = isExplicitBinding(source) } = {}) {
   const paths = resolveHubPaths(hubRoot);
   const projectId = normalizedProjectId(project_id);
   let normalizedTaskId = null;
@@ -521,10 +527,36 @@ function writeSessionBindingUnlocked(hubRoot, sessionId, { project_id = null, ta
     if (task.status !== 'active') throw new Error(`task_not_active:${normalizedTaskId}:${task.status}`);
     if (task.project_id !== projectId) throw new Error('task_project_mismatch');
   }
-  const binding = { session_id: sessionId, project_id: projectId, task_id: normalizedTaskId, source: String(source || 'explicit'), updated_at: new Date().toISOString() };
+  const binding = { session_id: sessionId, project_id: projectId, task_id: normalizedTaskId, source: String(source || 'explicit'), updated_at: new Date().toISOString(),
+    binding_epoch: bindingEpoch, explicit_pin: explicitPin };
   writeJsonAtomic(paths.sessionBindingFile(sessionId), binding);
   return { ...binding };
 }
+
+export const finishHubScopedTurn = locked((hubRoot, { sessionId, turn, scope, user, assistant }) => {
+  const current = readSessionBinding(hubRoot, sessionId, { includeCleared: true });
+  if ((current?.binding_epoch ?? null) !== scope.expectedEpoch && current?.binding_epoch !== scope.bindingEpoch) {
+    return { status: 'epoch_conflict' };
+  }
+  const taskId = scope.taskId ?? scope.newTaskTicket?.taskId;
+  if (scope.newTaskTicket && (scope.newTaskTicket.turnKey !== scope.turnKey || scope.taskId !== null)) return { status: 'invalid_ticket' };
+  const index = readHubTasksIndex(hubRoot);
+  let task = index.tasks.find(item => item.id === taskId);
+  if (scope.newTaskTicket && task?.creation_turn_key !== scope.turnKey) {
+    if (task || index.next_task_id !== taskId) return { status: 'ticket_conflict' };
+    task = upsertHubTaskUnlocked(hubRoot, {
+      id: taskId, project_id: scope.projectId, title: user.slice(0, 120), birth_turn: turn,
+      project: scope.projectHint, creation_turn_key: scope.turnKey
+    }).task;
+  }
+  if (!task || task.project_id !== scope.projectId || task.status !== 'active') return { status: 'task_invalidated' };
+  const { appended } = appendHubTaskTurnPair(hubRoot, { taskId, projectId: scope.projectId, sessionId, turn, user, assistant });
+  const binding = current?.binding_epoch === scope.bindingEpoch ? current : writeSessionBindingUnlocked(hubRoot, sessionId, {
+    project_id: scope.projectId, task_id: taskId, source: scope.bindingSource,
+    bindingEpoch: scope.bindingEpoch, explicitPin: scope.explicitPin
+  });
+  return { status: 'archived', appended, taskId, binding };
+});
 
 export const bindHubRoutedTask = locked((hubRoot, { sessionId, taskId, projectId, source = 'cold_router_match', wake = false, at = new Date().toISOString() }) => {
   const paths = resolveHubPaths(hubRoot);
@@ -545,8 +577,14 @@ export const clearSessionBinding = locked(clearSessionBindingUnlocked);
 function clearSessionBindingUnlocked(hubRoot, sessionId) {
   const file = resolveHubPaths(hubRoot).sessionBindingFile(sessionId);
   if (!fs.existsSync(file)) return false;
-  fs.unlinkSync(file);
+  if (!readSessionBinding(hubRoot, sessionId)) return false;
+  writeClearedBinding(file, sessionId);
   return true;
+}
+
+function writeClearedBinding(file, sessionId) {
+  writeJsonAtomic(file, { session_id: sessionId, project_id: null, task_id: null, source: 'cleared',
+    binding_epoch: randomUUID(), explicit_pin: false, cleared: true, updated_at: new Date().toISOString() });
 }
 
 function clearBindingsForTask(hubRoot, taskId) {
@@ -557,7 +595,7 @@ function clearBindingsForTask(hubRoot, taskId) {
     const file = path.join(paths.sessionsDir, entry.name);
     try {
       const binding = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (binding.task_id === taskId) { fs.unlinkSync(file); count++; }
+      if (binding.task_id === taskId) { writeClearedBinding(file, binding.session_id); count++; }
     } catch { /* Doctor reports malformed session bindings; lifecycle must continue. */ }
   }
   return count;

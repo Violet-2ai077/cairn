@@ -17,6 +17,7 @@ import { createHubWriteCoordinator } from '../../workers/hub-write-coordinator.m
 import { readProjectsIndex } from '../../kernel/hub-store.mjs';
 import { listHubTaskPools, resolveTaskHeatPolicy, selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
+import { createHubTurnRuntime, hideHubStreamMarker, HUB_TURN_CONTRACT, resolveMidSessionPolicy } from './hub-turn-runtime.mjs';
 
 function createHubHostLlmClient(ctx, route) {
   return {
@@ -70,13 +71,37 @@ export async function createHubDshHost(ctx, config = {}) {
   const taskList = filter => listHubTaskPools(readHubTasksIndex(hubRoot).tasks, { policy: taskHeat })
     .filter(task => !filter || task.status === filter);
   const clientFor = route => config.llmClient ?? createHubHostLlmClient(ctx, route);
+  const midSession = resolveMidSessionPolicy(config.autopilot);
+  const turnRuntime = midSession.enabled ? createHubTurnRuntime({
+    hubRoot, policy: midSession, taskHeat, clientFor, maxTailChars: config.maxTailChars ?? 6000,
+    stripReminders: stripTrailingSystemReminders,
+    onArchive({ sessionId, turn, scope, taskId, user, assistant }) {
+      queueArchived({ sessionId, taskId, projectId: scope.projectId, project: scope.projectHint,
+        turn, sourceStep: `turn_${scope.turnKey}`, user, assistant, authoredUser: user, client: clientFor(scope.modelSelection) });
+    }
+  }) : null;
   const routeForTurn = (sessionId, turn) => {
     const entry = modelRoutes.get(sessionId);
     return entry && (entry.turn == null || entry.turn === turn) ? entry.route : null;
   };
   const sessionIdFrom = payload => payload?.agent?.session?.id ?? payload?.session?.id ?? payload?.sessionId ?? null;
   const cwdFrom = payload => payload?.agent?.session?.header?.cwd ?? payload?.session?.header?.cwd ?? payload?.header?.cwd ?? null;
-  const stateFor = sessionId => sessions.get(sessionId) ?? { selectedProjectId: null, taskId: null, route: null, cwdHint: null, bindingSource: null };
+  const stateFor = sessionId => {
+    const scoped = turnRuntime?.sessions.get(sessionId);
+    return scoped ? { ...scoped, taskId: scoped.selectedTaskId }
+      : sessions.get(sessionId) ?? { selectedProjectId: null, taskId: null, route: null, cwdHint: null, bindingSource: null };
+  };
+  function setExplicitCheckout(sessionId, task, source) {
+    const binding = writeSessionBinding(hubRoot, sessionId, { project_id: task.project_id, task_id: task.id, source });
+    if (turnRuntime) turnRuntime.syncBinding(sessionId, binding);
+    else sessions.set(sessionId, { ...stateFor(sessionId), selectedProjectId: task.project_id, taskId: task.id, bindingSource: source,
+      route: { result: 'explicit_binding', elapsed_ms: 0 } });
+  }
+  function clearCheckout(sessionId) {
+    clearSessionBinding(hubRoot, sessionId);
+    sessions.delete(sessionId);
+    turnRuntime?.syncBinding(sessionId);
+  }
   function enqueueSessionJob(sessionId, job) {
     const previous = sessionJobs.get(sessionId) ?? Promise.resolve();
     const next = previous.catch(() => {}).then(job).catch(() => {});
@@ -84,10 +109,31 @@ export async function createHubDshHost(ctx, config = {}) {
     next.finally(() => { pending.delete(next); if (sessionJobs.get(sessionId) === next) sessionJobs.delete(sessionId); });
     return next;
   }
+  function queueArchived({ sessionId, taskId, projectId, project, turn, sourceStep, user, assistant, authoredUser, client }) {
+    enqueueSessionJob(sessionId, async () => {
+      await workerLlmCallContext.run({ sessionId }, () => runHubStagingExtractor({
+        hubRoot, scope: projectId ? 'project' : 'user', projectId, project, turnInput: { turn, user, assistant },
+        authoredUserText: authoredUser, autopilot: config.autopilot, source_step: sourceStep,
+        actor_id: config.actorId ?? 'dsh-host', llmClient: client
+      }));
+      const current = readHubTasksIndex(hubRoot).tasks.find(item => item.id === taskId);
+      if (!current || current.status !== 'active') return;
+      const records = readHubTaskThread(hubRoot, taskId).slice(current.compacted_record_count);
+      const chars = records.reduce((sum, record) => sum + String(record.content ?? '').length, 0);
+      const minRecords = Number.isSafeInteger(config.autoCompactMinRecords) ? config.autoCompactMinRecords : 12;
+      const minChars = Number.isSafeInteger(config.autoCompactMinChars) ? config.autoCompactMinChars : 4500;
+      if ((minRecords > 0 && records.length >= minRecords) || (minChars > 0 && chars >= minChars)) {
+        await workerLlmCallContext.run({ sessionId }, () => compactionCoordinator.run({ taskId, source: 'auto', mode: 'incremental', llmClient: client }));
+      }
+    });
+  }
   function clearTaskSessionState(taskId) {
     for (const [sessionId, state] of sessions) {
       if (state.taskId !== taskId) continue;
       sessions.set(sessionId, { ...state, taskId: null, bindingSource: null, route: { result: 'task_lifecycle_changed', elapsed_ms: 0 } });
+    }
+    for (const [sessionId, state] of turnRuntime?.sessions ?? []) {
+      if (state.selectedTaskId === taskId) turnRuntime.syncBinding(sessionId);
     }
   }
   function readStatus() {
@@ -102,6 +148,7 @@ export async function createHubDshHost(ctx, config = {}) {
 
   if (ctx.systemPrompt?.context) {
     const stop = ctx.systemPrompt.context({ name: 'cairn:user-and-global-catalog', order: 300, interpolate: false, text: context => {
+      if (turnRuntime) return HUB_TURN_CONTRACT;
       const projects = new Map(readProjectsIndex(hubRoot).projects.map(project => [project.project_id, project.name]));
       const taskIndex = readHubTasksIndex(hubRoot);
       const { hot } = selectHubTaskPools(taskIndex.tasks, { policy: taskHeat });
@@ -113,6 +160,7 @@ export async function createHubDshHost(ctx, config = {}) {
     if (typeof stop === 'function') disposers.push(stop);
     const stopProject = ctx.systemPrompt.context({ name: 'cairn:locked-project-context', order: 310, interpolate: false, text: context => {
       const sessionId = sessionIdFrom(context);
+      if (turnRuntime) return sessionId ? turnRuntime.context(sessionId) : '';
       const state = sessionId ? stateFor(sessionId) : null;
       if (routingUnresolved(state)) {
         return 'Cairn 路由尚未确认。若用户想继续旧任务，请澄清目标；已关闭或归档的任务需显式重开。在目标未确认前输出 <|task:UNRESOLVED|>，不要新建任务。';
@@ -145,6 +193,11 @@ export async function createHubDshHost(ctx, config = {}) {
       const route = selection?.provider && selection?.model ? { provider: selection.provider, model: selection.model, sessionId } : null;
       if (route && (!modelRoutes.has(sessionId) || modelRoutes.get(sessionId).turn !== turnNumber)) {
         modelRoutes.set(sessionId, { turn: turnNumber, route });
+      }
+      if (turnRuntime) {
+        await turnRuntime.preStep(sessionId, payload, cwdFrom(payload));
+        if (payload.signal?.aborted) throw payload.signal.reason ?? new Error('Aborted');
+        return decision;
       }
       if (currentTurn && currentTurn.turn === turnNumber && !currentTurn.modelRoute) currentTurn.modelRoute = routeForTurn(sessionId, turnNumber);
       let state = stateFor(sessionId);
@@ -201,18 +254,31 @@ export async function createHubDshHost(ctx, config = {}) {
       return decision;
     }, { global: true });
     if (typeof stopPreStep === 'function') disposers.push(stopPreStep);
+    if (turnRuntime && config.stripMarkerInStream !== false) {
+      const stopStream = ctx.on('llm/stream', (request, next) => {
+        const entry = turnRuntime.turns.get(request?.sessionId);
+        const stream = next(request);
+        if (request?.purpose || !entry?.scope || entry.signal !== request.signal) return stream;
+        return hideHubStreamMarker(stream, entry);
+      }, { prepend: true, global: true });
+      if (typeof stopStream === 'function') disposers.push(stopStream);
+    }
     const stopFlush = ctx.on('session/flush', async session => {
-      if (workerLlmCallContext.getStore()) return;
       const id = session?.id ?? session?.sessionId;
+      if (id && workerLlmCallContext.getStore()?.sessionId === id) return;
       if (id && sessionJobs.has(id)) await sessionJobs.get(id);
       await compactionCoordinator.flush();
     }, { global: true });
     if (typeof stopFlush === 'function') disposers.push(stopFlush);
-    const stopDisposed = ctx.on('session/disposed', async session => { const id = session?.id ?? session?.sessionId; if (id && sessionJobs.has(id)) await sessionJobs.get(id); if (id) { sessions.delete(id); turns.delete(id); modelRoutes.delete(id); } }, { global: true });
+    const stopDisposed = ctx.on('session/disposed', async session => { const id = session?.id ?? session?.sessionId; if (id && sessionJobs.has(id)) await sessionJobs.get(id); if (id) { sessions.delete(id); turns.delete(id); modelRoutes.delete(id); turnRuntime?.turns.delete(id); turnRuntime?.sessions.delete(id); } }, { global: true });
     if (typeof stopDisposed === 'function') disposers.push(stopDisposed);
     const stopEvent = ctx.on('session/event', (session, event) => {
       const sessionId = session?.id ?? session?.sessionId;
       if (!sessionId || !event?.type) return;
+      if (turnRuntime) {
+        try { turnRuntime.event(sessionId, event); } catch { /* Rejected archival never enters the worker queue. */ }
+        return;
+      }
       const turn = event.type === 'turn/start' || !turns.has(sessionId)
         ? { turn: event.data?.turn ?? 1, user: '', authoredUser: '', assistant: '', modelRoute: routeForTurn(sessionId, event.data?.turn ?? 1) }
         : turns.get(sessionId);
@@ -248,23 +314,10 @@ export async function createHubDshHost(ctx, config = {}) {
         if (!appended) return;
         state.taskId = taskId; state.bindingSource = state.bindingSource ?? 'task_marker'; sessions.set(sessionId, state);
         writeSessionBinding(hubRoot, sessionId, { project_id: projectId, task_id: taskId, source: state.bindingSource });
-        const stagedTurn = { turn: turn.turn, user: turn.user.trim(), assistant: marker.answer };
         const client = clientFor(turn.modelRoute ?? routeForTurn(sessionId, turn.turn));
         const project = projectId && projectHint?.project_id === projectId ? projectHint : null;
-        enqueueSessionJob(sessionId, async () => {
-          await workerLlmCallContext.run({ sessionId }, () => runHubStagingExtractor({
-            hubRoot, scope: projectId ? 'project' : 'user', projectId, project, turnInput: stagedTurn,
-            authoredUserText: turn.authoredUser, autopilot: config.autopilot, source_step: `turn_${turn.turn}`,
-            actor_id: config.actorId ?? 'dsh-host', llmClient: client
-          }));
-          const current = readHubTasksIndex(hubRoot).tasks.find(item => item.id === taskId);
-          if (!current || current.status !== 'active') return;
-          const records = readHubTaskThread(hubRoot, taskId).slice(current.compacted_record_count);
-          const chars = records.reduce((sum, record) => sum + String(record.content ?? '').length, 0);
-          const minRecords = Number.isSafeInteger(config.autoCompactMinRecords) ? config.autoCompactMinRecords : 12;
-          const minChars = Number.isSafeInteger(config.autoCompactMinChars) ? config.autoCompactMinChars : 4500;
-          if ((minRecords > 0 && records.length >= minRecords) || (minChars > 0 && chars >= minChars)) await workerLlmCallContext.run({ sessionId }, () => compactionCoordinator.run({ taskId, source: 'auto', mode: 'incremental', llmClient: client }));
-        });
+        queueArchived({ sessionId, taskId, projectId, project, turn: turn.turn, sourceStep: `turn_${turn.turn}`,
+          user: turn.user.trim(), assistant: marker.answer, authoredUser: turn.authoredUser, client });
       } catch { /* Invalid task markers cannot produce cross-project writes. */ }
     }, { global: true });
     if (typeof stopEvent === 'function') disposers.push(stopEvent);
@@ -275,7 +328,7 @@ export async function createHubDshHost(ctx, config = {}) {
     const definitions = [
       { name: 'cairn_status', description: 'Read-only status of the centralized Cairn Hub.', parameters: { type: 'object', properties: {} }, async execute() { return JSON.stringify(readStatus()); } },
       { name: 'cairn_tasks', description: 'List active tasks and their derived routing pools in the centralized Cairn Hub.', parameters: { type: 'object', properties: {} }, async execute() { return JSON.stringify(taskList('active')); } },
-      { name: 'cairn_checkout', description: 'Preview or bind a task to this session. HUMAN AUTHORITY RED LINE: only bind when explicitly instructed.', parameters: { type: 'object', properties: { task_id: { type: 'integer' }, preview: { type: 'boolean' }, clear: { type: 'boolean' } } }, async execute(args = {}, runCtx = {}) { const id = runCtx.agent?.session?.id; if (!id) return 'session_id_unavailable'; if (args.clear) { clearSessionBinding(hubRoot, id); sessions.delete(id); return 'Session checkout cleared.'; } const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === args.task_id); if (!task) return `task_not_found:${args.task_id}`; const checkout = compileHubTaskCheckout({ hubRoot, taskId: task.id }); if (args.preview) return checkout.text; if (task.status !== 'active') return `task_not_active:${task.id}; reopen first`; writeSessionBinding(hubRoot, id, { project_id: task.project_id, task_id: task.id, source: 'tool_checkout' }); sessions.set(id, { ...stateFor(id), selectedProjectId: task.project_id, taskId: task.id, bindingSource: 'tool_checkout' }); return `Checked out task ${task.id}.`; } },
+      { name: 'cairn_checkout', description: 'Preview or bind a task to this session. HUMAN AUTHORITY RED LINE: only bind when explicitly instructed.', parameters: { type: 'object', properties: { task_id: { type: 'integer' }, preview: { type: 'boolean' }, clear: { type: 'boolean' } } }, async execute(args = {}, runCtx = {}) { const id = runCtx.agent?.session?.id; if (!id) return 'session_id_unavailable'; if (args.clear) { clearCheckout(id); return 'Session checkout cleared.'; } const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === args.task_id); if (!task) return `task_not_found:${args.task_id}`; const checkout = compileHubTaskCheckout({ hubRoot, taskId: task.id }); if (args.preview) return checkout.text; if (task.status !== 'active') return `task_not_active:${task.id}; reopen first`; setExplicitCheckout(id, task, 'tool_checkout'); return `Checked out task ${task.id}.`; } },
       { name: 'cairn_compact', description: 'Compact a task-local Hub history. HUMAN AUTHORITY RED LINE: only compact when explicitly instructed by the user.', parameters: { type: 'object', properties: { task_id: { type: 'integer' }, full: { type: 'boolean' }, confirmed: { type: 'boolean' } }, required: ['confirmed'] }, async execute(args = {}, runCtx = {}) { if (args.confirmed !== true) return 'Explicit confirmation required.'; const sessionId = runCtx.agent?.session?.id; const id = args.task_id ?? stateFor(sessionId).taskId; if (!id) return 'no_active_task'; const llmClient = clientFor(modelRoutes.get(sessionId)?.route); return JSON.stringify(await workerLlmCallContext.run({ sessionId }, () => compactionCoordinator.run({ taskId: id, source: 'manual', mode: args.full ? 'full' : 'incremental', llmClient }))); } },
       ...['close', 'archive', 'reopen'].map(action => ({ name: `cairn_${action}_task`, description: `Change task lifecycle with ${action}. HUMAN AUTHORITY RED LINE: only perform when explicitly instructed by the user.`, parameters: { type: 'object', properties: { task_id: { type: 'integer' }, confirmed: { type: 'boolean' } }, required: ['task_id', 'confirmed'] }, async execute(args = {}) { if (args.confirmed !== true) return 'Explicit confirmation required.'; const result = transitionHubTaskStatus(hubRoot, { taskId: args.task_id, action }); if (action !== 'reopen') clearTaskSessionState(args.task_id); return JSON.stringify(result); } })),
       { name: 'cairn_commit', description: 'Commit staged Hub decisions. HUMAN AUTHORITY RED LINE: only call on explicit user confirmation.', parameters: { type: 'object', properties: { scope: { type: 'string', enum: ['user', 'project'] }, project_id: { type: 'string' }, proposal_id: { type: 'string' }, confirmed: { type: 'boolean' } }, required: ['scope', 'confirmed'] }, async execute(args = {}) { if (args.confirmed !== true) return 'Explicit confirmation required.'; return JSON.stringify(await writeCoordinator.run({ scope: args.scope, projectId: args.project_id ?? null }, () => commitScopedStaged(hubRoot, { scope: args.scope, projectId: args.project_id ?? null, proposal_id: args.proposal_id }))); } },
@@ -309,15 +362,14 @@ export async function createHubDshHost(ctx, config = {}) {
       }
       if (args[0] === 'checkout') {
         if (!sessionId) return { kind: 'error', text: 'session_id_unavailable' };
-        if (args[1] === '--clear') { clearSessionBinding(hubRoot, sessionId); sessions.delete(sessionId); return { kind: 'success', text: 'Session checkout cleared.' }; }
+        if (args[1] === '--clear') { clearCheckout(sessionId); return { kind: 'success', text: 'Session checkout cleared.' }; }
         const id = Number(args[1]);
         const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === id);
         if (!task) return { kind: 'error', text: `task_not_found:${id}` };
         if (task.status !== 'active' && !args.includes('--preview')) return { kind: 'error', text: `task_not_active:${id}; reopen first` };
         const checkout = compileHubTaskCheckout({ hubRoot, taskId: id });
         if (args.includes('--preview')) return { kind: 'success', text: checkout.text };
-        writeSessionBinding(hubRoot, sessionId, { project_id: task.project_id, task_id: id, source: 'slash_checkout' });
-        sessions.set(sessionId, { ...stateFor(sessionId), selectedProjectId: task.project_id, taskId: id, bindingSource: 'slash_checkout', route: { result: 'explicit_binding', elapsed_ms: 0 } });
+        setExplicitCheckout(sessionId, task, 'slash_checkout');
         return { kind: 'success', text: `Checked out task ${id}.` };
       }
       if (args[0] === 'compact') {
@@ -347,7 +399,7 @@ export async function createHubDshHost(ctx, config = {}) {
       if (args[0] === 'inspect') {
         const state = stateFor(sessionId);
         const fingerprint = state.selectedProjectId ? `ws_${crypto.createHash('sha256').update(state.selectedProjectId).digest('hex').slice(0, 8)}` : null;
-        return { kind: 'success', text: JSON.stringify({ hub_initialized: isHubInitialized(hubRoot), workspace_fingerprint: fingerprint, cwd_hint_mode: state.cwdHint ? 'git_project_hint' : 'general', selected_project_fingerprint: fingerprint, binding_source: state.bindingSource, last_route: state.route, auto_compaction: state.taskId ? compactionCoordinator.getTaskStatus(state.taskId) : { status: 'idle' }, session_id_present: Boolean(sessionId) }, null, 2) };
+        return { kind: 'success', text: JSON.stringify({ hub_initialized: isHubInitialized(hubRoot), workspace_fingerprint: fingerprint, cwd_hint_mode: state.cwdHint ? 'git_project_hint' : 'general', selected_project_fingerprint: fingerprint, binding_source: state.bindingSource, explicit_pin: state.explicitPin === true, pending_switch: state.pendingSwitch ?? null, last_route: state.route, auto_compaction: state.taskId ? compactionCoordinator.getTaskStatus(state.taskId) : { status: 'idle' }, session_id_present: Boolean(sessionId) }, null, 2) };
       }
       if (args[0] === 'tasks') {
         const showAll = args[1] === '--all' && args.length === 2;
@@ -359,5 +411,5 @@ export async function createHubDshHost(ctx, config = {}) {
     } });
     if (typeof stop === 'function') disposers.push(stop);
   }
-  return { hubRoot, sessions, dispose: async () => { while (pending.size) await Promise.allSettled([...pending]); await Promise.all([compactionCoordinator.flush(), writeCoordinator.flush()]); for (const stop of disposers) { try { stop(); } catch {} } sessions.clear(); turns.clear(); modelRoutes.clear(); } };
+  return { hubRoot, sessions: turnRuntime?.sessions ?? sessions, dispose: async () => { while (pending.size) await Promise.allSettled([...pending]); await Promise.all([compactionCoordinator.flush(), writeCoordinator.flush()]); for (const stop of disposers) { try { stop(); } catch {} } sessions.clear(); turns.clear(); modelRoutes.clear(); turnRuntime?.sessions.clear(); turnRuntime?.turns.clear(); } };
 }

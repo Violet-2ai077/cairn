@@ -30,6 +30,11 @@
             dormantMaxCandidates: 5
             # One deadline for both routing stages, in milliseconds.
             routeTimeoutMs: 2500
+          midSessionSwitch:
+            enabled: true
+            # Native transcript still contains earlier project messages.
+            crossProject: false
+            routeTimeoutMs: 2500
         # Optional explicit out-of-band worker model overrides:
         # workerProvider: 'deepseek'
         # workerModel: 'deepseek-chat'

@@ -22,11 +22,235 @@ function mockCtx() {
   };
 }
 
+test('Slice C keeps a turn-scoped checkout, does not route follow-ups, and only trusts the completed step marker', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-scope-'));
+  const ctx = mockCtx();
+  let routeCalls = 0;
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async req => {
+    if (req.system.startsWith('Route the opening')) routeCalls++;
+    return { ok: true, content: '{"ops":[]}' };
+  } } });
+  const s = { id: 'scope' };
+  const pre = ctx.handlers.get('agent/pre-step');
+  const emit = (type, data) => ctx.handlers.get('session/event')(s, { type, surfaceOp: 'append', data });
+  const step = (turn, step, text) => pre({ session: s, turn, step, messages: text ? [{ source: { kind: 'user' }, content: text }] : [] }, async () => ({ kind: 'enter' }));
+  const assistant = (turn, step, content) => emit('assistant/message', { turn, step, message: { content } });
+  try {
+    for (const id of [1, 2]) {
+      upsertHubTask(hub, { id, project_id: 'p_same', title: `Task ${id}` });
+      appendHubTaskTurn(hub, { task_id: id, project_id: 'p_same', content: `checkout sentinel ${id}`, timestamp: '2000-01-01T00:00:00Z' });
+    }
+    writeSessionBinding(hub, s.id, { task_id: 1, project_id: 'p_same', source: 'slash_checkout' });
+    emit('turn/start', { turn: 1 });
+    await step(1, 1, 'ordinary follow-up');
+    const initial = ctx.contexts[1].text({ session: s });
+    assert.match(initial, /checkout sentinel 1/u);
+    emit('user/message', { source: { kind: 'runtime-context' }, content: 'synthetic echo' });
+    assistant(1, 1, [{ type: 'text', text: 'intermediate\n<|task:2|>' }, { type: 'tool-call', id: 't' }]);
+    await step(1, 2);
+    assert.equal(ctx.contexts[1].text({ session: s }), initial);
+    assistant(1, 2, 'done\n<|task:1|>');
+    emit('turn/end', { turn: 1, reason: { kind: 'completed' } });
+    assert.deepEqual(readHubTaskThread(hub, 1).slice(-2).map(rec => rec.content), ['ordinary follow-up', 'done']);
+    assert.equal(readHubTaskThread(hub, 2).length, 1);
+    emit('turn/start', { turn: 2 });
+    await step(2, 1, 'another follow-up');
+    assert.equal(ctx.contexts[1].text({ session: s }), initial);
+    assistant(2, 1, 'wrong\n<|task:2|>');
+    emit('turn/end', { turn: 2, reason: { kind: 'completed' } });
+    assert.equal(readSessionBinding(hub, s.id).task_id, 1);
+    assert.equal(readHubTaskThread(hub, 2).length, 1);
+    assert.equal(host.sessions.get(s.id).pendingSwitch.taskId, 2);
+    assert.equal(host.sessions.get(s.id).explicitPin, true);
+    emit('turn/start', { turn: 3 });
+    await step(3, 1, 'Continue task #2');
+    assert.match(ctx.contexts[1].text({ session: s }), /checkout sentinel 2/u);
+    assistant(3, 1, 'resumed\n<|task:2|>');
+    emit('turn/end', { turn: 3, reason: { kind: 'completed' } });
+    assert.equal(readSessionBinding(hub, s.id).task_id, 2);
+    assert.equal(readSessionBinding(hub, s.id).explicit_pin, false);
+    assert.equal(routeCalls, 0);
+    await ctx.handlers.get('session/flush')(s);
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+function scopedSession(ctx, id) {
+  const session = { id };
+  const emit = (type, data) => ctx.handlers.get('session/event')(session, { type, surfaceOp: 'append', data });
+  return {
+    session, emit,
+    start(turn, input, opts = {}) {
+      emit('turn/start', { turn });
+      return ctx.handlers.get('agent/pre-step')({
+        session, turn, step: 1, signal: opts.signal, modelSelection: { provider: 'probe', model: opts.model ?? 'test' },
+        messages: [{ source: { kind: opts.source ?? 'user' }, content: input }]
+      }, async () => ({ kind: opts.reject ? 'reject' : 'enter' }));
+    },
+    end(turn, text, kind = 'completed') {
+      emit('assistant/message', { turn, step: 1, message: { content: text } });
+      emit('turn/end', { turn, reason: { kind } });
+    },
+    view: () => ctx.contexts[1].text({ session }),
+    slash: rawInput => ctx.registeredCommands[0].handler({ rawInput, agent: { session } })
+  };
+}
+
+test('Slice C dormant cross-project switch is opt-in, binds after confirmation, and old workers keep their scoped ledger', async () => {
+  for (const crossProject of [false, true]) {
+    const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-scope-cross-'));
+    const ctx = mockCtx();
+    const a = scopedSession(ctx, 'cross');
+    let release;
+    const wait = new Promise(resolve => { release = resolve; });
+    let oldStarted;
+    const started = new Promise(resolve => { oldStarted = resolve; });
+    let routes = 0;
+    const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true, midSessionSwitch: { crossProject } }, llmClient: { complete: async request => {
+      const text = request.messages[0].content;
+      if (request.system.startsWith('Route the opening')) {
+        routes++;
+        return { ok: true, content: routes === 1 ? '{"decision":"new","task_id":null}' : '{"decision":"match","task_id":2,"project_id":"p_beta"}' };
+      }
+      const old = text.includes('older project input');
+      if (old) { oldStarted(); await wait; }
+      await ctx.handlers.get('session/flush')(a.session);
+      return { ok: true, content: JSON.stringify({ ops: [{ op: 'ASSERT', key: old ? 'alpha' : 'beta', option_code: 'keep', summary: 'Test' }] }) };
+    } } });
+    try {
+      upsertHubTask(hub, { id: 1, project_id: 'p_alpha', title: 'Alpha work' });
+      appendHubTaskTurn(hub, { task_id: 1, project_id: 'p_alpha', content: 'Alpha private checkout' });
+      upsertHubTask(hub, { id: 2, project_id: 'p_beta', title: 'Kafka migration' });
+      appendHubTaskTurn(hub, { task_id: 2, project_id: 'p_beta', content: 'Beta private checkout', timestamp: '2000-01-01T00:00:00Z' });
+      await a.slash('checkout 1');
+      await a.start(1, 'older project input');
+      a.end(1, 'first\n<|task:1|>');
+      await started;
+      await a.start(2, 'Switch to Kafka migration');
+      assert.equal(routes, 2);
+      assert.doesNotMatch(a.view(), /Alpha private checkout/u);
+      assert.equal(readSessionBinding(hub, 'cross').task_id, 1);
+      if (crossProject) assert.match(a.view(), /Beta private checkout/u);
+      else assert.doesNotMatch(a.view(), /Beta private checkout/u);
+      a.end(2, 'switch answer\n<|task:2|>');
+      release();
+      await ctx.handlers.get('session/flush')(a.session);
+      assert.equal(readSessionBinding(hub, 'cross').task_id, crossProject ? 2 : 1);
+      assert.equal(readHubTaskThread(hub, 2).length, crossProject ? 3 : 1);
+      assert.equal(readHubTasksIndex(hub).tasks[1].last_activity_at !== '2000-01-01T00:00:00Z', crossProject);
+      const { readScopedStaged } = await import('../src/kernel/hub-store.mjs');
+      assert.deepEqual(readScopedStaged(hub, { scope: 'project', projectId: 'p_alpha' }).proposals.map(p => p.ops[0].key), ['alpha']);
+      assert.deepEqual(readScopedStaged(hub, { scope: 'project', projectId: 'p_beta' }).proposals.map(p => p.ops[0].key), crossProject ? ['beta'] : []);
+    } finally { release(); await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+  }
+});
+
+test('Slice C rejects a competing new-task ticket, wrong new marker, aborted/rejected turns, and synthetic-only inputs', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-scope-ticket-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } });
+  try {
+    const a = scopedSession(ctx, 'ticket-a');
+    const b = scopedSession(ctx, 'ticket-b');
+    const c = scopedSession(ctx, 'ticket-c');
+    await c.start(1, 'synthetic', { source: 'runtime-context' }); c.end(1, 'fake\n<|task:1|>');
+    await c.start(2, 'rejected', { reject: true }); c.end(2, 'fake\n<|task:1|>');
+    const ctl = new AbortController();
+    await c.start(3, 'cancelled', { signal: ctl.signal }); ctl.abort(); c.end(3, 'fake\n<|task:1|>', 'aborted');
+    await c.start(4, 'wrong ticket'); c.end(4, 'fake\n<|task:7|>');
+    assert.equal(readHubTasksIndex(hub).tasks.length, 0);
+    assert.equal(readSessionBinding(hub, 'ticket-c'), null);
+    await Promise.all([a.start(1, 'winner'), b.start(1, 'loser')]);
+    assert.match(a.view(), /Required tail marker.*<\|task:1\|>/u);
+    assert.match(b.view(), /Required tail marker.*<\|task:1\|>/u);
+    a.end(1, 'won\n<|task:1|>');
+    b.end(1, 'lost\n<|task:1|>');
+    assert.equal(readSessionBinding(hub, 'ticket-b'), null);
+    assert.deepEqual(readHubTaskThread(hub, 1).map(rec => rec.content), ['winner', 'won']);
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('Slice C refreshes ledger revisions without recompiling checkout, rejects ABA epoch, and repairs a half-written confirmed turn', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-scope-epoch-'));
+  const ctx = mockCtx();
+  let calls = 0;
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () => { calls++; return { ok: true, content: '{"ops":[]}' }; } } });
+  try {
+    const a = scopedSession(ctx, 'epoch');
+    const b = scopedSession(ctx, 'aba');
+    upsertHubTask(hub, { id: 1, title: 'General task' });
+    appendHubTaskTurn(hub, { task_id: 1, turn: 1, role: 'user', content: 'half', meta: { dsh_session_id: 'epoch' } });
+    await a.slash('checkout 1');
+    await a.start(1, 'half');
+    a.end(1, 'finished\n<|task:1|>');
+    await ctx.handlers.get('session/flush')(a.session);
+    assert.equal(calls, 1);
+    assert.deepEqual(readHubTaskThread(hub, 1).map(rec => rec.content), ['half', 'finished']);
+    const { proposal } = stageScopedOperators(hub, { ops: [{ op: 'ASSERT', key: 'policy', option_code: 'new', summary: 'Authority revision sentinel' }] });
+    commitScopedStaged(hub, { proposal_id: proposal.proposal_id });
+    await a.start(2, 'follow-up');
+    assert.match(a.view(), /Authority revision sentinel/u);
+    assert.doesNotMatch(a.view(), /finished|Current Project Ledger/u);
+    await b.start(1, 'Continue task #1');
+    await b.slash('checkout 1');
+    await b.slash('checkout --clear');
+    b.end(1, 'intervened\n<|task:1|>');
+    assert.equal(readSessionBinding(hub, 'aba'), null);
+    assert.equal(readHubTaskThread(hub, 1).length, 2);
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('Slice C hides a split stream marker, scopes it to its turn/step, and never touches worker chunks', async () => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-scope-stream-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } });
+  try {
+    const a = scopedSession(ctx, 'stream');
+    const ctl = new AbortController();
+    await a.start(1, 'authored\n<system-reminder>do not archive</system-reminder>', { signal: ctl.signal });
+    const next = async function* () {
+      yield { type: 'text-delta', index: 0, text: 'Done\n<|ta' };
+      yield { type: 'text-delta', index: 0, text: 'sk:1|>' };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Done\n<|task:1|>' } };
+    };
+    const collect = async purpose => {
+      const chunks = [];
+      for await (const chunk of ctx.handlers.get('llm/stream')({ sessionId: 'stream', purpose, signal: ctl.signal }, next)) chunks.push(chunk);
+      return chunks;
+    };
+    assert.match((await collect('cairn-worker')).at(-1).block.text, /<\|task:1\|>/u);
+    assert.equal((await collect(undefined)).at(-1).block.text, 'Done');
+    a.end(1, 'Done');
+    assert.deepEqual(readHubTaskThread(hub, 1).map(rec => rec.content), ['authored', 'Done']);
+    await a.start(2, 'marker absent', { signal: ctl.signal });
+    a.end(2, 'Done');
+    assert.equal(readHubTaskThread(hub, 1).length, 2);
+  } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+});
+
+test('Slice C honors both off switches even with crossProject enabled', async () => {
+  for (const autopilot of [{ enabled: false, midSessionSwitch: { crossProject: true } },
+    { enabled: true, midSessionSwitch: { enabled: false, crossProject: true } }]) {
+    const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-scope-disabled-'));
+    const ctx = mockCtx();
+    const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot, llmClient: { complete: async () => assert.fail('off must not route bound session') } });
+    try {
+      upsertHubTask(hub, { id: 1, project_id: 'p_a' });
+      upsertHubTask(hub, { id: 2, project_id: 'p_b' });
+      const a = scopedSession(ctx, 'disabled');
+      await a.slash('checkout 1');
+      await a.start(1, 'Continue task #2');
+      assert.doesNotMatch(a.view(), /project_id="p_b"/u);
+      assert.equal(readSessionBinding(hub, 'disabled').task_id, 1);
+      assert.equal(ctx.handlers.has('llm/stream'), false);
+    } finally { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); }
+  }
+});
+
 test('Hub budgets its catalog and routes only the current authored input; dormant checkout mounts in the wake turn', async () => {
   const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-host-heat-'));
   const ctx = mockCtx();
   const calls = [];
-  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true, taskHeat: { hotMaxTasks: 1 } },
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true, taskHeat: { hotMaxTasks: 1 }, midSessionSwitch: { enabled: false } },
     llmClient: { complete: async request => {
       calls.push(request);
       return { ok: true, content: calls.length === 1 ? '{"decision":"new","task_id":null}' : '{"decision":"match","task_id":2,"project_id":"p_old"}' };
@@ -68,7 +292,7 @@ test('Hub rechecks lifecycle when a dormant task closes between the router and w
   const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-host-wake-race-'));
   const ctx = mockCtx();
   const host = await createHubDshHost(ctx, {
-    storeRoot: hub, autopilot: { enabled: true },
+    storeRoot: hub, autopilot: { enabled: true, midSessionSwitch: { enabled: false } },
     llmClient: { complete: async () => {
       transitionHubTaskStatus(hub, { taskId: 1, action: 'close' });
       return { ok: true, content: '{"decision":"match","task_id":1,"project_id":"p_old"}' };
@@ -194,7 +418,7 @@ test('Hub passes only authored user evidence to enabled Project auto-commit', as
   const ctx = mockCtx();
   const proof = 'Use Redis';
   const result = { ops: [{ op: 'ASSERT', key: 'cache', option_code: 'redis', summary: 'Use Redis' }], evidence: [{ op_index: 0, user_quote: proof }] };
-  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () => ({ ok: true, content: JSON.stringify(result) }) } });
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true, midSessionSwitch: { enabled: false } }, llmClient: { complete: async () => ({ ok: true, content: JSON.stringify(result) }) } });
   try {
     fs.mkdirSync(cwd);
     execFileSync('git', ['init', '-q'], { cwd });
