@@ -12,6 +12,26 @@ const reason = 'npm fails the workspace install';
 export const name = 'cairn-smoke-provider';
 export const inject = ['llm', 'compaction', 'tools', 'commands'];
 export function apply(ctx) {
+  if (phase.startsWith('marker-')) ctx.on('session/event', (_session, e) => {
+    if (e.type === 'assistant/message' && e.surfaceOp === 'append') {
+      log({ markerBlocks: e.data.message.content.filter(b => b.type === 'text').map(b => b.text) });
+    }
+  }, { global: true });
+  if (phase === 'marker-hub') {
+    let active, completed = false, checked = false;
+    ctx.on('agent/created', ({ agent }) => { active = agent; }, { global: true });
+    ctx.on('session/event', (session, e) => {
+      if (session === active?.session && e.type === 'turn/end') completed = true;
+    }, { global: true });
+    ctx.on('session/flush', async session => {
+      if (!completed || checked || active?.status !== 'idle' || session !== active.session) return;
+      checked = true;
+      for (const command of ['commit proj', 'drop proj', 'archive 1', 'unknown']) {
+        const executed = await ctx.commands.execute(active, '/cairn ' + command, [], new AbortController().signal);
+        log({ slash: command, result: executed?.result.kind });
+      }
+    }, { global: true });
+  }
   if (phase === 'file-write-crash') {
     ctx.on('session/event', (session, e) => {
       if (e.type === 'tool/call' || e.type === 'tool/result') log({ event: e.type, seq: e.seq, turn: e.data.turn,
@@ -83,6 +103,17 @@ export function apply(ctx) {
         text = JSON.stringify(['a', 'b'].includes(phase) ? { ops: [op], evidence: [{ op_index: 0,
           user_quote: 'Use ' + op.option_code, ...(phase === 'b' && { falsification_quote: reason }) }] } : { ops: [] });
       } else if (req.purpose) text = 'CSV work';
+      else if (phase.startsWith('marker-')) {
+        const id = phase === 'marker-compat-continue' ? 2 : 1;
+        const answer = '  ' + 'Long result '.repeat(9).trimEnd() + '.';
+        for (const [index, parts] of [['First paragraph.'], [answer, ' '.repeat(90) + '\n<|ta', 'sk:' + id + '|>' + ' '.repeat(70)]].entries()) {
+          yield { type: 'block-start', index, blockType: 'text' };
+          for (const text of parts) yield { type: 'text-delta', index, text };
+          yield { type: 'block-end', index, block: { type: 'text', text: parts.join('') } };
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
       else {
         const task = Number(/Required tail marker for this request: <\|task:(\d+)\|>/u.exec(snapshot)?.[1]);
         const ledger = JSON.parse(/### Current Project Ledger[^\n]*\n(\{[\s\S]*?\n\})/u.exec(snapshot)?.[1] ?? '{}');

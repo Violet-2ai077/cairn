@@ -4,6 +4,8 @@
 // via AbortSignal.any), redacts Authorization headers, and retries ONLY transport-layer errors (HTTP 408/429/5xx,
 // timeout, or socket failure) with zero semantic/format retries.
 
+import { setTimeout as delay } from 'node:timers/promises';
+
 const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
 function normalizeChatCompletionsEndpoint(apiBase) {
@@ -16,9 +18,10 @@ function normalizeChatCompletionsEndpoint(apiBase) {
   return `${trimmed}/chat/completions`;
 }
 
-function sleepAsync(ms) {
-  if (ms <= 0) return Promise.resolve();
-  return new Promise(resolve => setTimeout(resolve, ms));
+async function sleepAsync(ms, signal) {
+  if (ms <= 0 || signal?.aborted) return;
+  try { await delay(ms, undefined, { signal }); }
+  catch (error) { if (!signal?.aborted) throw error; }
 }
 
 /**
@@ -133,7 +136,7 @@ export function createOpenAICompatibleClient(config = {}) {
           const isRetryableStatus = RETRYABLE_HTTP_STATUSES.has(response.status);
           if (isRetryableStatus && attempt < maxTransportRetries) {
             transportRetries++;
-            await sleepAsync(retryDelayMs * Math.pow(2, attempt));
+            await sleepAsync(retryDelayMs * Math.pow(2, attempt), signal);
             continue;
           }
 
@@ -158,7 +161,11 @@ export function createOpenAICompatibleClient(config = {}) {
           return httpErrRes;
         }
 
-        const payload = await response.json();
+        let payload;
+        try { payload = await response.json(); }
+        catch (error) {
+          if (!(error instanceof SyntaxError) || effectiveSignal.aborted) throw error;
+        }
         const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null;
         const message = choice?.message;
 
@@ -166,7 +173,7 @@ export function createOpenAICompatibleClient(config = {}) {
           const invalidPayloadRes = {
             ok: false,
             error_code: 'invalid_response_payload',
-            error_message: 'Response missing choices[0].message.content string',
+            error_message: payload === undefined ? 'Response is not JSON' : 'Response missing choices[0].message.content string',
             status: response.status,
             latency_ms: Date.now() - startTime,
             transport_retries: transportRetries,
@@ -212,7 +219,7 @@ export function createOpenAICompatibleClient(config = {}) {
 
         if (attempt < maxTransportRetries) {
           transportRetries++;
-          await sleepAsync(retryDelayMs * Math.pow(2, attempt));
+          await sleepAsync(retryDelayMs * Math.pow(2, attempt), signal);
           continue;
         }
 

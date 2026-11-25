@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -26,6 +26,53 @@ import {
   writeJsonAtomic
 } from '../src/kernel/index.mjs';
 import { runCairnCli, runCairnCliAsync } from '../bin/cairn.mjs';
+
+test('a Legacy writer exits after append: the next commit is blocked until repair and never reapplies a consumed proposal', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-commit-crash-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  initCairnStore(root);
+  const paths = resolveCairnPaths(root);
+  const op = key => ({ op: 'ASSERT', scope: 'global', key, option_code: 'yes', summary: 'yes' });
+  stageOperators(root, { ops: [op('first')] });
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+    import fs from 'node:fs';
+    import { commitStaged, resolveCairnPaths } from ${JSON.stringify(new URL('../src/kernel/store.mjs', import.meta.url).href)};
+    const root = process.argv[1];
+    const ledger = resolveCairnPaths(root).ledgerFile;
+    const append = fs.appendFileSync;
+    fs.appendFileSync = (file, ...args) => {
+      append(file, ...args);
+      if (file === ledger) process.exit(27);
+    };
+    commitStaged(root);
+  `, root], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(child.status, 27, child.error?.message ?? child.stderr);
+  assert.equal(readHead(root).revision, 0);
+  assert.equal(readLedgerLog(root).length, 1);
+  assert.equal(readStaged(root).proposals.length, 1);
+  assert.ok(fs.existsSync(path.join(paths.cairnDir, '.write.lock.guard')));
+  const next = stageOperators(root, { ops: [op('second')] }).proposal.proposal_id;
+  assert.throws(() => commitStaged(root, { proposal_id: next }), /ledger_replay_required/u);
+  assert.equal(readLedgerLog(root).length, 1);
+  assert.equal(replayLedger(root, { repairHead: true }).valid, true);
+  assert.equal(commitStaged(root, { rebase: true }).committed, true);
+  assert.deepEqual(readLedgerLog(root).map(r => r.base_revision), [0, 1]);
+  assert.equal(replayLedger(root).valid, true);
+});
+
+test('Legacy CLI writers serialize commits to the same store', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-shared-workspace-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  initCairnStore(root);
+  const proposals = ['first', 'second', 'third'].map(key =>
+    stageOperators(root, { ops: [{ op: 'ASSERT', scope: 'global', key, option_code: 'yes', summary: 'yes' }] }).proposal.proposal_id);
+  await Promise.all(proposals.map(id => new Promise((resolve, reject) =>
+    execFile(process.execPath, [CLI_BIN_PATH, 'commit', id, '--rebase', '--cwd', root], { timeout: 10000 },
+      (error, stdout, stderr) => error ? reject(new Error(stdout + stderr, { cause: error })) : resolve()))));
+  assert.deepEqual(readLedgerLog(root).map(r => r.base_revision), [0, 1, 2]);
+  assert.equal(readStaged(root).proposals.length, 0);
+  assert.equal(replayLedger(root).valid, true);
+});
 
 const CLI_BIN_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),

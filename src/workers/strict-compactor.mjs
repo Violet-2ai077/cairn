@@ -219,8 +219,10 @@ export async function runStrictCompactor({
   }
 
   const writeRes = writeTaskCompaction(workspaceRoot, id, summaryText, {
-    compactedRecordCount: allRecords.length
+    compactedRecordCount: allRecords.length,
+    expected: { count: prevCompactedCount, markdown: existingCompact }
   });
+  if (!writeRes) return { ok: false, skipped: true, reason: 'compaction_superseded', task_id: id, llm_called: true };
 
   return {
     ok: true,

@@ -87,7 +87,7 @@ Every workspace managed by Cairn stores its state in a human-inspectable, plain-
 1. **Host-Exclusive IDs**: Models never invent `D1` or `Q1` handles. Only `foldLedger()` in `src/kernel/ledger.mjs` allocates `D<n>` and `Q<n>` upon commit.
 2. **Tombstone Provenance**: When an active decision `D1` is superseded by `D2`, `D1` is never deleted; it moves to `tombstones` with `superseded_by: "D2"` and the objective falsification `reason`.
 3. **Optimistic Concurrency (`actor_id` + `base_revision`)**: Every fold accepts an optional `actor_id` (default `"default"`) and `base_revision`. If `base_revision !== currentLedger.revision`, `foldLedger` rejects the commit with `conflict: true` rather than silently overwriting a concurrent worker's state.
-4. **Crash-Safe Commit Write Ordering**: `commitStaged()` in `src/kernel/store.mjs` persists each accepted proposal strictly in order: (1) append commit record to `ledger.jsonl`, (2) atomically overwrite `head.json`, (3) atomically update `staged.json` (preserving monotonic `next_proposal_seq`).
+4. **Commit Write Ordering**: Legacy `commitStaged()` holds the local store lock, checks replay, then (1) appends and flushes `ledger.jsonl`, (2) atomically replaces `head.json`, (3) atomically replaces `staged.json`. An interrupted commit with a stale head blocks new commits until explicit replay/repair. Previously committed staged IDs are not applied again. Temporary files are flushed before rename; this is not a cross-file transaction or a guarantee against power loss.
 
 ---
 
@@ -113,7 +113,7 @@ cairn/
             └── index.mjs
 ```
 
-- **Layer 1 (`src/kernel/`)** has **zero network calls, zero file I/O, zero LLM calls, and zero host runtime imports**. It can be unit-tested in milliseconds via `node --test`.
+- **Layer 1 (`src/kernel/`)** has **zero network calls, zero LLM calls, and zero host runtime imports**. Pure folds and contracts are separate from local filesystem persistence and verification.
 - **Layer 2 (`src/workers/`)** wraps the prompt contracts from `src/kernel/contracts.mjs` around an OpenAI-compatible completion client and `.cairn/` disk persistence. It runs out-of-band so primary user responses incur zero latency penalty.
 - **Layer 3 (`src/hosts/<host>/`)** bridges a specific agent host (starting with `dsh`, see [`docs/dsh-host-interface.md`](dsh-host-interface.md)) to Cairn's workers and kernel. Supporting additional runtimes (e.g., Claude Code, Codex, custom CLI harnesses) only adds a sibling folder under `src/hosts/`.
 

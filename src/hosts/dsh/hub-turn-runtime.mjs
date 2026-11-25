@@ -317,51 +317,72 @@ export async function* hideHubStreamMarker(stream, entry, { strip = true, footer
   const previousText = [];
   let toolCall = false;
   let held;
-  function* finishBlock(note) {
-    const { chunk, marker, fullMarker, sent, metadata } = held;
-    const text = marker.answer + note + (strip ? '' : '\n<|task:' + marker.task_number + '|>');
-    entry.streamMarkers.set(step, { ...fullMarker, display_text: [...previousText, text].join('\n').trim() });
+
+  function* finishBlock(terminal, stop) {
+    const { chunk, sent, metadata, deltaOnly } = held;
+    const raw = chunk.block.text;
+    const rawText = [...previousText, raw].join('\n');
+    const marker = terminal ? parseTaskMarker(rawText) : null;
+    let text = raw;
+    if (marker?.valid) {
+      const addFooter = stop && footer && marker.task_number === (entry.scope?.taskId ?? entry.scope?.newTaskTicket?.taskId);
+      if (strip || addFooter) {
+        // Only the final block changes; preserve its leading whitespace and already streamed prefix.
+        const body = raw.slice(0, raw.lastIndexOf('<|task:')).trimEnd();
+        const candidate = body + (addFooter ? footer : '') + (strip ? '' : '\n<|task:' + marker.marker + '|>');
+        if (candidate.startsWith(raw.slice(0, sent))) {
+          text = candidate;
+        }
+      }
+    }
+    if (marker?.valid) entry.streamMarkers.set(step, { ...marker, rawText, display_text: [...previousText, text].join('\n').trim() });
     if (text.length > sent) yield { type: 'text-delta', index: chunk.index, text: text.slice(sent) };
-    yield { ...chunk, block: { ...chunk.block, text } };
+    if (!deltaOnly) yield { ...chunk, block: { ...chunk.block, text } };
     yield* metadata;
-    previousText.push(chunk.block.text);
+    previousText.push(raw);
     held = null;
   }
+
+  function* flushDeltas() {
+    if (blocks.size === 1) {
+      const [index, { raw, sent }] = blocks.entries().next().value;
+      held = { chunk: { index, block: { text: raw } }, sent, metadata: [], deltaOnly: true };
+      yield* finishBlock(true, false);
+    } else {
+      for (const [index, { raw, sent }] of blocks) if (raw.length > sent) yield { type: 'text-delta', index, text: raw.slice(sent) };
+    }
+    blocks.clear();
+  }
+
   for await (const chunk of stream) {
+    if (!chunk || typeof chunk !== 'object') { yield chunk; continue; }
     if (held && chunk.type === 'usage') { held.metadata.push(chunk); continue; }
-    if (held) yield* finishBlock(!toolCall && chunk.type === 'finish' && chunk.reason?.kind === 'stop' ? footer : '');
     if (chunk.blockType === 'tool-call' || chunk.block?.type === 'tool-call') toolCall = true;
+    if (held) yield* finishBlock(chunk.type === 'finish', !toolCall && chunk.reason?.kind === 'stop');
     if (chunk.type === 'text-delta') {
       const block = blocks.get(chunk.index) ?? { raw: '', sent: 0 };
       block.raw += chunk.text;
       blocks.set(chunk.index, block);
-      const end = Math.max(block.sent, block.raw.length - 64);
+      const trimmed = block.raw.trimEnd();
+      const start = trimmed.lastIndexOf('<');
+      const suffix = start < 0 ? '' : trimmed.slice(start);
+      const possibleMarker = suffix && ('<|task:'.startsWith(suffix) || /^<\|task:[0-9A-Z]{0,10}\|?>?$/u.test(suffix));
+      const safe = (possibleMarker ? trimmed.slice(0, start).trimEnd() : trimmed).length;
+      const end = Math.max(block.sent, Math.min(safe, block.raw.length - 64));
       if (end > block.sent) yield { ...chunk, text: block.raw.slice(block.sent, end) };
       block.sent = end;
       continue;
     }
     if (chunk.type === 'block-end' && chunk.block?.type === 'text') {
-      const block = blocks.get(chunk.index);
-      const raw = chunk.block.text;
-      const marker = parseTaskMarker(raw);
-      const fullMarker = footer && marker.valid && previousText.length ? parseTaskMarker([...previousText, raw].join('\n')) : marker;
-      if (footer && fullMarker.valid && marker.task_number === (entry.scope.taskId ?? entry.scope.newTaskTicket?.taskId) &&
-          marker.answer.length >= (block?.sent ?? 0)) {
-        held = { chunk, marker, fullMarker, sent: block?.sent ?? 0, metadata: [] };
-        blocks.delete(chunk.index);
-        continue;
-      }
-      const text = marker.valid && strip ? marker.display_text : raw;
-      if (marker.valid && marker.display_text.length >= (block?.sent ?? 0)) entry.streamMarkers.set(step, marker);
-      else entry.streamMarkers.delete(step);
-      const remainder = text.slice(block?.sent ?? 0);
-      if (remainder) yield { type: 'text-delta', index: chunk.index, text: remainder };
+      held = { chunk, sent: blocks.get(chunk.index)?.sent ?? 0, metadata: [] };
       blocks.delete(chunk.index);
-      if (footer) previousText.push(raw);
-      yield { ...chunk, block: { ...chunk.block, text } };
       continue;
+    }
+    if (chunk.type === 'finish') {
+      yield* flushDeltas();
     }
     yield chunk;
   }
-  if (held) yield* finishBlock('');
+  if (held) yield* finishBlock(true, false);
+  yield* flushDeltas();
 }

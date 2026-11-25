@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
-import { appendHubTaskTurn, checkpointToolResult, commitScopedStaged, readSessionBinding, readScopedStaged, readTurnReceipts,
+import { appendHubTaskTurn, checkpointToolResult, commitScopedStaged, readSessionBinding, readScopedStaged, readTurnReceipts, transitionHubTaskStatus,
   recordTurnReceipt, resolveHubPaths, stageScopedOperators, upsertHubTask, writeHubTaskCompaction, writeSessionBinding } from '../src/kernel/hub-store.mjs';
 import { captureFileWrite } from '../src/kernel/file-writes.mjs';
 import { withHubWriteLock } from '../src/kernel/hub-write-lock.mjs';
@@ -154,4 +154,28 @@ test('backup respects an active write lock and never publishes a snapshot from t
   withHubWriteLock(hub, () => assert.match(cli(['backup', bundle, '--store', hub], 1, false), /hub_write_lock_busy/u));
   assert.equal(fs.existsSync(bundle), false);
   assert.equal(cli(['backup', bundle, '--store', hub]).ok, true);
+});
+
+test('binding cleanup I/O failures abort close; doctor reports stale bindings and invalid task metadata', t => {
+  const { hub, paths } = fixture(t);
+  writeSessionBinding(hub, 'retained', { task_id: 1 });
+  const rename = fs.renameSync;
+  fs.renameSync = (source, target) => {
+    if (target === paths.sessionBindingFile('retained')) throw Object.assign(new Error('fixture_io_failure'), { code: 'EIO' });
+    return rename(source, target);
+  };
+  try { assert.throws(() => transitionHubTaskStatus(hub, { taskId: 1, action: 'close' }), /fixture_io_failure/u); }
+  finally { fs.renameSync = rename; }
+  const index = JSON.parse(fs.readFileSync(paths.tasksIndexFile));
+  assert.equal(index.tasks[0].status, 'active');
+  assert.equal(readSessionBinding(hub, 'retained').task_id, 1);
+  index.tasks[0].status = 'done';
+  fs.writeFileSync(paths.tasksIndexFile, JSON.stringify(index));
+  assert.ok(cli(['doctor', '--store', hub], 1).issues.some(i => i.code === 'session_binding_stale'));
+  index.tasks[0].status = 'unknown';
+  fs.writeFileSync(paths.tasksIndexFile, JSON.stringify(index));
+  fs.writeFileSync(paths.taskCompactFile(1), 'unindexed');
+  const report = cli(['doctor', '--store', hub], 1);
+  assert.ok(report.issues.some(i => i.code === 'task_status_invalid'));
+  assert.ok(report.issues.some(i => i.code === 'task_compact_index_mismatch'));
 });

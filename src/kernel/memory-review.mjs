@@ -49,12 +49,13 @@ export function prepareMemoryReview(root, session, id, op, failure = 'no_proposa
     const row = readMemoryReview(root, session, id);
     if (!row || row.status !== 'preparing') return row;
     if (op) {
+      if (op.op !== 'ASSERT') throw new Error('invalid_preference_operator');
       row.op = op;
       if (row.scopes.length === 1) {
         const proposal = stage(root, row, row.scopes[0]);
         row.proposal = proposal.proposal_id;
         const { key, option_code, summary } = proposal.ops[0];
-        row.op = { op: 'ASSERT', key, option_code, summary };
+        row.op = { op: op.op, key, option_code, summary };
       }
     }
     row.status = op ? 'pending' : failure;

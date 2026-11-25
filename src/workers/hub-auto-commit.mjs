@@ -22,14 +22,21 @@ export function plainLines(text) {
 export function explicitUserDefaults(text) {
   const cue = /(?:所有|全部|各个|每个|任何|跨)的?(?:项目|仓库)|\b(?:across (?:all (?:my )?|my )?|(?:in|for) (?:all (?:my )?|every |each |any ))(?:projects?|repos?|repositor(?:y|ies))\b/iu;
   const localOrHypothetical = /这个?(?:项目|仓库)|本(?:项目|仓库)|如果|假设|是否|[?？]|\b(?:this (?:repo(?:sitory)?|project)|if|maybe|suppose)\b/iu;
-  return plainLines(text).flatMap(line => line.split(/[;；。]|(?<=[.!?])\s+/u))
+  const guarded = /[“”「」『』"\x60]|(?:举例|例如|比如)|(?:不要|别|不必|不用).{0,8}(?:记|保存)|\b(?:for example|(?:do not|don't|never) (?:remember|save))\b/iu;
+  return plainLines(text).filter(line => !guarded.test(line)).flatMap(line => line.split(/[;；。]|(?<=[.!?])\s+/u))
     .map(clause => clause.trim()).filter(clause => cue.test(clause) && !localOrHypothetical.test(clause)).join('\n');
 }
 
 const canonical = text => String(text ?? '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 const namesOption = (text, code) => {
   const normalized = canonical(code);
-  return normalized && ` ${canonical(text)} `.includes(` ${normalized} `);
+  if (!normalized) return false;
+  const body = canonical(text);
+  if ((' ' + body + ' ').includes(' ' + normalized + ' ')) return true;
+  const prefix = adoption.exec(text)?.[0];
+  if (prefix && canonical(text.slice(prefix.length)) === normalized) return true;
+  const separate = s => s.replace(/(?<=\p{Script=Han})(?=[\p{Script=Latin}\p{N}])|(?<=[\p{Script=Latin}\p{N}])(?=\p{Script=Han})/gu, ' ');
+  return (' ' + separate(body) + ' ').includes(' ' + separate(normalized) + ' ');
 };
 
 export function evaluateAutoCommit({ scope, rejectedCount, ops, evidence, authoredUserText, assistantText, autopilot }) {

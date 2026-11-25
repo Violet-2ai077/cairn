@@ -373,7 +373,7 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
   const hubRoot = resolveStoreRoot({ storeRoot: values.store });
   const scope = values.scope ?? (values.project ? 'project' : 'user');
   const projectId = values.project ?? null;
-  const emit = value => stdout(asJson ? JSON.stringify(value, null, 2) : String(value));
+  const emit = value => stdout(!asJson && typeof value === 'string' ? value : JSON.stringify(value, null, 2));
   try {
     if (command === 'backup' || command === 'restore') {
       if (positionals.length !== 2 || !targetArg?.trim() || !values.store?.trim() ||
@@ -430,7 +430,7 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
     }
     if (command === 'commit') {
       const result = commitScopedStaged(hubRoot, { scope, projectId, proposal_id: targetArg, rebase: values.rebase, actor_id: values.actor });
-      emit(result); return result.conflict || result.all_rejected ? 1 : 0;
+      emit(result); return ['committed', 'nothing_to_commit'].includes(result.reason) ? 0 : 1;
     }
     if (command === 'drop') { emit(dropScopedStaged(hubRoot, { scope, projectId, proposal_id: targetArg })); return 0; }
     if (command === 'verify-write') {
@@ -442,6 +442,7 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
     if (command === 'checkout') {
       const sessionId = values.session;
       if (targetArg === '--clear' || values.clear) {
+        if (values.preview) throw new Error('checkout --clear cannot be combined with --preview');
         if (!sessionId) throw new Error('checkout --clear requires --session <id>');
         const cleared = clearSessionBinding(hubRoot, sessionId);
         emit({ cleared, session_id: sessionId }); return 0;
@@ -485,9 +486,9 @@ export async function runCairnCliAsync(argv = process.argv.slice(2), io = {}) {
   const id = Number(args[0]);
   const full = argv.includes('--full');
   const cwdIndex = argv.indexOf('--cwd');
-  const root = path.resolve(cwdIndex >= 0 ? argv[cwdIndex + 1] : cwd);
   try {
     if (!Number.isSafeInteger(id) || id < 1 || args.length !== 1 || (cwdIndex >= 0 && !argv[cwdIndex + 1])) throw new Error('Use compact <id> [--full] [--cwd <dir>]');
+    const root = path.resolve(cwdIndex >= 0 ? argv[cwdIndex + 1] : cwd);
     const task = isCairnInitialized(root) ? readTasksIndex(root).tasks.find(entry => entry.id === id) : null;
     if (!task) throw new Error(`Task not found: ${id}`);
     if (task.status !== 'active') {

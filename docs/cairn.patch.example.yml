@@ -11,7 +11,6 @@
         # storeRoot: '/absolute/path/to/cairn-hub'
         actorId: 'dsh-main'
         stripMarkerInStream: true
-        useHostLlm: true
         autoCompactMinRecords: 12
         autoCompactMinChars: 4500
         maxTailChars: 6000
@@ -35,8 +34,5 @@
             # Native transcript still contains earlier project messages.
             crossProject: false
             routeTimeoutMs: 2500
-        # Optional explicit out-of-band worker model overrides:
-        # workerProvider: 'deepseek'
-        # workerModel: 'deepseek-chat'
-        # workerApiBase: 'https://api.deepseek.com/v1'
-        # workerApiKey: ''
+        # Hub workers use the selected dsh model route. The legacy workspace
+        # adapter's useHostLlm and worker* settings do not configure Hub workers.

@@ -13,8 +13,11 @@ import {
   projectReadOnlyLedger
 } from './ledger.mjs';
 import { buildLightTaskCatalog } from './marker.mjs';
+import { withHubWriteLock } from './hub-write-lock.mjs';
 
 let atomicTempCounter = 0;
+const locked = operation => (workspaceRoot = process.cwd(), ...args) =>
+  withHubWriteLock(resolveCairnPaths(workspaceRoot).cairnDir, () => operation(workspaceRoot, ...args));
 
 function sleepSync(ms) {
   const sab = new SharedArrayBuffer(4);
@@ -31,7 +34,7 @@ export function writeTextAtomic(filePath, content) {
   fs.mkdirSync(dir, { recursive: true });
   const tmpName = `.${path.basename(filePath)}.tmp.${process.pid}.${++atomicTempCounter}`;
   const tmpPath = path.join(dir, tmpName);
-  fs.writeFileSync(tmpPath, content, 'utf8');
+  fs.writeFileSync(tmpPath, content, { encoding: 'utf8', flush: true });
 
   const maxAttempts = 5;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -107,7 +110,8 @@ export function isCairnInitialized(workspaceRoot = process.cwd()) {
 /**
  * Idempotently initializes the `.cairn/` directory layout.
  */
-export function initCairnStore(workspaceRoot = process.cwd()) {
+export const initCairnStore = locked(initCairnStoreUnlocked);
+function initCairnStoreUnlocked(workspaceRoot) {
   const paths = resolveCairnPaths(workspaceRoot);
   fs.mkdirSync(paths.cairnDir, { recursive: true });
   fs.mkdirSync(paths.tasksDir, { recursive: true });
@@ -170,7 +174,9 @@ export function readLedgerLog(workspaceRoot = process.cwd()) {
   if (!fs.existsSync(paths.ledgerFile)) {
     throw new Error(`cairn_not_initialized:${paths.cairnDir}`);
   }
-  const text = fs.readFileSync(paths.ledgerFile, 'utf8').trim();
+  const raw = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(paths.ledgerFile));
+  if (raw && !raw.endsWith('\n')) throw new Error('ledger_jsonl_incomplete_line');
+  const text = raw.trim();
   if (!text) {
     return [];
   }
@@ -202,8 +208,13 @@ function deepEqualPlain(a, b) {
  * and verifies every commit transition as well as final equivalence with `.cairn/head.json`.
  */
 export function replayLedger(workspaceRoot = process.cwd(), { repairHead = false } = {}) {
+  return repairHead
+    ? locked(replayLedgerUnlocked)(workspaceRoot, true)
+    : replayLedgerUnlocked(workspaceRoot, false);
+}
+
+function replayLedgerUnlocked(workspaceRoot, repairHead, records = readLedgerLog(workspaceRoot)) {
   const paths = resolveCairnPaths(workspaceRoot);
-  const records = readLedgerLog(workspaceRoot);
   const currentHead = readHead(workspaceRoot);
 
   let workingLedger = createEmptyLedger();
@@ -369,7 +380,8 @@ export function readStaged(workspaceRoot = process.cwd()) {
  * Stages candidate delta operators into `.cairn/staged.json`.
  * Ignores empty `ops: []` (NO_OP) and allocates monotonic `stg_<n>` via `next_proposal_seq`.
  */
-export function stageOperators(
+export const stageOperators = locked(stageOperatorsUnlocked);
+function stageOperatorsUnlocked(
   workspaceRoot = process.cwd(),
   { ops, source_step, actor_id = 'default', base_revision, created_at } = {}
 ) {
@@ -433,15 +445,24 @@ export function stageOperators(
  *   retains the proposal in `staged.json` with `last_rejected_ops` and halts without writing an empty commit.
  * - Strictly persists each accepted commit in order: `ledger.jsonl` append -> `head.json` atomic write -> `staged.json` atomic write.
  */
-export function commitStaged(
+export const commitStaged = locked(commitStagedUnlocked);
+function commitStagedUnlocked(
   workspaceRoot = process.cwd(),
   { proposal_id = null, actor_id = null, source_step = null, rebase = false, timestamp = null } = {}
 ) {
   const paths = resolveCairnPaths(workspaceRoot);
+  const existingLog = readLedgerLog(workspaceRoot);
+  const replay = replayLedgerUnlocked(workspaceRoot, false, existingLog);
+  if (!replay.valid) throw new Error('ledger_replay_required:' + replay.mismatch_reason);
   let workingHead = readHead(workspaceRoot);
   const initialHeadRevision = workingHead.revision;
   const staged = readStaged(workspaceRoot);
-  const existingLog = readLedgerLog(workspaceRoot);
+  const consumed = new Set(existingLog.map(record => record.proposal_id).filter(Boolean));
+  const unconsumed = staged.proposals.filter(proposal => !consumed.has(proposal.proposal_id));
+  if (unconsumed.length !== staged.proposals.length) {
+    staged.proposals = unconsumed;
+    writeJsonAtomic(paths.stagedFile, staged);
+  }
   let nextCommitSeq =
     existingLog.length > 0
       ? Math.max(...existingLog.map((r, i) => (typeof r.commit_seq === 'number' ? r.commit_seq : i + 1))) + 1
@@ -578,7 +599,7 @@ export function commitStaged(
     workingHead = JSON.parse(JSON.stringify(foldResult.ledger));
     staged.proposals = staged.proposals.filter(p => p.proposal_id !== proposal.proposal_id);
 
-    fs.appendFileSync(paths.ledgerFile, `${JSON.stringify(commitRecord)}\n`, 'utf8');
+    fs.appendFileSync(paths.ledgerFile, `${JSON.stringify(commitRecord)}\n`, { encoding: 'utf8', flush: true });
     writeJsonAtomic(paths.headFile, workingHead);
     writeJsonAtomic(paths.stagedFile, staged);
 
@@ -603,7 +624,8 @@ export function commitStaged(
  * Drops a specific staged proposal by `proposal_id`, or clears all staged proposals when omitted.
  * Preserves monotonic `next_proposal_seq`.
  */
-export function dropStaged(workspaceRoot = process.cwd(), { proposal_id = null } = {}) {
+export const dropStaged = locked(dropStagedUnlocked);
+function dropStagedUnlocked(workspaceRoot, { proposal_id = null } = {}) {
   const paths = resolveCairnPaths(workspaceRoot);
   const staged = readStaged(workspaceRoot);
   const beforeCount = staged.proposals.length;
@@ -673,7 +695,8 @@ export function readTasksIndex(workspaceRoot = process.cwd()) {
 /**
  * Inserts or updates a task entry in `.cairn/tasks/index.json` and ensures `.cairn/tasks/<id>/` exists.
  */
-export function upsertTask(
+export const upsertTask = locked(upsertTaskUnlocked);
+function upsertTaskUnlocked(
   workspaceRoot = process.cwd(),
   { id, title, birth_turn, status, work_anchor_task_id, updated_at } = {}
 ) {
@@ -736,7 +759,8 @@ export function upsertTask(
   };
 }
 
-export function transitionTaskStatus(
+export const transitionTaskStatus = locked(transitionTaskStatusUnlocked);
+function transitionTaskStatusUnlocked(
   workspaceRoot = process.cwd(),
   { taskId, action, updatedAt } = {}
 ) {
@@ -792,7 +816,8 @@ function summarizeTitleFromContent(content, taskId) {
 /**
  * Appends a turn/message record to `.cairn/tasks/<id>/thread.jsonl` and updates `.cairn/tasks/index.json`.
  */
-export function appendTaskTurn(
+export const appendTaskTurn = locked(appendTaskTurnUnlocked);
+function appendTaskTurnUnlocked(
   workspaceRoot = process.cwd(),
   { task_id, turn, role = 'assistant', content = '', raw_content = null, title, meta = {}, timestamp } = {}
 ) {
@@ -885,11 +910,12 @@ export function readTaskThread(workspaceRoot = process.cwd(), taskId) {
     .map(line => JSON.parse(line));
 }
 
-export function writeTaskCompaction(
+export const writeTaskCompaction = locked(writeTaskCompactionUnlocked);
+function writeTaskCompactionUnlocked(
   workspaceRoot = process.cwd(),
   taskId,
   compactMarkdown,
-  { compactedRecordCount } = {}
+  { compactedRecordCount, expected } = {}
 ) {
   if (!isCairnInitialized(workspaceRoot)) {
     initCairnStore(workspaceRoot);
@@ -898,7 +924,6 @@ export function writeTaskCompaction(
   const paths = resolveCairnPaths(workspaceRoot);
   fs.mkdirSync(paths.taskDir(id), { recursive: true });
   const text = `${String(compactMarkdown ?? '').trim()}\n`;
-  writeTextAtomic(paths.taskCompactFile(id), text);
 
   const threadLen = readTaskThread(workspaceRoot, id).length;
   const effectiveCompactedCount =
@@ -906,6 +931,11 @@ export function writeTaskCompaction(
 
   const index = readTasksIndex(workspaceRoot);
   const existingIdx = index.tasks.findIndex(t => t.id === id);
+  const current = index.tasks[existingIdx];
+  if (expected && (!current || current.status !== 'active' ||
+      current.compacted_record_count !== expected.count || readTaskCompaction(workspaceRoot, id) !== expected.markdown ||
+      effectiveCompactedCount < expected.count || effectiveCompactedCount > threadLen)) return null;
+  writeTextAtomic(paths.taskCompactFile(id), text);
   const now = new Date().toISOString();
   if (existingIdx === -1) {
     index.tasks.push({

@@ -196,7 +196,8 @@ export function readScopedLedgerLog(hubRoot, { scope = 'user', projectId = null 
 export function readScopedStaged(hubRoot, { scope = 'user', projectId = null } = {}) {
   const file = resolveHubPaths(hubRoot).ledgerPaths({ scope, projectId }).stagedFile;
   const raw = readJson(file, emptyStaged(), 'scoped_staged_unreadable');
-  return { next_proposal_seq: Number.isSafeInteger(raw.next_proposal_seq) ? raw.next_proposal_seq : 1, proposals: Array.isArray(raw.proposals) ? raw.proposals : [] };
+  if (!Number.isSafeInteger(raw.next_proposal_seq) || raw.next_proposal_seq < 1) throw new Error('invalid_next_proposal_seq');
+  return { next_proposal_seq: raw.next_proposal_seq, proposals: Array.isArray(raw.proposals) ? raw.proposals : [] };
 }
 
 export const stageScopedOperators = locked(stageScopedOperatorsUnlocked);
@@ -712,10 +713,10 @@ function clearBindingsForTask(hubRoot, taskId) {
   for (const entry of fs.readdirSync(paths.sessionsDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
     const file = path.join(paths.sessionsDir, entry.name);
-    try {
-      const binding = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (binding.task_id === taskId) { writeClearedBinding(file, binding.session_id); count++; }
-    } catch { /* Doctor reports malformed session bindings; lifecycle must continue. */ }
+    let binding;
+    try { binding = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (error) { if (error instanceof SyntaxError) continue; throw error; }
+    if (binding?.task_id === taskId) { writeClearedBinding(file, binding.session_id); count++; }
   }
   return count;
 }
@@ -745,10 +746,12 @@ function transitionHubTaskStatusUnlocked(hubRoot, { taskId, action, updatedAt } 
 }
 
 export const writeHubTaskCompaction = locked(writeHubTaskCompactionUnlocked);
-function writeHubTaskCompactionUnlocked(hubRoot, taskId, content, compactedRecordCount) {
+function writeHubTaskCompactionUnlocked(hubRoot, taskId, content, compactedRecordCount, { expected } = {}) {
   const paths = resolveHubPaths(hubRoot);
   const index = readHubTasksIndex(hubRoot);
   const task = index.tasks.find(item => item.id === normalizeTaskId(taskId));
+  if (expected && (!task || task.status !== 'active' || task.compacted_record_count !== expected.count ||
+      readHubTaskCompaction(hubRoot, task.id) !== expected.markdown)) return null;
   if (!task) throw new Error(`task_not_found:${taskId}`);
   if (task.status !== 'active') throw new Error(`task_not_active:${task.id}:${task.status}`);
   const thread = readHubTaskThread(hubRoot, task.id);

@@ -12,13 +12,104 @@ import { buildHubColdRouterPrompt, runHubColdRouter } from '../src/workers/hub-c
 import { runHubStagingExtractor } from '../src/workers/hub-staging-extractor.mjs';
 import { runHubStrictCompactor, createHubTaskCompactionCoordinator } from '../src/workers/hub-strict-compactor.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
-import { explicitUserDefaults } from '../src/workers/hub-auto-commit.mjs';
+import { evaluateAutoCommit, explicitUserDefaults } from '../src/workers/hub-auto-commit.mjs';
+import { buildScopedAuthorityContract, buildScopedStagingExtractorPrompt } from '../src/kernel/contracts.mjs';
+import { createOpenAICompatibleClient } from '../src/workers/llm-client.mjs';
+import { initCairnStore, upsertTask } from '../src/kernel/store.mjs';
+import { createTaskCompactionCoordinator } from '../src/workers/task-compaction-coordinator.mjs';
+
+test('both compaction coordinators report thrown failures, release their queue and settle flush', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-compact-exception-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const hub = path.join(root, 'hub');
+  upsertHubTask(hub, { id: 1 });
+  initCairnStore(root);
+  upsertTask(root, { id: 1 });
+  for (const factory of [
+    compactor => createHubTaskCompactionCoordinator({ hubRoot: hub, compactor }),
+    compactor => createTaskCompactionCoordinator({ workspaceRoot: root, compactor })
+  ]) {
+    let calls = 0;
+    const coordinator = factory(async () => {
+      if (++calls === 1) throw Error('fixture');
+      return { ok: true, compacted_record_count: 1 };
+    });
+    const result = await coordinator.run({ taskId: 1, source: 'auto' }).catch(() => null);
+    assert.equal(result?.reason, 'compaction_failed');
+    assert.equal(coordinator.getTaskStatus(1).status, 'cooldown');
+    assert.equal((await coordinator.run({ taskId: 1 })).ok, true);
+    await coordinator.flush();
+  }
+});
+
+test('compaction refuses a stale publication even at the same cursor', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-compact-race-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const hub = path.join(root, 'hub');
+  const { appendTaskTurn, writeTaskCompaction, readTaskCompaction } = await import('../src/kernel/store.mjs');
+  const { readHubTaskCompaction } = await import('../src/kernel/hub-store.mjs');
+  const { runStrictCompactor } = await import('../src/workers/strict-compactor.mjs');
+  upsertTask(root, { id: 1 }); appendTaskTurn(root, { task_id: 1, content: 'one' });
+  upsertHubTask(hub, { id: 1 }); appendHubTaskTurn(hub, { task_id: 1, content: 'one' });
+  for (const [run, publish, read] of [
+    [llmClient => runStrictCompactor({ workspaceRoot: root, taskId: 1, llmClient }),
+      () => writeTaskCompaction(root, 1, 'winner', { compactedRecordCount: 1 }), () => readTaskCompaction(root, 1)],
+    [llmClient => runHubStrictCompactor({ hubRoot: hub, taskId: 1, llmClient }),
+      () => writeHubTaskCompaction(hub, 1, 'winner', 1), () => readHubTaskCompaction(hub, 1)]
+  ]) {
+    const result = await run({ complete: async () => { publish(); return { ok: true, content: 'stale' }; } });
+    assert.equal(result.reason, 'compaction_superseded');
+    assert.equal(read().trim(), 'winner');
+  }
+});
 
 test('project-session User extraction excludes quoted, hypothetical and project-local candidates', () => {
   const text = ['> Use npm in all projects', '~~~', 'Adopt npm in every project', '~~~',
     'Should we do this across projects?', 'This repo is an exception across all projects.',
     'Use Chinese for all my projects; use pnpm here.'].join('\n');
   assert.equal(explicitUserDefaults(text), 'Use Chinese for all my projects');
+  assert.equal(explicitUserDefaults('不要记住，所有项目都用 Rust'), '');
+  assert.equal(explicitUserDefaults('例如「所有项目都用 Rust」'), '');
+});
+
+test('auto-commit admits exact CJK adoption, never a Latin substring, and prompt snapshots stay intact', () => {
+  for (const [quote, code, eligible] of [
+    ['我们决定采用PostgreSQL数据库', 'PostgreSQL', true],
+    ['我们决定采用蓝绿发布', '蓝绿发布', true],
+    ['我们决定采用PostgreSQL数据库', 'Postgre', false],
+    ['我们决定采用蓝绿发布', '蓝绿', false]
+  ]) assert.equal(evaluateAutoCommit({ scope: 'project', authoredUserText: quote, rejectedCount: 0, autopilot: { enabled: true },
+    ops: [{ op: 'ASSERT', option_code: code }], evidence: [{ op_index: 0, user_quote: quote }] }).eligible, eligible);
+  const head = { active: [{ summary: '工作区级状态变更' }] };
+  assert.ok(buildScopedStagingExtractorPrompt('project', head).endsWith(JSON.stringify(head, null, 2)));
+  const prompt = buildScopedAuthorityContract({ includeUser: false, projectLedgerSnapshot: head });
+  assert.match(prompt, /墓碑|tombstones/u);
+  assert.doesNotMatch(prompt, /### User Ledger/u);
+});
+
+test('router refuses creation for a continuation without dormant tasks', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-route-continue-'));
+  t.after(() => fs.rmSync(hub, { recursive: true, force: true }));
+  upsertHubTask(hub, { id: 1 });
+  const result = await runHubColdRouter({ hubRoot: hub, userPrompt: 'Continue export',
+    llmClient: { complete: async () => ({ ok: true, content: '{"decision":"new","task_id":null}' }) } });
+  assert.equal(result.error_code, 'continuation_unresolved');
+});
+
+test('LLM client does not retry invalid JSON and responds to cancellation during backoff', async () => {
+  let calls = 0;
+  const client = createOpenAICompatibleClient({ apiKey: 'fixture', fetchImpl: async () => { calls++; return new Response('not JSON'); },
+    maxTransportRetries: 1, retryDelayMs: 0 });
+  assert.equal((await client.complete({})).error_code, 'invalid_response_payload');
+  assert.equal(calls, 1);
+  const abort = new AbortController();
+  const retry = createOpenAICompatibleClient({ apiKey: 'fixture', maxTransportRetries: 1, retryDelayMs: 10000,
+    fetchImpl: async () => { calls++; setImmediate(() => abort.abort()); return new Response('', { status: 503 }); } });
+  const deadline = AbortSignal.timeout(1000);
+  const result = await Promise.race([retry.complete({ signal: abort.signal }),
+    new Promise(resolve => deadline.addEventListener('abort', () => resolve(null), { once: true }))]);
+  assert.equal(result?.error_code, 'aborted');
+  assert.equal(calls, 2);
 });
 
 const heat = { enabled: true, hotMaxTasks: 1, idleDays: 14, dormantMaxCandidates: 1 };

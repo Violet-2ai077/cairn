@@ -96,6 +96,81 @@ function scopedSession(ctx, id) {
   };
 }
 
+test('Hub slash rejects ambiguous writes and invalid lifecycle input without mutation', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-slash-'));
+  const ctx = mockCtx(), host = await createHubDshHost(ctx, { storeRoot: hub });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  const s = scopedSession(ctx, 'slash');
+  upsertHubTask(hub, { id: 1 });
+  stageScopedOperators(hub, { ops: [{ op: 'ASSERT', key: 'tool', option_code: 'one', summary: 'Use one' }] });
+  for (const command of ['commit proj', 'drop proj', 'close abc', 'archive 1', 'close 1 extra', 'unknown', 'commit user stg_999']) {
+    assert.equal((await s.slash(command)).kind, 'error', command);
+  }
+  assert.equal(readScopedLedgerLog(hub).length, 0);
+  assert.equal(readHubTasksIndex(hub).tasks[0].status, 'active');
+  assert.equal((await s.slash('commit user')).kind, 'success');
+  assert.equal(readScopedLedgerLog(hub).length, 1);
+});
+
+test('Hub marker stripping keeps full-answer provenance and identical deltas in both runtimes', async t => {
+  for (const autopilot of [undefined, { enabled: true }]) {
+    const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-marker-'));
+    const ctx = mockCtx();
+    const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot, llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } });
+    t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+    const s = scopedSession(ctx, 'marker'), signal = new AbortController().signal;
+    await s.start(1, 'Write an answer', { signal });
+    s.emit('user/message', { turn: 1, message: { source: { kind: 'user' }, content: 'Write an answer' } });
+    async function* reply() {
+      for (const [index, text] of ['First paragraph', '  ' + 'x'.repeat(80) + ' '.repeat(90) + '\n<|task:1|>' + ' '.repeat(65)].entries()) {
+        yield { type: 'block-start', index, blockType: 'text' };
+        yield { type: 'text-delta', index, text };
+        yield { type: 'block-end', index, block: { type: 'text', text } };
+      }
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+    const chunks = await Array.fromAsync(ctx.handlers.get('llm/stream')({ sessionId: 'marker', signal }, reply));
+    const blocks = chunks.filter(c => c.type === 'block-end').map(c => c.block);
+    assert.equal(blocks[1].text, '  ' + 'x'.repeat(80));
+    assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), blocks.map(b => b.text).join(''));
+    s.end(1, blocks);
+    assert.equal(readHubTaskThread(hub, 1).at(-1)?.content, 'First paragraph\n  ' + 'x'.repeat(80));
+  }
+});
+
+test('selection can leave a full menu without taking action on the old request', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-picker-exit-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub, autopilot: { enabled: true },
+    llmClient: { complete: async () => ({ ok: true, content: '{"decision":"new","task_id":null}' }) } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, title: 'Old task' });
+  const s = scopedSession(ctx, 'exit');
+  await s.start(1, '继续'); s.end(1, '请选择');
+  await s.start(2, '都不是'); s.end(2, '请描述其他任务');
+  assert.equal(readSessionBinding(hub, 'exit'), null);
+  await s.start(3, '另开一个任务：整理发布记录');
+  assert.match(s.view(), /Required tail marker.*<\|task:2\|>/u);
+});
+
+test('a compatibility Hub cannot create a task on an unresolved continuation', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-continue-compat-'));
+  const ctx = mockCtx();
+  const host = await createHubDshHost(ctx, { storeRoot: hub,
+    llmClient: { complete: async () => ({ ok: true, content: '{"decision":"new","task_id":null}' }) } });
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  initHubStore(hub);
+  const s = scopedSession(ctx, 'continuation');
+  for (const turn of [1, 2]) {
+    if (turn === 2) upsertHubTask(hub, { id: 1, title: 'Something unrelated' });
+    await s.start(turn, 'Continue the export');
+    assert.match(s.view(), /路由尚未确认/u);
+    s.emit('user/message', { turn, message: { source: { kind: 'user' }, content: 'Continue the export' } });
+    s.end(turn, 'Wrong creation\n<|task:2|>');
+    assert.ok(!readHubTasksIndex(hub).tasks.some(task => task.id === 2));
+  }
+});
+
 test('an independent checkout distinguishes observed results from accepted turns before and after interruption', async t => {
   const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-handoff-'));
   const ctx = mockCtx(), s = scopedSession(ctx, 'writer');

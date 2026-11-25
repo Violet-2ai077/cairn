@@ -117,7 +117,8 @@ export function buildScopedAuthorityContract({ userLedgerSnapshot = null, projec
 3. 当当前会话尚未完成 pre-step 路由且没有显式项目绑定时，不存在可用的 Project Ledger；不得将 cwd hint 当成已选项目，不得猜测或注入其账本。
 4. cwd 项目仅为软路由信号。只有显式绑定、有效任务匹配，或已完成路由后的 new+cwd hint 才能形成当前项目锁定。
 5. 以当前生效的决策 ID 为准。显式撤回可由账本以新 ID 恢复旧选项；历史 ID 的 tombstone 仍然有效。撤回项目规则而无替代项时，适用的 User 默认规则仍然有效。`;
-  const sections = includeUser ? [text, `### User Ledger\n${userLedgerSnapshot ? JSON.stringify(userLedgerSnapshot, null, 2) : '(none)'}`] : [];
+  const sections = includeUser || includeProject ? [text] : [];
+  if (includeUser) sections.push(`### User Ledger\n${userLedgerSnapshot ? JSON.stringify(userLedgerSnapshot, null, 2) : '(none)'}`);
   if (includeProject) sections.push(`### Current Project Ledger${projectName ? ` (${projectLabel})` : ''}\n${projectLedgerSnapshot ? JSON.stringify(projectLedgerSnapshot, null, 2) : '(none; no project is locked)'}`);
   return sections.join('\n\n');
 }
@@ -131,7 +132,7 @@ export function buildScopedStagingExtractorPrompt(scope, readOnlyHead = null, { 
     : `
 ### Project-scope extraction boundary
 只抽取当前已锁定项目内明确确立的决策。不得抽取跨项目用户偏好；算子 scope 必须为 "project"，project_id 由宿主固定，模型不得生成或修改。`;
-  const base = buildStagingExtractorPrompt(readOnlyHead)
+  const base = buildStagingExtractorPrompt()
     .replaceAll('工作区级状态变更', `${scope === 'user' ? 'User Ledger 跨项目偏好' : '当前 Project Ledger 项目内决策'}变更`)
     .replaceAll('"scope":"global"', `"scope":"${scope}"`)
     .replaceAll('scope: "global"', `scope: "${scope}"`);
@@ -139,5 +140,6 @@ export function buildScopedStagingExtractorPrompt(scope, readOnlyHead = null, { 
 ### Project automatic admission evidence
 仍只输出严格 JSON 对象，"ops" 保持原契约。若每项都有明确用户拍板，可附 "evidence":[{"op_index":0,"user_quote":"用户明确采纳的完整原文行","assistant_quote":"同一选项及具体技术方案的助手原话","falsification_quote":"证伪原话"}]。
 op_index 从零开始。user_quote 必须来自 User，不要截取假设、引语、提醒、工具输出或助手的话。简短的“就用方案 B”允许用 assistant_quote 定位同一方案及技术选项。SUPERSEDE 必须给出独立于采纳措辞、包含具体证伪 reason 的 falsification_quote；没有充分证据则省略 evidence，仅入暂存。不要生成 project_id、决策 ID 或置信度分数。` : '';
-  return `${base}${userOnly}${evidence}`;
+  const snapshot = readOnlyHead ? '\n\n### 当前只读账本快照（current_ledger_head）\n' + JSON.stringify(readOnlyHead, null, 2) : '';
+  return base + userOnly + evidence + snapshot;
 }

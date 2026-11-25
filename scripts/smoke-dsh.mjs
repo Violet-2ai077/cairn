@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readHubTaskThread, readHubTasksIndex, readScopedHead, readSessionBinding } from '../src/kernel/hub-store.mjs';
+import { readHubTaskThread, readHubTasksIndex, readScopedHead, readScopedStaged, readSessionBinding, stageScopedOperators } from '../src/kernel/hub-store.mjs';
+import { readTaskThread, replayLedger } from '../src/kernel/store.mjs';
 
 const requested = process.argv[2] ?? process.env.DSH_BIN;
 if (!requested) throw new Error('Pass the installed dsh/lib/bin.js path, or set DSH_BIN.');
@@ -73,19 +74,53 @@ function verifyWriteCrash(writer, projectId) {
   assert.deepEqual([readScopedHead(hub), readScopedHead(hub, { scope: 'project', projectId })], priorHeads);
   console.log('PASS: native write exited before tool/result; separate CLI checks matched, detected a peer edit and declined a non-file, without replay.');
 }
-function main() {
-  fs.mkdirSync(cwd);
-  assert.equal(spawnSync('git', ['init', '--quiet'], { cwd, windowsHide: true }).status, 0);
-  fs.writeFileSync(path.join(cwd, 'csv.test.cjs'), "require('node:test')('csv-header', () => require('node:assert/strict').equal('wrong', 'CSV_HEADER_EXPECTED'));");
+function configure(config) {
   const url = name => new URL(name, import.meta.url).href;
   fs.writeFileSync(patch, JSON.stringify([
     { id: 'agent-default-model', config: { provider: 'cairn-offline', model: 'fixture' } },
     { id: 'compaction-basic', config: { retainTokens: 1, headroomTokens: 1024 } },
     { insert: [
       { id: 'cairn-smoke-provider', name: url('./fixtures/dsh-offline-provider.mjs') },
-      { id: 'cairn', name: url('../src/hosts/dsh/index.mjs'), config: { storeRoot: hub, autopilot: { enabled: true } } }
+      { id: 'cairn', name: url('../src/hosts/dsh/index.mjs'), config }
     ] }
   ]));
+}
+function verifyMarkerMatrix() {
+  for (const mode of ['hub', 'autopilot', 'legacy']) {
+    const storeRoot = path.join(tmp, 'marker-' + mode);
+    const config = mode === 'legacy' ? { workspaceRoot: cwd } : { storeRoot };
+    if (mode === 'autopilot') config.autopilot = { enabled: true };
+    configure(config);
+    if (mode === 'hub') stageScopedOperators(storeRoot, { ops: [{ op: 'ASSERT', key: 'scope_check', option_code: 'fixture', summary: 'Scope check' }] });
+    const phase = 'marker-' + mode;
+    const input = 'Write a two-paragraph progress note.';
+    const output = run(phase, input);
+    const answer = '  ' + 'Long result '.repeat(9).trimEnd() + '.';
+    assert.match(output, /First paragraph\./u);
+    assert.match(output, /Long result Long result/u);
+    assert.doesNotMatch(output, /<\|task:/u);
+    assert.deepEqual(entries().find(e => e.phase === phase && e.markerBlocks)?.markerBlocks, ['First paragraph.', answer]);
+    const thread = mode === 'legacy' ? readTaskThread(cwd, 1) : readHubTaskThread(storeRoot, 1);
+    assert.deepEqual(thread.map(r => r.content), [input, 'First paragraph.\n' + answer]);
+    if (mode === 'legacy') assert.equal(replayLedger(cwd).valid, true);
+    if (mode === 'hub') {
+      const checks = entries().filter(e => e.phase === phase && e.slash).map(e => [e.slash, e.result]);
+      assert.deepEqual(checks, ['commit proj', 'drop proj', 'archive 1', 'unknown'].map(command => [command, 'error']));
+      assert.equal(readScopedHead(storeRoot).revision, 0);
+      assert.equal(readScopedStaged(storeRoot).proposals.length, 1);
+      run('marker-compat-continue', 'Continue the unrecognized deployment task.');
+      assert.deepEqual(readHubTasksIndex(storeRoot).tasks.map(t => t.id), [1]);
+      console.log('PASS: real dsh rejected wrong-scope slash writes, invalid lifecycle changes and unresolved continuation creation.');
+    }
+    console.log('PASS: real dsh ' + mode + ' hid the fragmented multi-block marker and archived the full answer.');
+  }
+}
+function main() {
+  fs.mkdirSync(cwd);
+  assert.equal(spawnSync('git', ['init', '--quiet'], { cwd, windowsHide: true }).status, 0);
+  fs.writeFileSync(path.join(cwd, 'csv.test.cjs'), "require('node:test')('csv-header', () => require('node:assert/strict').equal('wrong', 'CSV_HEADER_EXPECTED'));");
+  if (process.argv.includes('--marker-only')) return verifyMarkerMatrix();
+  configure({ storeRoot: hub, autopilot: { enabled: true } });
   run('a', 'Investigate CSV export.\nUse npm');
   const id = entries().find(e => e.sessionId).sessionId;
   const projectId = readHubTasksIndex(hub).tasks[0].project_id;
@@ -172,6 +207,7 @@ function main() {
   console.log('PASS: memory review follows the answer, survives restart, and injects the project exception only in its own checkout.');
   console.log('PASS: real dsh tool failure, Project supersession, native compaction, restart and natural-language checkout (offline provider).');
   console.log('PASS: native userQuestions selection and restarted text fallback; no business request before selection, original verification runs after selection.');
+  verifyMarkerMatrix();
 }
 try { main(); } finally {
   if (path.dirname(tmp) === fs.realpathSync(os.tmpdir()) && path.basename(tmp).startsWith('cairn-live-')) fs.rmSync(tmp, { recursive: true, force: true });

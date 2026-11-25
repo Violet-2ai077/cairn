@@ -5,6 +5,7 @@ import { resolveTaskHeatPolicy, selectHubTaskPools } from '../kernel/task-heat.m
 import { createOpenAICompatibleClient } from './llm-client.mjs';
 
 const START_CONTINUE = /^(?:(?:please\s+)?(?:continue|resume|revisit|return to|pick up)\b|(?:请\s*)?(?:继续|接着|恢复|回到|跟进))/iu;
+export const isHubContinuation = text => START_CONTINUE.test(text.trim());
 const START_EXACT = /^(?:(?:please\s+)?(?:continue|resume|revisit|return to|pick up|switch to|open|work on)\s+|(?:请\s*)?(?:继续|接着|恢复|回到|跟进|切到|打开)\s*)?(?:task\b\s*|任务\s*|<\|task:)#?\s*([1-9]\d{0,2})(?!\d)(?:\|>)?(?=$|[\s，。,.!！:：])/iu;
 
 function taskReferences(text) {
@@ -164,7 +165,7 @@ export async function runHubColdRouter({
     if (task.status !== 'active') return failure('task_not_active');
     return match(task, dormant.some(candidate => candidate.id === task.id) ? 'dormant' : 'hot', false, 'explicit_task_id');
   }
-  if (!hot.length && !dormant.length) return newDecision('empty_task_catalog');
+  if (!hot.length && !dormant.length) return isHubContinuation(prompt) ? failure('continuation_unresolved') : newDecision('empty_task_catalog');
   const client = llmClient ?? createOpenAICompatibleClient();
   const clock = new AbortController();
   const timer = setTimeout(() => clock.abort(new DOMException('Routing deadline', 'TimeoutError')), timeoutMs);
@@ -172,11 +173,11 @@ export async function runHubColdRouter({
   const request = { paths: resolveHubPaths(hubRoot), userPrompt: prompt, cwdProjectHint, client, signal: combined };
   try {
     const first = await routeCandidates(hot, { ...request, pool: 'hot' });
-    if (!first.ok || first.decision !== 'new' || !dormant.length) return first;
+    if (!first.ok || first.decision !== 'new') return first;
     if (combined.aborted) return failure(clock.signal.aborted ? 'timeout' : 'aborted', first.llm_called);
     const shortlist = shortlistDormant({ userPrompt: prompt, tasks: dormant, limit: taskHeat.dormantMaxCandidates });
     const result = shortlist.length ? await routeCandidates(shortlist, { ...request, pool: 'dormant' }) : first;
-    if (result.decision === 'new' && START_CONTINUE.test(prompt)) return failure('continuation_unresolved', result.llm_called);
+    if (result.decision === 'new' && isHubContinuation(prompt)) return failure('continuation_unresolved', result.llm_called);
     return result;
   } finally { clearTimeout(timer); }
 }

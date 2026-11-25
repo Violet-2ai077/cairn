@@ -53,7 +53,9 @@ export function createTaskCompactionCoordinator({
       }
 
       setState(key, { status: 'running', task_id: id, source, mode, started_at: now() });
-      const result = await compactor({ workspaceRoot: root, taskId: id, mode, llmClient, signal });
+      let result;
+      try { result = await compactor({ workspaceRoot: root, taskId: id, mode, llmClient, signal }); }
+      catch { result = { ok: false, task_id: id, reason: signal?.aborted ? 'aborted' : 'compaction_failed' }; }
       if (result.reason === 'task_not_active' || result.reason === 'task_not_found') {
         setState(key, { status: 'idle', task_id: id, source, reason: result.reason });
         return result;
@@ -85,7 +87,8 @@ export function createTaskCompactionCoordinator({
   function run(options = {}) {
     const promise = execute(options);
     pending.add(promise);
-    promise.finally(() => pending.delete(promise));
+    const cleanup = () => pending.delete(promise);
+    void promise.then(cleanup, cleanup);
     return promise;
   }
 

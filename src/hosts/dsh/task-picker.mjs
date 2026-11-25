@@ -133,6 +133,10 @@ export async function pickTask(options) {
       : { id: choice.id, input: pending.input, originalTurn: pending.turn };
   }
   if (choice.kind === 'other' || choice.kind === 'more') {
+    if (choice.kind === 'other' && pending.ids.length === pending.eligibleIds.length) {
+      if (!save(pending.key, null)) return stale();
+      return reply('choice_none', '已退出任务选择，未执行原请求。请描述另一项任务，或指定要继续的任务。');
+    }
     const ids = choice.kind === 'other' ? pending.eligibleIds : pending.ids;
     const offset = choice.kind === 'more' && pending.offset + PAGE < ids.length ? pending.offset + PAGE : 0;
     const next = { ...pending, ids, offset, key: randomUUID() };

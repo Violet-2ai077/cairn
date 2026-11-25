@@ -8,7 +8,7 @@ import {
 } from '../../kernel/index.mjs';
 import { readScopedStaged, commitScopedStaged, dropScopedStaged } from '../../kernel/index.mjs';
 import { resolveStoreRoot } from '../../workers/store-root.mjs';
-import { runHubColdRouter } from '../../workers/hub-cold-router.mjs';
+import { isHubContinuation, runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
 import { compileHubHandoff } from '../../workers/hub-handoff.mjs';
 import { installFileWriteHook } from './file-write-hook.mjs';
@@ -22,7 +22,7 @@ import { memoryCommand, memoryReply, memoryNotice } from './memory-dialog.mjs';
 import { appendCompactionDirective } from './compaction-directive.mjs';
 import { createHubWriteCoordinator } from '../../workers/hub-write-coordinator.mjs';
 import { readProjectsIndex, readTurnReceipts, recordTurnReceipt, recoverMarkerlessTurn, turnSourceDigest } from '../../kernel/hub-store.mjs';
-import { collectToolEvidence, recoverJournalText } from './turn-journal.mjs';
+import { collectToolEvidence, recoverJournalText, textOf } from './turn-journal.mjs';
 import { menuStream } from './task-picker.mjs';
 import { listHubTaskPools, resolveTaskHeatPolicy, selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
@@ -36,12 +36,13 @@ function createHubHostLlmClient(ctx, route) {
       let output = '';
       try {
         for await (const chunk of ctx.llm.stream(request)) {
+          if (signal?.aborted || (chunk?.type === 'finish' && chunk.reason?.kind === 'aborted')) return { ok: false, error_code: 'aborted' };
           if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') output += chunk.text;
           else if (chunk?.type === 'block-end' && chunk.block?.type === 'text' && !output) output = chunk.block.text ?? '';
           else if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') return { ok: false, error_code: chunk.reason.failure?.code ?? 'host_llm_error', error_message: chunk.reason.failure?.message ?? 'Host LLM error' };
         }
-        return { ok: true, content: output };
-      } catch (error) { return { ok: false, error_code: 'host_llm_error', error_message: error?.message ?? String(error) }; }
+        return signal?.aborted ? { ok: false, error_code: 'aborted' } : { ok: true, content: output };
+      } catch (error) { return { ok: false, error_code: signal?.aborted ? 'aborted' : 'host_llm_error', error_message: error?.message ?? String(error) }; }
     }
   };
 }
@@ -76,7 +77,8 @@ export async function createHubDshHost(ctx, config = {}) {
   const compactionCoordinator = createHubTaskCompactionCoordinator({ hubRoot, cooldownMs: config.autoCompactCooldownMs ?? 300000 });
   const writeCoordinator = createHubWriteCoordinator();
   const taskHeat = resolveTaskHeatPolicy(config.autopilot);
-  const routingUnresolved = state => taskHeat.enabled && ['ambiguous', 'error'].includes(state?.route?.result);
+  const routingUnresolved = state => state?.route?.error_code === 'continuation_unresolved' ||
+    (taskHeat.enabled && ['ambiguous', 'error'].includes(state?.route?.result));
   const taskList = filter => listHubTaskPools(readHubTasksIndex(hubRoot).tasks, { policy: taskHeat })
     .filter(task => !filter || task.status === filter);
   const clientFor = route => config.llmClient ?? createHubHostLlmClient(ctx, route);
@@ -276,7 +278,7 @@ export async function createHubDshHost(ctx, config = {}) {
         }
       }
       const cwdHint = resolveGitProjectHint(cwdFrom(payload));
-      if ((!taskHeat.enabled && !tasks.some(task => task.status === 'active')) || (!tasks.length && !userPrompt)) {
+      if ((!taskHeat.enabled && !isHubContinuation(userPrompt) && !tasks.some(task => task.status === 'active')) || (!tasks.length && !userPrompt)) {
         sessions.set(sessionId, { ...state, selectedProjectId: cwdHint?.project_id ?? null, cwdHint: cwdHint?.project_id ?? null, route: { result: 'new', elapsed_ms: 0 } });
         return decision;
       }
@@ -301,7 +303,8 @@ export async function createHubDshHost(ctx, config = {}) {
         state = { ...state, selectedProjectId: result.project_id, taskId: result.task_id, cwdHint: cwdHint?.project_id ?? null, bindingSource, route: { result: 'match', elapsed_ms: elapsed } };
       } else {
         const selectedProjectId = result.ok && result.decision === 'new' ? cwdHint?.project_id ?? null : null;
-        state = { ...state, selectedProjectId, taskId: null, cwdHint: cwdHint?.project_id ?? null, bindingSource: null, route: { result: result.ok ? result.decision : 'error', elapsed_ms: elapsed, turn: turnNumber } };
+        state = { ...state, selectedProjectId, taskId: null, cwdHint: cwdHint?.project_id ?? null, bindingSource: null,
+          route: { result: result.ok ? result.decision : 'error', error_code: result.error_code, elapsed_ms: elapsed, turn: turnNumber } };
         if (selectedProjectId && tasks.length) { initHubStore(hubRoot); writeSessionBinding(hubRoot, sessionId, { project_id: selectedProjectId, task_id: null, source: 'cwd_new' }); }
       }
       sessions.set(sessionId, state);
@@ -326,6 +329,10 @@ export async function createHubDshHost(ctx, config = {}) {
         const blocked = !request?.purpose && turnRuntime?.blockedReply(request?.sessionId);
         if (blocked) return menuStream(blocked, config.stripMarkerInStream === false);
         const stream = next(request);
+        const compat = !turnRuntime && turns.get(request?.sessionId);
+        if (!request?.purpose && compat && config.stripMarkerInStream !== false && stream?.[Symbol.asyncIterator]) {
+          return hideHubStreamMarker(stream, compat);
+        }
         if (request?.purpose || !entry?.scope || entry.signal !== request.signal) return stream;
         const input = turnRuntime.userText(entry);
         const footer = memoryNotice(splitMemoryIntent(input, entry.scope.projectId).cards, entry.turn);
@@ -355,7 +362,8 @@ export async function createHubDshHost(ctx, config = {}) {
         return;
       }
       const turn = event.type === 'turn/start' || !turns.has(sessionId)
-        ? { turn: event.data?.turn ?? 1, firstSeq: event.seq, user: '', authoredUser: '', assistant: '', tools: [], toolNames: new Map(), modelRoute: routeForTurn(sessionId, event.data?.turn ?? 1) }
+        ? { turn: event.data?.turn ?? 1, firstSeq: event.seq, user: '', authoredUser: '', assistant: '', tools: [],
+          step: 1, streamMarkers: new Map(), toolNames: new Map(), modelRoute: routeForTurn(sessionId, event.data?.turn ?? 1) }
         : turns.get(sessionId);
       collectToolEvidence(turn, event);
       if (event.type === 'user/message' || event.type === 'assistant/message') {
@@ -367,7 +375,13 @@ export async function createHubDshHost(ctx, config = {}) {
           if (!source || source === 'user') turn.user += `\n${clean}`;
           if (source === 'user' && (event.surfaceOp === undefined || event.surfaceOp === 'append')) turn.authoredUser += `\n${clean}`;
         }
-        else { turn.assistant += `\n${content}`; turn.finalSeq = event.seq; }
+        else {
+          const saved = turn.streamMarkers.get(turn.step);
+          turn.streamMarkers.delete(turn.step);
+          const text = textOf(message);
+          turn.assistant += '\n' + (saved?.display_text === text.trim() && !event.data?.interrupted ? saved.rawText : text);
+          turn.finalSeq = event.seq;
+        }
       }
       turns.set(sessionId, turn);
       if (event.type !== 'turn/end') return;
@@ -435,7 +449,8 @@ export async function createHubDshHost(ctx, config = {}) {
   }
   if (commands?.register) {
     const stop = commands.register({ name: 'cairn', description: 'Manage centralized Cairn Hub state', input: { hint: 'status | turns [turn] | recover <turn> <task-id> | tasks [--all|--status <status>] | inspect | doctor | checkout <id|--clear> [--preview] | undo <user|project [id]> <seq> [--preview] <reason>' }, async handler({ rawInput, agent }) {
-      const args = String(rawInput ?? 'status').trim().split(/\s+/u).filter(Boolean);
+      const args = String(rawInput ?? '').trim().split(/\s+/u).filter(Boolean);
+      if (!args.length) args.push('status');
       const sessionId = agent?.session?.id;
       if (midSession.enabled && args[0] === 'memory') {
         await sessionJobs.get(sessionId);
@@ -456,6 +471,7 @@ export async function createHubDshHost(ctx, config = {}) {
       }
       if (args[0] === 'checkout') {
         if (!sessionId) return { kind: 'error', text: 'session_id_unavailable' };
+        if (args[1] === '--clear' && args.length !== 2) return { kind: 'error', text: 'Use checkout --clear without other arguments' };
         if (args[1] === '--clear') { clearCheckout(sessionId); return { kind: 'success', text: 'Session checkout cleared.' }; }
         const id = Number(args[1]);
         const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === id);
@@ -496,17 +512,30 @@ export async function createHubDshHost(ctx, config = {}) {
       if (args[0] === 'status') return { kind: 'success', text: JSON.stringify(readStatus(), null, 2) };
       if (args[0] === 'init') return { kind: 'success', text: JSON.stringify(initHubStore(hubRoot)) };
       if (args[0] === 'commit' || args[0] === 'drop') {
-        const scope = args[1] === 'project' ? 'project' : 'user';
+        const [command, scope] = args;
         const projectId = scope === 'project' ? args[2] : null;
-        const proposalId = args.find(token => /^stg_\d+$/u.test(token));
-        const result = await writeCoordinator.run({ scope, projectId }, () => args[0] === 'commit' ? commitScopedStaged(hubRoot, { scope, projectId, proposal_id: proposalId }) : dropScopedStaged(hubRoot, { scope, projectId, proposal_id: proposalId }));
-        return { kind: 'success', text: JSON.stringify(result) };
+        const offset = scope === 'project' ? 3 : 2;
+        const proposalId = args[offset];
+        if (!['user', 'project'].includes(scope) || (scope === 'project' && !projectId) ||
+            args.length > offset + 1 || (proposalId && !/^stg_[1-9]\d*$/u.test(proposalId))) {
+          return { kind: 'error', text: 'Use ' + command + ' <user|project <id>> [stg_<id>]' };
+        }
+        try {
+          const result = await writeCoordinator.run({ scope, projectId }, () => command === 'commit'
+            ? commitScopedStaged(hubRoot, { scope, projectId, proposal_id: proposalId })
+            : dropScopedStaged(hubRoot, { scope, projectId, proposal_id: proposalId }));
+          const ok = command === 'commit' ? ['committed', 'nothing_to_commit'].includes(result.reason) : !proposalId || result.dropped;
+          return { kind: ok ? 'success' : 'error', text: JSON.stringify(result) };
+        } catch (error) { return { kind: 'error', text: error.message }; }
       }
       if (['close', 'archive', 'reopen'].includes(args[0])) {
+        if (args.length !== 2 || !/^[1-9]\d{0,2}$/u.test(args[1])) return { kind: 'error', text: 'Use ' + args[0] + ' <task-id>' };
         const taskId = Number(args[1]);
-        const result = transitionHubTaskStatus(hubRoot, { taskId, action: args[0] });
-        if (args[0] !== 'reopen') clearTaskSessionState(taskId);
-        return { kind: 'success', text: JSON.stringify(result) };
+        try {
+          const result = transitionHubTaskStatus(hubRoot, { taskId, action: args[0] });
+          if (args[0] !== 'reopen') clearTaskSessionState(taskId);
+          return { kind: 'success', text: JSON.stringify(result) };
+        } catch (error) { return { kind: 'error', text: error.message }; }
       }
       if (args[0] === 'inspect') {
         const state = stateFor(sessionId);
@@ -519,7 +548,7 @@ export async function createHubDshHost(ctx, config = {}) {
         if (!showAll && !['active', 'done', 'archived'].includes(filter)) return { kind: 'error', text: 'Use tasks [--all|--status <active|done|archived>]' };
         return { kind: 'success', text: JSON.stringify(taskList(filter), null, 2) };
       }
-      return { kind: 'success', text: JSON.stringify(readStatus(), null, 2) };
+      return { kind: 'error', text: 'Unknown Cairn subcommand: ' + args[0] };
     } });
     if (typeof stop === 'function') disposers.push(stop);
   }

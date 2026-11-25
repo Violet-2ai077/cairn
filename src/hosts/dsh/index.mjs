@@ -16,7 +16,6 @@ import {
   projectReadOnlyLedger,
   readStaged,
   readTasksIndex,
-  parseTaskMarker,
   buildAntiRecencyContract,
   buildAuthorityCheckoutContract,
   buildStrictCompactorPrompt
@@ -31,12 +30,12 @@ import {
 import { runCairnCli } from '../../../bin/cairn.mjs';
 import { createTurnAccumulator } from './turn-accumulator.mjs';
 import { createHubDshHost } from './hub-host.mjs';
+import { hideHubStreamMarker } from './hub-turn-runtime.mjs';
 
 export const name = 'cairn-dsh-host';
 
 export const inject = ['systemPrompt', 'llm', 'tools'];
 
-const TAIL_BUFFER_CHARS = 64;
 
 
 export function resolveDshHostConfig(rawConfig = {}) {
@@ -619,120 +618,17 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
         }
 
         const sessionId = String(request?.sessionId ?? 'default-session');
-        const textBlocksByIndex = new Map();
-
-        function ensureBlockState(index) {
-          let state = textBlocksByIndex.get(index);
-          if (!state) {
-            state = {
-              index,
-              fullText: '',
-              pendingTail: '',
-              yieldedLen: 0,
-              flushed: false
-            };
-            textBlocksByIndex.set(index, state);
-          }
-          return state;
-        }
-
-        function* flushBlockState(state) {
-          if (!state || state.flushed) return;
-          const parsed = parseTaskMarker(state.fullText);
-          if (parsed.valid) {
-            accumulator.stashStreamMarker(sessionId, {
-              rawText: state.fullText,
-              parsed
-            });
-          }
-          const cleanFullText = parsed.valid ? parsed.display_text : state.fullText;
-          const remainingDelta = cleanFullText.slice(state.yieldedLen);
-          if (remainingDelta.length > 0) {
-            yield {
-              type: 'text-delta',
-              index: state.index,
-              text: remainingDelta
-            };
-          }
-          state.yieldedLen = cleanFullText.length;
-          state.pendingTail = '';
-          state.flushed = true;
-          state.cleanFullText = cleanFullText;
-        }
-
-        for await (const chunk of invokeNext(request)) {
-          if (!chunk || typeof chunk !== 'object') {
-            yield chunk;
-            continue;
-          }
-
-          if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-            const idx = typeof chunk.index === 'number' ? chunk.index : 0;
-            const state = ensureBlockState(idx);
-            if (state.flushed) continue;
-
-            state.fullText += chunk.text;
-            state.pendingTail += chunk.text;
-
-            if (state.pendingTail.length > TAIL_BUFFER_CHARS) {
-              const flushLen = state.pendingTail.length - TAIL_BUFFER_CHARS;
-              const emitText = state.pendingTail.slice(0, flushLen);
-              state.pendingTail = state.pendingTail.slice(flushLen);
-              state.yieldedLen += emitText.length;
-              yield {
-                ...chunk,
-                index: idx,
-                text: emitText
-              };
+        const turn = accumulator.activeTurn(sessionId);
+        const entry = { step: 1, streamMarkers: new Map() };
+        for await (const chunk of hideHubStreamMarker(invokeNext(request), entry)) {
+          const marker = entry.streamMarkers.get(1);
+          if (marker) {
+            entry.streamMarkers.delete(1);
+            if (turn === accumulator.activeTurn(sessionId)) {
+              accumulator.stashStreamMarker(sessionId, { rawText: marker.rawText, parsed: marker, turn });
             }
-            continue;
           }
-
-          if (chunk.type === 'block-end' && chunk.block?.type === 'text') {
-            const idx = typeof chunk.index === 'number' ? chunk.index : 0;
-            const state = textBlocksByIndex.get(idx);
-            let cleanBlockText;
-
-            if (state && state.fullText.length > 0) {
-              yield* flushBlockState(state);
-              cleanBlockText = state.cleanFullText;
-            } else {
-              const rawBlockText = String(chunk.block.text ?? '');
-              const parsed = parseTaskMarker(rawBlockText);
-              if (parsed.valid) {
-                accumulator.stashStreamMarker(sessionId, {
-                  rawText: rawBlockText,
-                  parsed
-                });
-              }
-              cleanBlockText = parsed.valid ? parsed.display_text : rawBlockText;
-              if (state) state.flushed = true;
-            }
-
-            // Shallow-clone chunk and chunk.block so frozen chunks are never mutated in-place
-            yield {
-              ...chunk,
-              block: {
-                ...chunk.block,
-                text: cleanBlockText
-              }
-            };
-            continue;
-          }
-
-          if (chunk.type === 'finish') {
-            for (const state of textBlocksByIndex.values()) {
-              yield* flushBlockState(state);
-            }
-            yield chunk;
-            continue;
-          }
-
           yield chunk;
-        }
-
-        for (const state of textBlocksByIndex.values()) {
-          yield* flushBlockState(state);
         }
       },
       { prepend: true, global: true }
@@ -923,7 +819,7 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
         const sessionId = agent?.session?.id ?? null;
         if (cliArgs[0] === 'checkout') {
           const out = executeCairnCliCommand(workspaceRoot, cliArgs);
-          if (out.code === 0) {
+          if (out.code === 0 && !cliArgs.includes('--preview')) {
             routeStates.clear();
             checkoutSnapshots.clear();
             activeSnapshotTaskBySession.clear();

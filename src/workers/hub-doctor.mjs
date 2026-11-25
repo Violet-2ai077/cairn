@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isHubInitialized, readFileWrites, readHubTasksIndex, readProjectsIndex, replayScopedLedger, resolveHubPaths, readHubTaskThread } from '../kernel/index.mjs';
-import { readTaskObservations } from '../kernel/hub-store.mjs';
+import { readSessionBinding, readTaskObservations } from '../kernel/hub-store.mjs';
 
 function inspectReceipts(paths, observations, inspect, issue) {
   const dir = path.join(paths.sessionsDir, 'turns');
@@ -34,6 +34,9 @@ export function runHubDoctor({ hubRoot } = {}) {
   };
   const initialized = isHubInitialized(hubRoot);
   if (!initialized) issue('hub_not_initialized');
+  if (![paths.hubFile, paths.userLedgerDir, paths.projectsDir, paths.tasksDir, paths.sessionsDir].some(file => fs.existsSync(file))) {
+    return { ok: false, hub_initialized: false, project_count: 0, task_count: 0, issues };
+  }
   if (fs.existsSync(paths.hubFile)) inspect('hub_metadata_invalid', {}, () => {
     if (JSON.parse(fs.readFileSync(paths.hubFile, 'utf8')).schema_version !== 1) issue('hub_schema_unsupported');
   });
@@ -43,6 +46,12 @@ export function runHubDoctor({ hubRoot } = {}) {
       if (!Array.isArray(raw[key]) || raw.schema_version !== 1) throw new Error('invalid_index');
       if (key === 'tasks' && raw.tasks.some(t => ['turn_count', 'compacted_record_count'].some(k =>
         Object.hasOwn(t, k) && (!Number.isSafeInteger(t[k]) || t[k] < 0)))) throw new Error('invalid_index_counter');
+      if (key === 'tasks') {
+        if (!Number.isSafeInteger(raw.next_task_id) || raw.next_task_id < 1 || raw.tasks.some(t => Number(t.id) >= raw.next_task_id)) issue('task_next_id_invalid');
+        for (const t of raw.tasks) if (Object.hasOwn(t, 'status') && !['active', 'done', 'archived'].includes(t.status)) {
+          issue('task_status_invalid', { task_id: Number(t.id) });
+        }
+      }
       return reader(hubRoot)[key];
     });
   }
@@ -75,7 +84,9 @@ export function runHubDoctor({ hubRoot } = {}) {
       const bad = rows.findIndex((r, i) => r?.seq !== i + 1 || r.project_id !== task.project_id);
       if (bad !== -1) issue('task_record_identity_mismatch', { ...fields, record_number: bad + 1 });
     });
-    if ((task.has_compact || task.compacted_record_count > 0) && !fs.existsSync(paths.taskCompactFile(task.id))) issue('task_compact_missing', fields);
+    const compactExists = fs.existsSync(paths.taskCompactFile(task.id));
+    if ((task.has_compact || task.compacted_record_count > 0) && !compactExists) issue('task_compact_missing', fields);
+    if (!task.has_compact && (compactExists || task.compacted_record_count > 0)) issue('task_compact_index_mismatch', fields);
     inspect('task_observations_unreadable', fields, () => {
       for (const row of readTaskObservations(hubRoot, task.id)) {
         const session = path.basename(paths.sessionBindingFile(row.source.session_id), '.json');
@@ -95,6 +106,21 @@ export function runHubDoctor({ hubRoot } = {}) {
     if (projects && task.project_id && !projects.some(p => p.project_id === task.project_id)) issue('task_project_unregistered', fields);
   }
   if (tasks) inspect('receipts_unreadable', {}, () => inspectReceipts(paths, observations, inspect, issue));
+  if (tasks && fs.existsSync(paths.sessionsDir)) inspect('sessions_dir_unreadable', {}, () => {
+    const byId = new Map(tasks.map(task => [task.id, task]));
+    for (const name of fs.readdirSync(paths.sessionsDir).filter(name => /^[a-f0-9]{24}\.json$/u.test(name))) {
+      const fields = { session_key: path.basename(name, '.json') };
+      inspect('session_binding_unreadable', fields, () => {
+        const { session_id: id } = JSON.parse(fs.readFileSync(path.join(paths.sessionsDir, name), 'utf8'));
+        if (path.basename(paths.sessionBindingFile(id)) !== name) throw new Error('identity_mismatch');
+        const binding = readSessionBinding(hubRoot, id);
+        if (binding?.task_id != null) {
+          const task = byId.get(binding.task_id);
+          if (task?.status !== 'active' || task.project_id !== binding.project_id) issue('session_binding_stale', { ...fields, task_id: binding.task_id });
+        }
+      });
+    }
+  });
   if (projects && fs.existsSync(paths.projectsDir)) inspect('projects_dir_unreadable', {}, () => {
     const known = new Set(projects.map(p => p.project_id));
     for (const dir of fs.readdirSync(paths.projectsDir, { withFileTypes: true })) {

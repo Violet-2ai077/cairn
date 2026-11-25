@@ -22,6 +22,31 @@ import {
 } from '../src/hosts/dsh/index.mjs';
 import { createHubDshHost } from '../src/hosts/dsh/hub-host.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
+import { createTurnAccumulator } from '../src/hosts/dsh/turn-accumulator.mjs';
+import { parseTaskMarker } from '../src/kernel/marker.mjs';
+
+test('Legacy drops a cancelled turn marker and refuses a mismatching marker in the current turn', async () => {
+  await withTempWorkspace(async workspaceRoot => {
+    const acc = createTurnAccumulator({ workspaceRoot });
+    const session = { id: 'interrupted' };
+    const event = (type, data) => acc.observeSessionEvent(session, { type, data, surfaceOp: 'append' });
+    const stash = (turn, text) => {
+      const rawText = text + '\n<|task:1|>';
+      acc.stashStreamMarker(session.id, { turn, rawText, parsed: parseTaskMarker(rawText) });
+    };
+    event('turn/start', { turn: 1 });
+    stash(1, 'Old answer');
+    event('turn/end', { turn: 1, reason: { kind: 'aborted' } });
+    assert.equal(acc.consumeStashedMarker(session.id), null);
+    event('turn/start', { turn: 2 });
+    stash(2, 'Wrong answer');
+    event('user/message', { turn: 2, message: { source: { kind: 'user' }, content: 'New request' } });
+    event('assistant/message', { turn: 2, message: { content: 'Unrelated answer' } });
+    event('turn/end', { turn: 2, reason: { kind: 'completed' } });
+    assert.deepEqual(readTaskThread(workspaceRoot, 1), []);
+    await acc.flushPendingJobs();
+  });
+});
 import { runCairnCli } from '../bin/cairn.mjs';
 
 async function withTempWorkspace(fn) {

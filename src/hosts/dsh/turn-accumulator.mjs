@@ -168,6 +168,7 @@ export function createTurnAccumulator({
 
     if (event.type === 'turn/start') {
       const turnNum = event.data?.turn ?? 1;
+      stashedMarkersBySession.delete(sessionId);
       turnStateBySession.delete(sessionId);
       ensureTurnState(sessionId, turnNum);
       return;
@@ -235,7 +236,8 @@ export function createTurnAccumulator({
       let rawText = eventText;
       let parsed = parseTaskMarker(eventText);
 
-      if (stashed && stashed.parsed?.valid) {
+      if (stashed?.turn === turnNum && stashed.parsed?.valid && stashed.parsed.display_text === eventText &&
+          !event.data?.interrupted) {
         rawText = stashed.rawText;
         parsed = stashed.parsed;
       }
@@ -290,9 +292,11 @@ export function createTurnAccumulator({
     }
 
     if (event.type === 'turn/end') {
+      stashedMarkersBySession.delete(sessionId);
       const current = turnStateBySession.get(sessionId);
       if (!current) return;
       turnStateBySession.delete(sessionId);
+      if (event.data?.reason?.kind && event.data.reason.kind !== 'completed') return;
 
       const userCombined = current.userTexts.join('\n\n').trim();
       const assistantCombined =
@@ -506,6 +510,7 @@ export function createTurnAccumulator({
     observeSessionEvent,
     stashStreamMarker,
     consumeStashedMarker,
+    activeTurn: sessionId => turnStateBySession.get(sessionId)?.turn ?? null,
     disposeSession,
     getLastTaskId,
     clearTaskBindings,

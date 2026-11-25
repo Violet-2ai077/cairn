@@ -93,6 +93,8 @@ test('the pre-write observer preserves native policy and requires a direct admit
   assert.equal(view()[0].expected_sha256, digest(content));
   const raw = fs.readFileSync(path.join(hub, 'tasks', '1', 'file-writes', view()[0].id + '.json'), 'utf8');
   assert.doesNotMatch(raw, /private bytes/u);
+  assert.equal(await run({ arguments: { file_path: 'result.txt', content: 'conflicting replay' } }), policy);
+  assert.equal(view()[0].expected_sha256, digest(content));
 });
 
 test('large or multiply linked files are not hashed; frozen tasks cannot be updated by verification', t => {

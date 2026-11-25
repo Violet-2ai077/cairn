@@ -256,9 +256,10 @@ export async function runColdRouter({
     const candidates = Array.isArray(parsed.candidates)
       ? parsed.candidates.filter(cid => typeof cid === 'number' && validIdSet.has(cid))
       : [];
+    const distinct = [...new Set(candidates)];
     if (
       !Array.isArray(parsed.candidates) ||
-      candidates.length < 2 ||
+      distinct.length < 2 ||
       candidates.length !== parsed.candidates.length
     ) {
       return {
@@ -278,7 +279,7 @@ export async function runColdRouter({
       ok: true,
       decision: 'ambiguous',
       task_id: null,
-      candidates,
+      candidates: distinct,
       reason,
       llm_called: true
     };

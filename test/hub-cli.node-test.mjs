@@ -6,6 +6,22 @@ import path from 'node:path';
 import { runCairnCli, runCairnCliAsync } from '../bin/cairn.mjs';
 import { upsertHubTask, appendHubTaskTurn, stageScopedOperators, commitScopedStaged, readScopedLedgerLog } from '../src/kernel/hub-store.mjs';
 
+test('Hub commit reports rejected or missing proposals and compact handles missing cwd', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-cli-errors-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const out = [], io = { stdout: s => out.push(s), stderr: s => out.push(s) };
+  const run = (...args) => runCairnCli([...args, '--store', root], io);
+  assert.equal(run('init'), 0);
+  assert.equal(JSON.parse(out.at(-1)).initialized, true);
+  assert.equal(run('commit', 'stg_999'), 1);
+  assert.equal(JSON.parse(out.at(-1)).reason, 'proposal_not_found');
+  const { proposal } = stageScopedOperators(root, { ops: [{ op: 'ASSERT' }] });
+  assert.equal(run('commit', proposal.proposal_id), 1);
+  assert.equal(JSON.parse(out.at(-1)).reason, 'all_operators_rejected');
+  assert.equal(await runCairnCliAsync(['compact', '1', '--cwd'], io), 1);
+  assert.match(out.at(-1), /Use compact/u);
+});
+
 test('Hub CLI revert requires explicit scope, supports read-only preview, and appends a revert event', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-cli-revert-'));
   try {

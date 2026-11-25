@@ -31,11 +31,12 @@ export async function runHubStrictCompactor({ hubRoot, taskId, mode = 'increment
   if (signal?.aborted) return { ok: false, reason: 'aborted', error_code: 'aborted', attempts, task_id: id, compacted_record_count: oldCount };
   if (!response.ok) return { ok: false, reason: 'llm_error', error_code: response.error_code, attempts, task_id: id, compacted_record_count: oldCount };
   const content = String(response.content ?? '').trim();
-  if (!content) return { ok: false, reason: 'empty_compaction_output', attempts, raw_response_length: String(response.content ?? '').length, finish_reason: response.finish_reason ?? response.metadata?.finish_reason ?? null, task_id: id, compacted_record_count: oldCount };
+  if (!content) return { ok: false, reason: 'empty_compaction_output', attempts, raw_response_length: String(response.content ?? '').length, finish_reason: response.finish_reason ?? response.metadata?.finish_reason ?? response.raw_response?.choices?.[0]?.finish_reason ?? null, task_id: id, compacted_record_count: oldCount };
   if (signal?.aborted) return { ok: false, reason: 'aborted', error_code: 'aborted', attempts, task_id: id, compacted_record_count: oldCount };
   const current = readHubTasksIndex(hubRoot).tasks.find(item => item.id === id);
   if (!current || current.status !== 'active') return { ok: false, skipped: true, reason: current ? 'task_not_active' : 'task_not_found', task_id: id, compacted_record_count: oldCount };
-  const updated = writeHubTaskCompaction(hubRoot, id, content, records.length);
+  const updated = writeHubTaskCompaction(hubRoot, id, content, records.length, { expected: { count: oldCount, markdown: compact } });
+  if (!updated) return { ok: false, skipped: true, reason: 'compaction_superseded', task_id: id };
   return { ok: true, task_id: id, attempts, raw_response_length: String(response.content ?? '').length, compacted_record_count: updated.compacted_record_count, compact_markdown: content };
 }
 
@@ -52,13 +53,21 @@ export function createHubTaskCompactionCoordinator({ hubRoot, cooldownMs = 30000
       const task = readHubTasksIndex(root).tasks.find(item => item.id === Number(taskId));
       if (!task || task.status !== 'active') return { ok: false, skipped: true, reason: task ? 'task_not_active' : 'task_not_found', task_id: Number(taskId), llm_called: false };
       states.set(key, { status: 'running', source, task_id: Number(taskId), updated_at: now() });
-      const result = await compactor({ hubRoot: root, taskId, mode, llmClient, signal });
+      let result;
+      try { result = await compactor({ hubRoot: root, taskId, mode, llmClient, signal }); }
+      catch { result = { ok: false, task_id: Number(taskId), reason: signal?.aborted ? 'aborted' : 'compaction_failed' }; }
       if (result.ok) states.set(key, { status: 'succeeded', source, task_id: Number(taskId), compacted_record_count: result.compacted_record_count, updated_at: now() });
       else if (source === 'auto' && !result.skipped) states.set(key, { status: 'cooldown', source, task_id: Number(taskId), reason: result.reason, cooldown_until: now() + cooldownMs, updated_at: now() });
       else states.set(key, { status: 'failed', source, task_id: Number(taskId), reason: result.reason, updated_at: now() });
       return result;
     } finally { release(); if (locks.get(key) === tail) locks.delete(key); }
   }
-  function run(options = {}) { const promise = execute(options); pending.add(promise); promise.finally(() => pending.delete(promise)); return promise; }
+  function run(options = {}) {
+    const promise = execute(options);
+    pending.add(promise);
+    const cleanup = () => pending.delete(promise);
+    void promise.then(cleanup, cleanup);
+    return promise;
+  }
   return Object.freeze({ run, getTaskStatus: id => ({ ...(states.get(`${root}:${Number(id)}`) ?? { status: 'idle', task_id: Number(id) }) }), async flush() { while (pending.size) await Promise.allSettled([...pending]); } });
 }
