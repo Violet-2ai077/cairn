@@ -1,0 +1,48 @@
+name: Cairn reliability
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '27 3 * * 1'
+permissions:
+  contents: read
+jobs:
+  reliability:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
+      - run: node scripts/eval-reliability.mjs > attribution-eval.json
+      - run: node scripts/bench-hub.mjs --output hub-benchmark.json
+      - if: github.event_name == 'schedule'
+        run: node scripts/bench-hub.mjs --tasks 1000 --records 100 --samples 30 --output hub-benchmark-large.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hub-benchmark-${{ matrix.os }}-${{ matrix.node }}
+          path: |
+            hub-benchmark*.json
+            attribution-eval.json
+      - name: Install pinned real host in an isolated prefix
+        if: matrix.node == 24
+        run: npm install --prefix "${{ runner.temp }}/cairn-smoke" --no-audit --no-fund @deepseek-ai/dsh@0.2.2-rc.5
+      - name: Check real host using the offline provider
+        if: matrix.node == 24
+        run: node scripts/smoke-dsh.mjs "${{ runner.temp }}/cairn-smoke/node_modules/@deepseek-ai/dsh/lib/bin.js"
+      - name: Check strict task sessions
+        if: matrix.node == 24
+        run: node scripts/smoke-dsh.mjs "${{ runner.temp }}/cairn-smoke/node_modules/@deepseek-ai/dsh/lib/bin.js" --separate-session-only
+      - name: Check extended IDs across a native session restart
+        if: matrix.node == 24
+        run: node scripts/smoke-dsh.mjs "${{ runner.temp }}/cairn-smoke/node_modules/@deepseek-ai/dsh/lib/bin.js" --marker-bank-only

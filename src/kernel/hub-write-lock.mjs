@@ -92,7 +92,38 @@ function acquireLegacyFence(lock, deadline) {
   }
 }
 
-export function withHubWriteLock(hubRoot, work) {
+// A reader never acquires or repairs a lock. A unique generation brackets
+// synchronous reads, including changes that leave the same counters behind.
+export function readConsistentHub(hubRoot, read) {
+  const generation = path.join(hubRoot, '.hub-generation');
+  const guard = path.join(hubRoot, '.write.lock.guard');
+  function stamp() {
+    if (fs.existsSync(guard) || fs.existsSync(path.join(hubRoot, '.write.lock'))) return null;
+    let token = '';
+    try {
+      const st = fs.lstatSync(generation);
+      if (!st.isFile() || st.nlink !== 1 || st.size !== 36) throw new Error('hub_integrity:generation_invalid');
+      token = fs.readFileSync(generation, 'utf8');
+    }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+    return fs.existsSync(guard) || fs.existsSync(path.join(hubRoot, '.write.lock')) ? null : token;
+  }
+  for (let i = 0; i < 5; i++) {
+    const before = stamp();
+    if (before !== null) {
+      let value, error;
+      try { value = read(); } catch (e) { error = e; }
+      if (before === stamp()) {
+        if (error) throw error;
+        return value;
+      }
+    }
+    if (i < 4) Atomics.wait(waiter, 0, 0, 5 * (i + 1));
+  }
+  throw new Error('hub_snapshot_busy');
+}
+
+export function withHubWriteLock(hubRoot, work, { publishGeneration = true } = {}) {
   fs.mkdirSync(hubRoot, { recursive: true });
   const lock = path.join(fs.realpathSync.native(hubRoot), '.write.lock');
   if (held.has(lock)) return work();
@@ -100,6 +131,33 @@ export function withHubWriteLock(hubRoot, work) {
   return underDirectoryLock(lock + '.guard', deadline, () => {
     acquireLegacyFence(lock, deadline);
     held.add(lock);
-    try { return work(); } finally { held.delete(lock); fs.rmdirSync(lock); }
+    const hubFile = path.join(hubRoot, 'hub.json');
+    const hubStateExists = () => fs.existsSync(hubFile) || fs.existsSync(path.join(hubRoot, 'sessions'));
+    const initialized = hubStateExists();
+    const publish = () => {
+      const token = randomUUID();
+      // Keep the legacy fence empty for dead-owner recovery. Never truncate a
+      // possibly linked destination; replace the entry from the same directory.
+      const candidate = path.join(hubRoot, '.hub-generation.pending');
+      fs.rmSync(candidate, { force: true });
+      fs.writeFileSync(candidate, token, { flag: 'wx', mode: 0o600 });
+      try {
+        for (let attempt = 0; ; attempt++) {
+          try { fs.renameSync(candidate, path.join(hubRoot, '.hub-generation')); break; }
+          catch (e) {
+            if (attempt === 4 || !transientAccess(e)) throw e;
+            Atomics.wait(waiter, 0, 0, 5 * (attempt + 1));
+          }
+        }
+      }
+      finally { fs.rmSync(candidate, { force: true }); }
+    };
+    try {
+      if (publishGeneration && initialized) publish();
+      return work();
+    } finally {
+      try { if (publishGeneration && !initialized && hubStateExists()) publish(); }
+      finally { held.delete(lock); fs.rmdirSync(lock); }
+    }
   });
 }

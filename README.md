@@ -73,6 +73,12 @@ cairn verify-write 1 <write-id> --store /path/to/hub --json
 
 For day-to-day Hub use, [check health and rehearse a cold restore](docs/hub-recovery.md) before relying on the ledger. `doctor` is read-only. `backup` and `restore` use explicit store paths and fresh destinations; neither changes which Hub dsh is configured to use.
 
+See [Hub reliability and benchmarks](docs/hub-reliability.md) for verified context reads and CI,
+[turn recovery](docs/turn-recovery.md) for interrupted archives and tool evidence, and
+[attribution experiments](docs/attribution-quality.md) for task routing, preference evaluation,
+and opt-in fresh-session isolation. Backup encryption is optional; plaintext is not authenticated
+against replacement by an attacker.
+
 ## Running Tests
 
 Cairn uses Node.js built-in test runner (`node:test` and `node:assert/strict`) with zero external runtime dependencies:

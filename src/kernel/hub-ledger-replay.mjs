@@ -43,7 +43,8 @@ export function replayHubRecords(records, disk, { scope, projectId }) {
       if (planned.status !== 'ready' || !isDeepStrictEqual(planned.ops, record.ops)) return fail(`invalid_revert_${seq}`);
     } else {
       if (record.kind !== undefined || typeof record.proposal_id !== 'string' ||
-          !/^stg_\d+$/u.test(record.proposal_id) || consumed.has(record.proposal_id)) return fail(`invalid_proposal_at_commit_${seq}`);
+          !/^stg_[1-9]\d*$/u.test(record.proposal_id) || !Number.isSafeInteger(Number(record.proposal_id.slice(4)) + 1) ||
+          consumed.has(record.proposal_id)) return fail(`invalid_proposal_at_commit_${seq}`);
       consumed.add(record.proposal_id);
     }
     const result = foldScopedLedger(ledger, record.ops, {

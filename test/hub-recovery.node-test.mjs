@@ -38,7 +38,7 @@ test('doctor agrees with checkout about index drift, above and below history, an
     const report = cli(['doctor', '--store', hub], 1);
     assert.deepEqual(report.issues.find(i => i.code === 'task_record_count_mismatch'),
       { code: 'task_record_count_mismatch', task_id: 1, indexed_count: indexed, record_count: 1 });
-    assert.equal(cli(['checkout', '1', '--preview', '--store', hub]).work_state.history_index_matches, false);
+    assert.equal(cli(['checkout', '1', '--preview', '--store', hub], 1).work_state.history_index_matches, false);
     assert.match(cli(['doctor', '--store', hub], 1, false), /task_record_count_mismatch/u);
     assert.equal(fs.readFileSync(paths.tasksIndexFile, 'utf8'), original);
   }

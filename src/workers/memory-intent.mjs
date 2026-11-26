@@ -7,6 +7,8 @@ const oneOff = /这(?:一)?次|这轮|本(?:轮|次)|仅今天|暂时|\b(?:this 
 const personal = /中文|英文|英语|汉语|回复|回答|简短|详细|\b(?:english|chinese|replies|answers|concise|verbose)\b/iu;
 const guarded = /[\p{Cc}\p{Cf}?？“”「」『』<>]|(?:如果|假设|举例|例如|比如|除非|只有|是否)|(?:不要|别|不必|不用).{0,8}(?:记|保存)|\b(?:if|unless|except|maybe|suppose|for example|(?:do not|don't) (?:remember|save))\b/iu;
 const instruction = /^(?:请\s*)?(?:以后|今后|往后|默认|请记住|记住|我的偏好|(?:我(?:希望|要求))?(?:所有|全部|每个|各个|跨)(?:的)?(?:项目|仓库))|^(?:please\s+)?(?:always|from now on|going forward|by default|remember|i prefer|use|reply|answer|respond|for |in |across )\b/iu;
+// A positive ASSERT cannot faithfully encode a negation or another speaker's preference.
+const nonAffirmative = /(?:不要|不用|别用|不再|并非|不是|不喜欢|不想|不应该|不得|禁止)|(?:同事|客户|别人|他们|她|他)(?:说|希望|要求|喜欢|偏好)|\b(?:not|never|don't|don’t|avoid|someone said|they prefer|(?:client|colleague) (?:says|prefers?))\b/iu;
 
 function* clauses(sentence) {
   let start = 0;
@@ -28,7 +30,7 @@ export function splitMemoryIntent(text, projectId) {
     for (const sentence of line.split(/[。；;！!]|\.(?:\s+|$)/u)) {
       if (!sentence.trim()) continue;
       const cue = globalCue.test(sentence) || durable.test(sentence) || oneOff.test(sentence) || localCue.test(sentence);
-      if (cue && (guarded.test(sentence) || /["\x60]/u.test(sentence))) { filtered = true; continue; }
+      if (cue && (guarded.test(sentence) || nonAffirmative.test(sentence) || /["\x60]/u.test(sentence))) { filtered = true; continue; }
       for (const raw of clauses(sentence)) {
         const quote = raw.trim().replace(/^(?:但是|但|but\s+)\s*/iu, '');
         if (!quote) continue;
@@ -37,7 +39,8 @@ export function splitMemoryIntent(text, projectId) {
         if (((all || durable.test(quote)) && (instruction.test(quote) || local)) || (local && personal.test(quote))) {
           filtered = true;
           if (quote.length > 320 || cards.length >= 8 || (all && local) || (local && !projectId)) continue;
-          cards.push({ quote, scopes: all ? ['user'] : local ? ['project'] : projectId ? ['user', 'project'] : ['user'] });
+          if (!cards.some(card => card.quote === quote))
+            cards.push({ quote, scopes: all ? ['user'] : local ? ['project'] : projectId ? ['user', 'project'] : ['user'] });
         } else rest.push(quote);
       }
     }

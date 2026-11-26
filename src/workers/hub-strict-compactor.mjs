@@ -1,5 +1,7 @@
 import path from 'node:path';
-import { buildStrictCompactorPrompt, readHubTaskCompaction, readHubTaskThread, readHubTasksIndex, readScopedHead, projectReadOnlyLedger, writeHubTaskCompaction } from '../kernel/index.mjs';
+import { buildStrictCompactorPrompt, readHubTasksIndex, readScopedHead, projectReadOnlyLedger, writeHubTaskCompaction } from '../kernel/index.mjs';
+import { readConsistentHub } from '../kernel/hub-write-lock.mjs';
+import { readCheckoutHistory } from './hub-task-checkout.mjs';
 import { summarizeBatches } from './compaction-batches.mjs';
 import { createOpenAICompatibleClient } from './llm-client.mjs';
 
@@ -14,17 +16,22 @@ export function exclusionWatchlist(...heads) {
 
 export async function runHubStrictCompactor({ hubRoot, taskId, mode = 'incremental', llmClient = null, signal, maxEmptyRetries = 1 } = {}) {
   const id = Number(taskId);
-  const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === id);
+  const { task, history, watchlist } = readConsistentHub(hubRoot, () => {
+    const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === id);
+    if (!task) return {};
+    const history = readCheckoutHistory(hubRoot, task);
+    const user = projectReadOnlyLedger(readScopedHead(hubRoot));
+    const project = task.project_id && projectReadOnlyLedger(readScopedHead(hubRoot, { scope: 'project', projectId: task.project_id }));
+    return { task, history, watchlist: exclusionWatchlist(user, project) };
+  });
   if (!task) return { ok: false, skipped: true, reason: 'task_not_found', task_id: id, llm_called: false };
-  const records = readHubTaskThread(hubRoot, id);
+  if (!history.ok) return { ok: false, reason: history.status, task_id: id, llm_called: false };
+  const records = history.thread;
   const oldCount = task.compacted_record_count;
-  const compact = readHubTaskCompaction(hubRoot, id);
+  const compact = history.raw;
   if (task.status !== 'active') return { ok: false, skipped: true, reason: 'task_not_active', task_id: id, task_status: task.status, compacted_record_count: oldCount };
   const target = mode === 'full' ? records : records.slice(oldCount);
   if (!target.length) return { ok: true, skipped: true, reason: 'no_new_turns', task_id: id, compacted_record_count: oldCount, compact_markdown: compact };
-  const userHead = projectReadOnlyLedger(readScopedHead(hubRoot, { scope: 'user' }), { includeTombstones: true });
-  const projectHead = task.project_id ? projectReadOnlyLedger(readScopedHead(hubRoot, { scope: 'project', projectId: task.project_id }), { includeTombstones: true }) : null;
-  const watchlist = exclusionWatchlist(userHead, projectHead);
   const system = [buildStrictCompactorPrompt({ taskId: id }), watchlist].filter(Boolean).join('\n\n');
   const { attempts, response } = await summarizeBatches({ records: target, previous: mode === 'full' ? '' : compact,
     system, client: llmClient ?? createOpenAICompatibleClient(), signal, maxEmptyRetries });

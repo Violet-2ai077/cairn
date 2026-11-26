@@ -116,7 +116,11 @@ export function createOpenAICompatibleClient(config = {}) {
         return abortedRes;
       }
 
-      const timeoutSignal = AbortSignal.timeout(timeoutMs);
+      // AbortSignal.timeout uses an unref'ed timer. A standalone CLI awaiting
+      // an injected transport must not exit before its outstanding deadline.
+      const timeout = new AbortController();
+      const deadline = setTimeout(() => timeout.abort(new DOMException('Timed out', 'TimeoutError')), timeoutMs);
+      const timeoutSignal = timeout.signal;
       const effectiveSignal = signal
         ? AbortSignal.any([signal, timeoutSignal])
         : timeoutSignal;
@@ -237,6 +241,8 @@ export function createOpenAICompatibleClient(config = {}) {
         };
         if (onLog) onLog(netErrRes);
         return netErrRes;
+      } finally {
+        clearTimeout(deadline);
       }
     }
   }

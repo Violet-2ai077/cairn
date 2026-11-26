@@ -1,5 +1,9 @@
 # DeepSeek Harness (`dsh`) Host Extension & Hook Interface Reference
 
+Current Hub operational contracts: [verified context](hub-reliability.md),
+[crash recovery](turn-recovery.md), [optional separate-session mode](attribution-quality.md),
+and [optional extended task IDs](hub-recovery.md#optional-extended-hub-task-ids).
+
 This document records **only verified factual capabilities** of the DeepSeek Harness (`dsh`) plugin and hook surface inspected during the ACMI -> Cairn transition, clearly separating **confirmed runtime hooks** from **surface items that require verification on an interactive `dsh` profile**.
 
 > **Hard Red Line**: Never port or resurrect legacy same-generation JSON `ENVELOPE` wrappers (`Phase 0.9.10` / `FM1` nested work-state trees). Cairn uses only lightweight trailing `<|task:N|UNRESOLVED|>` markers in the primary response stream and out-of-band asynchronous operator staging.

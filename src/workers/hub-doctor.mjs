@@ -1,9 +1,11 @@
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { isHubInitialized, readFileWrites, readHubTasksIndex, readProjectsIndex, replayScopedLedger, resolveHubPaths, readHubTaskThread } from '../kernel/index.mjs';
-import { readSessionBinding, readTaskObservations } from '../kernel/hub-store.mjs';
+import { readSessionBinding, readSessionMarkerBank, readTaskObservations } from '../kernel/hub-store.mjs';
+import { EXTENDED_TASK_CAPACITY, markerBank } from '../kernel/hub-task-ids.mjs';
 
-function inspectReceipts(paths, observations, inspect, issue) {
+function inspectReceipts(paths, observations, banks, inspect, issue) {
   const dir = path.join(paths.sessionsDir, 'turns');
   if (!fs.existsSync(dir)) return;
   for (const session of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -17,6 +19,10 @@ function inspectReceipts(paths, observations, inspect, issue) {
         inspect('turn_receipt_unreadable', { ...fields, turn }, () => {
           const r = JSON.parse(fs.readFileSync(path.join(folder, name), 'utf8'));
           if (r.turn !== turn || typeof r.status !== 'string') throw new Error('invalid_receipt');
+          if ((Object.hasOwn(r, 'marker_bank') && (!banks.has(session.name) || r.marker_bank !== banks.get(session.name))) ||
+              (r.task_id > 999 && r.status === 'archived' && r.marker_bank !== markerBank(r.task_id))) {
+            issue('receipt_marker_bank_mismatch', { ...fields, turn });
+          }
           if (r.observation_task_id != null && !observations.has([r.observation_task_id, session.name, turn].join(':'))) {
             issue('receipt_observation_missing', { ...fields, turn, task_id: r.observation_task_id });
           }
@@ -52,7 +58,13 @@ export function runHubDoctor({ hubRoot } = {}) {
           issue('task_status_invalid', { task_id: Number(t.id) });
         }
       }
-      return reader(hubRoot)[key];
+      try { return reader(hubRoot)[key]; }
+      catch (error) {
+        if (key !== 'tasks') throw error;
+        issue('tasks_index_unreadable');
+        // A diagnostic may inspect safe task paths without granting invalid rows authority.
+        return raw.tasks.filter(t => Number.isSafeInteger(t?.id) && t.id >= 1 && t.id <= EXTENDED_TASK_CAPACITY);
+      }
     });
   }
   const projects = index('projects', paths.projectsIndexFile, readProjectsIndex);
@@ -85,6 +97,10 @@ export function runHubDoctor({ hubRoot } = {}) {
       if (bad !== -1) issue('task_record_identity_mismatch', { ...fields, record_number: bad + 1 });
     });
     const compactExists = fs.existsSync(paths.taskCompactFile(task.id));
+    if (compactExists && task.compact_sha256) inspect('task_compact_unreadable', fields, () => {
+      if (createHash('sha256').update(fs.readFileSync(paths.taskCompactFile(task.id))).digest('hex') !== task.compact_sha256)
+        issue('task_compact_digest_mismatch', fields);
+    });
     if ((task.has_compact || task.compacted_record_count > 0) && !compactExists) issue('task_compact_missing', fields);
     if (!task.has_compact && (compactExists || task.compacted_record_count > 0)) issue('task_compact_index_mismatch', fields);
     inspect('task_observations_unreadable', fields, () => {
@@ -105,7 +121,15 @@ export function runHubDoctor({ hubRoot } = {}) {
     });
     if (projects && task.project_id && !projects.some(p => p.project_id === task.project_id)) issue('task_project_unregistered', fields);
   }
-  if (tasks) inspect('receipts_unreadable', {}, () => inspectReceipts(paths, observations, inspect, issue));
+  const banks = new Map(), bankDir = path.join(paths.sessionsDir, 'marker-banks');
+  if (fs.existsSync(bankDir)) inspect('marker_banks_unreadable', {}, () => {
+    for (const name of fs.readdirSync(bankDir)) inspect('session_marker_bank_invalid', {}, () => {
+      const row = JSON.parse(fs.readFileSync(path.join(bankDir, name), 'utf8'));
+      if (path.basename(paths.sessionBindingFile(row.session_id)) !== name) throw new Error('identity_mismatch');
+      banks.set(path.basename(name, '.json'), readSessionMarkerBank(hubRoot, row.session_id));
+    });
+  });
+  if (tasks) inspect('receipts_unreadable', {}, () => inspectReceipts(paths, observations, banks, inspect, issue));
   if (tasks && fs.existsSync(paths.sessionsDir)) inspect('sessions_dir_unreadable', {}, () => {
     const byId = new Map(tasks.map(task => [task.id, task]));
     for (const name of fs.readdirSync(paths.sessionsDir).filter(name => /^[a-f0-9]{24}\.json$/u.test(name))) {

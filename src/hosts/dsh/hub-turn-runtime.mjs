@@ -1,17 +1,21 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { claimSessionMarkerBank } from '../../kernel/hub-store.mjs';
+import { markerAlias, markerBank } from '../../kernel/hub-task-ids.mjs';
 import { buildAntiRecencyContract, buildHubTaskCatalog, parseTaskMarker } from '../../kernel/index.mjs';
 import { checkpointToolResult, finishHubScopedTurn, readHubTasksIndex, readProjectsIndex, readSessionBinding, readSessionChoice, recordTurnReceipt, replaceSessionChoice, turnSourceDigest } from '../../kernel/hub-store.mjs';
-import { textOf, collectToolEvidence, resumeUserText } from './turn-journal.mjs';
+import { textOf, collectToolEvidence, persistToolFact, resumeUserText } from './turn-journal.mjs';
 import { selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { mentionsCompetingTopic, runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
+import { readConsistentHub } from '../../kernel/hub-write-lock.mjs';
 import { readHandoffInputs, renderHandoffAuthority, renderHandoffObservations, renderFileWrites } from '../../workers/hub-handoff.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
 import { genericResume, pickTask, resumeIntent } from './task-picker.mjs';
+import { hasSingleTaskHistory, freshSessionReply } from './single-task-session.mjs';
 
 const SWITCH = /^(?:(?:please\s+)?(?:switch\s+(?:to|topics?)|change\s+(?:topics?|tasks?)|(?:start\s+(?:a\s+)?)?new\s+(?:topic|task))\b|(?:请\s*)?(?:切换|切到|换个话题|另开|新任务|新话题))/iu;
-const EXACT = /(?:\btask\s*#?\s*|任务\s*#?\s*|<\|task:)([1-9]\d{0,2})(?!\d)/giu;
-const EXACT_START = /^(?:(?:please\s+)?(?:continue|resume|revisit|switch to|open|work on)\s+|(?:请\s*)?(?:继续|恢复|切到|切换到|回到|打开)\s*)?(?:task\s*#?\s*|任务\s*#?\s*|<\|task:)[1-9]\d{0,2}(?!\d)/iu;
+const EXACT = /(?:\btask\s*#?\s*|任务\s*#?\s*|<\|task:)([1-9]\d*)(?!\d)/giu;
+const EXACT_START = /^(?:(?:please\s+)?(?:continue|resume|revisit|switch to|open|work on)\s+|(?:请\s*)?(?:继续|恢复|切到|切换到|回到|打开)\s*)?(?:task\s*#?\s*|任务\s*#?\s*|<\|task:)[1-9]\d*(?!\d)/iu;
 const clarification = 'Cairn 未确认本轮作用域，请澄清目标。旧作用域不适用于本轮；输出 <|task:UNRESOLVED|>，不要新建或续写任务。';
 const RETURN_TO = /^(?:(?:please\s+)?(?:(?:(?:let['’]s|can we)\s+)?(?:go\s+|come\s+|get\s+)?back to\b|(?:return to|revisit|resume|pick up)\s+\S)|(?:请|我们)?(?:再)?(?:回到|接着(?:昨天|之前|上次)|继续(?:昨天|之前|上次)))/iu;
 
@@ -19,8 +23,12 @@ const scopeKey = (sessionId, turn) => createHash('sha256').update(JSON.stringify
 
 export function resolveMidSessionPolicy(autopilot) {
   const options = autopilot?.midSessionSwitch;
+  const historyMode = options?.historyMode ?? 'native';
+  if (!['native', 'separate-session'].includes(historyMode) ||
+      (historyMode !== 'native' && (!autopilot?.enabled || options?.enabled === false))) throw new Error('invalid_history_mode');
   return {
     enabled: autopilot?.enabled === true && options?.enabled !== false,
+    historyMode,
     crossProject: options?.crossProject === true,
     routeTimeoutMs: Number.isSafeInteger(options?.routeTimeoutMs) && options.routeTimeoutMs > 0 ? options.routeTimeoutMs : 2500
   };
@@ -54,26 +62,49 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     turns.set(id, entry);
     return entry;
   }
-  function makeSnapshot(state, target, ticket, hot, projects, task) {
+  function makeSnapshot(sessionId, state, target, ticket) {
+    return readConsistentHub(hubRoot, () => {
+      const currentEpoch = readSessionBinding(hubRoot, sessionId, { includeCleared: true })?.binding_epoch ?? null;
+      if (currentEpoch !== state.bindingEpoch) throw new Error('epoch_conflict');
+      const index = readHubTasksIndex(hubRoot);
+      const task = index.tasks.find(t => t.id === target.taskId);
+      if (target.taskId && (!task || task.status !== 'active' || task.project_id !== target.projectId)) throw new Error('task_invalidated');
+      if (ticket && index.next_task_id !== ticket.taskId && !index.tasks.some(t =>
+        t.id === ticket.taskId && t.creation_turn_key === ticket.turnKey)) throw new Error('ticket_conflict');
+      const { hot } = selectHubTaskPools(index.tasks, { policy: taskHeat });
+      const projects = new Map(readProjectsIndex(hubRoot).projects.map(p => [p.project_id, p.name]));
+      return renderSnapshot(state, target, ticket, hot, projects, task);
+    });
+  }
+  function renderSnapshot(state, target, ticket, hot, projects, task) {
     const inputs = readHandoffInputs(hubRoot, task, target.projectId);
     const v = inputs.version;
     const cached = state.snapshot?.bindingEpoch === target.bindingEpoch ? state.snapshot : null;
-    const sameHistory = cached && cached.seenSeq === v.thread_seq;
-    if (sameHistory && cached.userRevision === v.user_revision && cached.projectRevision === v.project_revision &&
-        cached.observations === v.observations_sha256 && cached.fileWrites === v.file_writes_sha256) return cached;
-    const checkout = sameHistory ? cached.checkout : (target.taskId
-      ? compileHubTaskCheckout({ hubRoot, taskId: target.taskId, maxTailChars })
-      : null);
+    const fresh = target.taskId ? compileHubTaskCheckout({ hubRoot, taskId: target.taskId, maxTailChars }) : null;
+    if (fresh && !fresh.ok) throw new Error(fresh.status);
+    const sameHistory = cached && cached.seenSeq === v.thread_seq &&
+      cached.compactedCount === v.compacted_record_count && cached.compactHash === (fresh?.compact_sha256 ?? null);
+    // The selected task already has its own checkout and marker; its own
+    // successful turn must not invalidate the catalog just by warming it.
     const chosen = target.taskId ?? ticket?.taskId;
-    const catalog = cached?.catalog ?? buildHubTaskCatalog(hot.map(task => ({ ...task, project_name: projects.get(task.project_id) })));
+    const catalog = policy.historyMode === 'separate-session' ? '' : buildHubTaskCatalog(hot
+      .filter(t => t.id !== target.taskId && markerBank(t.id) === markerBank(chosen))
+      .map(t => ({ ...t, id: markerAlias(t.id), project_name: projects.get(t.project_id),
+        title: t.id > 999 ? 'Task #' + t.id + ': ' + t.title : t.title })));
+    if (sameHistory && cached.userRevision === v.user_revision && cached.projectRevision === v.project_revision &&
+        cached.observations === v.observations_sha256 && cached.fileWrites === v.file_writes_sha256 && cached.catalog === catalog) return cached;
+    const checkout = sameHistory ? cached.checkout : fresh;
     const text = [
-      `### Cairn current scope\nEarlier Cairn Project Ledgers and Task Checkouts do not apply to this turn. Project: ${target.projectId ?? 'general'}.\nRequired tail marker for this request: <|task:${chosen}|>.`,
+      `### Cairn current scope\nEarlier Cairn Project Ledgers and Task Checkouts do not apply to this turn. Project: ${target.projectId ?? 'general'}.\nRequired tail marker for this request: <|task:${markerAlias(chosen)}|>.` +
+        (chosen > 999 ? '\nDurable task #' + chosen + '; the short marker is local to this native session.' : ''),
       renderHandoffAuthority(inputs, projects.get(target.projectId)),
       checkout?.ok ? `<cairn_task_checkout task_id="${target.taskId}" project_id="${target.projectId ?? 'general'}">\n${checkout.text}\n</cairn_task_checkout>` : '',
       renderHandoffObservations(inputs), renderFileWrites(inputs), catalog
     ].filter(Boolean).join('\n\n');
     return Object.freeze({
       bindingEpoch: target.bindingEpoch, userRevision: v.user_revision, projectRevision: v.project_revision,
+      consistencyStatus: 'verified', snapshotId: createHash('sha256').update(JSON.stringify([target, v, fresh?.compact_sha256, text])).digest('hex'),
+      compactedCount: v.compacted_record_count, compactHash: fresh?.compact_sha256 ?? null,
       seenSeq: sameHistory ? cached.seenSeq : (checkout?.total_record_count ?? 0),
       observations: v.observations_sha256, fileWrites: v.file_writes_sha256,
       checkout: checkout ? Object.freeze(checkout) : null,
@@ -96,6 +127,7 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     if (memory) return deny('memory_command', memory);
     const started = Date.now();
     const index = readHubTasksIndex(hubRoot);
+    if (index.task_id_capacity && /<\|task:/u.test(entry.input)) return deny('use_durable_task_id', '请使用持久任务号（例如“继续任务 #1000”），不要用会话 marker 选择任务。');
     const tasks = index.tasks;
     const { hot, dormant } = selectHubTaskPools(tasks, { policy: taskHeat });
     const projects = new Map(readProjectsIndex(hubRoot).projects.map(item => [item.project_id, item.name]));
@@ -158,13 +190,22 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     if (taskId && !selected) return deny('task_invalidated');
     const allocate = result.decision === 'new';
     const nextId = recovery?.id ?? currentIndex.next_task_id;
-    if (allocate && (nextId < 1 || nextId > 999)) return deny('task_ids_exhausted');
+    if (allocate && (nextId < 1 || nextId > (currentIndex.task_id_capacity ?? 999))) return deny('task_ids_exhausted');
     const ticket = allocate ? Object.freeze({ taskId: nextId, turnKey: entry.turnKey }) : null;
     const same = !allocate && taskId === bound?.id && projectId === bound.project_id;
+    if (policy.historyMode === 'separate-session' &&
+        ((bound && !same) || !hasSingleTaskHistory(hubRoot, payload.agent?.session, sessionId, entry.turn, taskId ?? nextId)))
+      return deny('fresh_session_required', freshSessionReply(taskId));
     const target = { projectId, taskId, bindingEpoch: same ? expectedEpoch : randomUUID() };
-    const snapshot = makeSnapshot(state, target, ticket, hot, projects, selected);
+    const native = payload.agent?.session ?? payload.session;
+    if (currentIndex.task_id_capacity && !claimSessionMarkerBank(hubRoot, sessionId, taskId ?? nextId, {
+      turn: entry.turn, nativeId: native?.id, inheritedEventCount: native?.inheritedEventCount
+    })) return deny('fresh_session_required', freshSessionReply(taskId));
+    const snapshot = makeSnapshot(sessionId, state, target, ticket);
     return scoped({ result: result.decision, pool: result.pool ?? null, elapsed_ms: Date.now() - started }, {
-      ...target, snapshot, newTaskTicket: ticket, explicitPin: same && state.explicitPin,
+      ...target, snapshot, markerAlias: markerAlias(taskId ?? nextId),
+      ...(currentIndex.task_id_capacity && { markerBank: markerBank(taskId ?? nextId) }),
+      newTaskTicket: ticket, explicitPin: same && state.explicitPin,
       humanChoice: Boolean(picked),
       resumed: picked && picked.originalTurn !== entry.turn ? { turn: picked.originalTurn, input: picked.input } : null,
       bindingSource: picked ? 'human_choice' : same ? state.bindingSource : allocate ? 'new_task_ticket' : result.pool === 'dormant' ? 'dormant_wake' : explicit ? 'explicit_switch' : 'cold_router_match',
@@ -187,16 +228,23 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       const state = stateFor(sessionId);
       if (state.lastProcessedTurnKey === entry.turnKey) return;
       state.pendingSwitch = null;
-      entry.pending = plan(sessionId, entry, payload, cwd).catch(() => Object.freeze({
-        turnKey: entry.turnKey, snapshot: Object.freeze({ text: clarification }), route: Object.freeze({ result: 'clarify', reason: 'scope_unavailable' })
-      }));
+      entry.pending = plan(sessionId, entry, payload, cwd).catch(error => {
+        const code = String(error?.message ?? '').split(':', 1)[0];
+        const invalid = /^(?:hub_integrity|ledger_integrity|task_history_inconsistent|(?:tasks|projects)_index_(?:invalid.*|unreadable))$/u.test(code);
+        const busy = code === 'hub_snapshot_busy';
+        return Object.freeze({ turnKey: entry.turnKey, snapshot: Object.freeze({ text: clarification }),
+          route: Object.freeze({ result: 'clarify', reason: invalid ? 'state_integrity' : busy ? code : 'scope_unavailable' }),
+          ...(invalid || busy ? { display: invalid ? 'Cairn 状态校验失败，本轮未交给模型。请运行 cairn doctor 检查。' :
+            'Cairn 暂时无法获取一致快照，本轮未交给模型。请在写入结束后重试。' } : {}) });
+      });
     }
     if (entry.pending && !entry.scope) {
       const scope = await entry.pending;
       if (turns.get(sessionId) === entry && !payload.signal?.aborted) {
         entry.scope = scope;
         stateFor(sessionId).route = scope.route;
-        recordTurnReceipt(hubRoot, sessionId, turn, { status: 'in_progress', reason: 'awaiting_turn_end', first_seq: entry.firstSeq ?? null });
+        recordTurnReceipt(hubRoot, sessionId, turn, { status: 'in_progress', reason: 'awaiting_turn_end', first_seq: entry.firstSeq ?? null,
+          ...(scope.markerBank !== undefined && { marker_bank: scope.markerBank }) });
       }
     }
   }
@@ -230,6 +278,9 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     if (Number.isSafeInteger(event.seq)) entry.firstSeq ??= event.seq;
     const tool = collectToolEvidence(entry, event);
     const pinned = entry.scope;
+    if (pinned?.taskId && pinned.expectedEpoch === pinned.bindingEpoch && !entry.signal?.aborted && pinned.route.result !== 'clarify') {
+      persistToolFact(hubRoot, sessionId, entry, pinned, event);
+    }
     if (tool && event.surfaceOp === 'append' && pinned?.taskId && pinned.expectedEpoch === pinned.bindingEpoch && data.turn === entry.turn && Number.isSafeInteger(event.seq)) {
       checkpointToolResult(hubRoot, { taskId: pinned.taskId, projectId: pinned.projectId, bindingEpoch: pinned.bindingEpoch,
         source: { host: 'dsh', session_id: sessionId, turn: entry.turn, step: data.step ?? entry.step, journal_seq: event.seq },
@@ -275,20 +326,20 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
         ...(scope.resumed ? { selection_messages: entry.selectionMessages } : {}),
         source_digest: turnSourceDigest(user, marker.display_text) });
     }
-    if (marker.task_number !== (scope.taskId ?? scope.newTaskTicket?.taskId)) {
-      state.pendingSwitch = Object.freeze({ taskId: marker.task_number, turn: entry.turn });
+    if (marker.task_number !== scope.markerAlias) {
+      state.pendingSwitch = Object.freeze({ taskId: markerBank(scope.taskId ?? scope.newTaskTicket.taskId) * 999 + marker.task_number, turn: entry.turn });
       return receipt('unassigned', 'marker_mismatch');
     }
-    const result = finishHubScopedTurn(hubRoot, { sessionId, turn: entry.turn, scope, user, assistant: marker.answer, tools: entry.tools });
+    const result = finishHubScopedTurn(hubRoot, { sessionId, turn: entry.turn, scope, user, assistant: marker.answer, tools: entry.tools,
+      receiptFields: { first_seq: entry.firstSeq ?? null, end_seq: event.seq ?? null, ...(scope.resumed ? { original_turn: scope.resumed.turn } : {}) } });
     if (result.status !== 'archived') return receipt('unassigned', result.status);
-    receipt('archived', 'confirmed_marker', { task_id: result.taskId, ...(result.appended ? { extraction: { [scope.projectId ? 'project' : 'user']: 'pending' } } : {}) });
     syncBinding(sessionId, result.binding);
     state.lastProcessedTurnKey = scope.turnKey;
     // Native history contains our own answer. Advancing past an intervening peer append would lose its evidence.
     state.snapshot = scope.snapshot.seenSeq === result.prior_seq
       ? Object.freeze({ ...scope.snapshot, seenSeq: result.end_seq }) : scope.snapshot;
     state.presentedSnapshot = scope.snapshot;
-    if (result.appended) onArchive({ sessionId, turn: entry.turn, scope, taskId: result.taskId, user, assistant: marker.answer });
+    if (result.job) onArchive(result.job);
   }
   function context(id) {
     const scope = turns.get(id)?.scope;
@@ -325,7 +376,7 @@ export async function* hideHubStreamMarker(stream, entry, { strip = true, footer
     const marker = terminal ? parseTaskMarker(rawText) : null;
     let text = raw;
     if (marker?.valid) {
-      const addFooter = stop && footer && marker.task_number === (entry.scope?.taskId ?? entry.scope?.newTaskTicket?.taskId);
+      const addFooter = stop && footer && marker.task_number === (entry.scope?.markerAlias ?? entry.scope?.taskId ?? entry.scope?.newTaskTicket?.taskId);
       if (strip || addFooter) {
         // Only the final block changes; preserve its leading whitespace and already streamed prefix.
         const body = raw.slice(0, raw.lastIndexOf('<|task:')).trimEnd();

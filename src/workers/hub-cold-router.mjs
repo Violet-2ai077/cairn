@@ -6,15 +6,26 @@ import { createOpenAICompatibleClient } from './llm-client.mjs';
 
 const START_CONTINUE = /^(?:(?:please\s+)?(?:continue|resume|revisit|return to|pick up)\b|(?:请\s*)?(?:继续|接着|恢复|回到|跟进))/iu;
 export const isHubContinuation = text => START_CONTINUE.test(text.trim());
-const START_EXACT = /^(?:(?:please\s+)?(?:continue|resume|revisit|return to|pick up|switch to|open|work on)\s+|(?:请\s*)?(?:继续|接着|恢复|回到|跟进|切到|打开)\s*)?(?:task\b\s*|任务\s*|<\|task:)#?\s*([1-9]\d{0,2})(?!\d)(?:\|>)?(?=$|[\s，。,.!！:：])/iu;
+const START_EXACT = /^(?:(?:please\s+)?(?:continue|resume|revisit|return to|pick up|switch to|open|work on)\s+|(?:请\s*)?(?:继续|接着|恢复|回到|跟进|切到|打开)\s*)?(?:task\b\s*|任务\s*|<\|task:)#?\s*([1-9]\d*)(?!\d)(?:\|>)?(?=$|[\s，。,.!！:：])/iu;
 
 function taskReferences(text) {
-  return new Set([...text.matchAll(/(?:\btask\b\s*|任务\s*|<\|task:)#?\s*([1-9]\d{0,2})(?!\d)/giu)].map(match => Number(match[1])));
+  return new Set([...text.matchAll(/(?:\btask\b\s*|任务\s*|<\|task:)#?\s*([1-9]\d*)(?!\d)/giu)].map(match => Number(match[1])));
 }
 
 const STOP = new Set(['continue', 'resume', 'work', 'task', 'the', 'for', 'and', 'with', 'ing', '继续', '任务', '接着', '恢复', '回到', '跟进', '项目', '之前', '这个', '切到']);
 
-function terms(value) {
+// A small reviewable vocabulary expands candidate recall, not binding authority.
+// Matching English words (not substrings) keeps e.g. "cachet" out of cache tasks.
+const concepts = [
+  /\b(?:invoices?|billing)\b|发票|账单/iu, /\b(?:reconcil(?:e|ing|iation)|matching)\b|对账|核对/iu,
+  /\b(?:cache|caching)\b|缓存/iu, /\b(?:invalidat(?:e|ion)|eviction)\b|失效|淘汰/iu,
+  /\b(?:databases?|db)\b|数据库/iu, /\b(?:migrat(?:e|ing|ions?))\b|迁移/iu,
+  /\b(?:payments?|checkout)\b|支付|付款/iu, /\b(?:retries|retry|retrying)\b|重试/iu,
+  /\b(?:notifications?|alerts?)\b|通知|告警/iu, /\b(?:queues?|queueing)\b|队列/iu,
+  /\b(?:backups?|backing up)\b|备份/iu, /\b(?:restor(?:e|ing|ation)|recovery)\b|还原|灾备/iu
+];
+
+function terms(value, expandConcepts = true) {
   const tokens = new Set();
   const text = sanitizeHubRoutingText(value).normalize('NFKC').toLowerCase();
   for (const match of text.matchAll(/\p{Script=Han}+|(?:(?!\p{Script=Han})[\p{L}\p{N}])+/gu)) {
@@ -24,13 +35,14 @@ function terms(value) {
     } else if (word.length >= 2 && /\p{L}/u.test(match[0])) tokens.add(match[0]);
   }
   for (const token of STOP) tokens.delete(token);
+  if (expandConcepts) for (const [i, pattern] of concepts.entries()) if (pattern.test(text)) tokens.add('@' + i);
   return tokens;
 }
 
-export function shortlistDormant({ userPrompt, tasks, limit }) {
+export function shortlistDormant({ userPrompt, tasks, limit, expandConcepts = true }) {
   const ids = taskReferences(userPrompt);
-  const query = terms(userPrompt);
-  const hits = text => [...terms(text)].filter(token => query.has(token)).length;
+  const query = terms(userPrompt, expandConcepts);
+  const hits = text => [...terms(text, expandConcepts)].filter(token => query.has(token)).length;
   return tasks.map(task => ({
     task,
     score: (ids.has(task.id) ? 1000 : 0) + hits(task.title) * 3 + hits(task.project_name ?? task.project_id)
@@ -45,8 +57,12 @@ export function mentionsCompetingTopic(input, bound, tasks) {
   const query = terms(input);
   for (const token of terms(bound.title)) query.delete(token);
   if (query.size < 2) return false;
-  return tasks.some(task => task.id !== bound.id && task.status === 'active' &&
-    [...terms(task.title)].filter(token => query.has(token)).length >= 2);
+  return tasks.some(task => {
+    if (task.id === bound.id || task.status !== 'active') return false;
+    const shared = [...terms(task.title)].filter(token => query.has(token));
+    return shared.filter(term => term.startsWith('@')).length >= 2 ||
+      shared.filter(term => !term.startsWith('@')).length >= 2;
+  });
 }
 
 export function buildHubColdRouterPrompt(tasks, { cwdProjectHint = null } = {}) {

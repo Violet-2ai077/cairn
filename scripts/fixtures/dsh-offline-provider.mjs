@@ -115,6 +115,7 @@ export function apply(ctx) {
         return;
       }
       else {
+        if (phase === 'fresh-beta') log({ oldNativeMessage: req.messages.some(m => body(m).includes('ALPHA_ONLY_CSV_WITNESS')) });
         const task = Number(/Required tail marker for this request: <\|task:(\d+)\|>/u.exec(snapshot)?.[1]);
         const ledger = JSON.parse(/### Current Project Ledger[^\n]*\n(\{[\s\S]*?\n\})/u.exec(snapshot)?.[1] ?? '{}');
         if (phase === 'memory-same' || phase === 'memory-other') {

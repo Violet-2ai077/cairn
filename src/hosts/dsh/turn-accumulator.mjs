@@ -17,6 +17,7 @@ import {
   runStagingExtractor,
 } from '../../workers/index.mjs';
 import { distillTaskThread } from '../../workers/distill.mjs';
+import { redactToolOutput } from '../../kernel/tool-evidence.mjs';
 
 const SYNTHETIC_USER_SOURCES = new Set(['runtime-context', 'compact-checkpoint', 'agent-instructions']);
 
@@ -48,15 +49,15 @@ function summarizeToolTarget(name, rawArgs) {
     try {
       parsed = JSON.parse(rawArgs);
     } catch {
-      return rawArgs.slice(0, 120);
+      return redactToolOutput(rawArgs).slice(0, 120);
     }
   }
   if (!parsed || typeof parsed !== 'object') {
-    return String(rawArgs).slice(0, 120);
+    return redactToolOutput(rawArgs).slice(0, 120);
   }
   for (const key of ['command', 'CommandLine', 'path', 'Path', 'file', 'pattern', 'query', 'url']) {
     if (typeof parsed[key] === 'string' && parsed[key].trim()) {
-      return parsed[key].trim().slice(0, 160);
+      return redactToolOutput(parsed[key]).trim().slice(0, 160);
     }
   }
   return '';
@@ -191,7 +192,7 @@ export function createTurnAccumulator({
     if (event.type === 'tool/call') {
       const turnNum = event.data?.turn ?? turnStateBySession.get(sessionId)?.turn ?? 1;
       const current = ensureTurnState(sessionId, turnNum);
-      const callId = event.data?.callId ?? event.data?.id ?? `seq_${event.seq}`;
+      const callId = event.data?.callId ?? event.data?.id;
       const name = event.data?.name ?? event.data?.toolName ?? 'tool';
       const args = event.data?.arguments ?? event.data?.args ?? '';
       const callRecord = {
@@ -200,7 +201,7 @@ export function createTurnAccumulator({
         name,
         target: summarizeToolTarget(name, args)
       };
-      current.toolCallsById.set(callId, callRecord);
+      if (callId) current.toolCallsById.set(callId, callRecord);
       if (typeof event.seq === 'number') {
         current.toolCallsBySeq.set(event.seq, callRecord);
       }
@@ -281,12 +282,14 @@ export function createTurnAccumulator({
 
       const outputText = extractTextFromDshMessage(msg);
       const isError = Boolean(msg?.isError ?? event.data?.error !== undefined);
+      const nativeId = toolCallId ?? matchedCall?.callId;
       current.completedTools.push({
         name: matchedCall?.name ?? 'tool',
         target: matchedCall?.target ?? '',
         ok: !isError,
         exit_code: isError ? 1 : 0,
-        output: outputText
+        ...(typeof nativeId === 'string' && nativeId && { call_id: nativeId }),
+        output: redactToolOutput(outputText)
       });
       return;
     }

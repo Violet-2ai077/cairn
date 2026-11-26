@@ -142,8 +142,9 @@ test('handoff bounds outstanding evidence, preserves receipt privacy, and never 
   fs.writeFileSync(file, bytes);
   const inconsistent = preview();
   assert.equal(inconsistent.work_state.history_index_matches, false);
-  assert.equal(inconsistent.work_state.pending_count, 9);
-  assert.equal(inconsistent.work_state.version.thread_seq, 0);
+  assert.equal(inconsistent.ok, false);
+  assert.equal(inconsistent.work_state.consistency_status, 'inconsistent');
+  assert.equal(inconsistent.work_state.authority, undefined);
   assert.equal(fs.readFileSync(file, 'utf8'), bytes);
 });
 const recent = '2026-01-31T00:00:00Z';

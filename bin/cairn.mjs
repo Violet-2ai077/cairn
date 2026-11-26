@@ -22,6 +22,7 @@ import {
 import { compileTaskCheckout, runStrictCompactor, createOpenAICompatibleClient, runWorkspaceDoctor } from '../src/workers/index.mjs';
 import { resolveStoreRoot } from '../src/workers/store-root.mjs';
 import { compileHubHandoff } from '../src/workers/hub-handoff.mjs';
+import { readToolTimeline } from '../src/kernel/tool-timeline.mjs';
 import { verifyFileWrite } from '../src/kernel/file-writes.mjs';
 import { runHubDoctor } from '../src/workers/hub-doctor.mjs';
 import { backupHub, restoreHub } from '../src/workers/hub-recovery.mjs';
@@ -41,6 +42,7 @@ function printUsage(writeOut) {
       '',
       'Usage:',
       '  cairn init   [--cwd <dir>] [--json]',
+      '  cairn init   --store <hub> [--extended-task-ids] [--json]',
       '  cairn status [--cwd <dir>] [--json]',
       '  cairn log    [--cwd <dir>] [--json]',
       '  cairn commit [proposal_id] [--rebase] [--actor <id>] [--step <step>] [--cwd <dir>] [--json]',
@@ -51,8 +53,9 @@ function printUsage(writeOut) {
       '  cairn doctor [--cwd <dir>] [--json]'
       ,'  cairn checkout <id|--clear> [--preview] [--cwd <dir>]'
       ,'  cairn verify-write <task-id> <write-id> [--store <path>] [--json]'
-      ,'  cairn backup <new-bundle-dir> --store <stopped-hub> [--json]'
-      ,'  cairn restore <bundle-dir> --store <new-hub-dir> [--json]'
+      ,'  cairn tool-calls <task-id> [<turn> --session <id>] [--store <path>] [--json]'
+      ,'  cairn backup <new-bundle-dir> --store <stopped-hub> [--key-file <external-key>] [--json]'
+      ,'  cairn restore <bundle-dir> --store <new-hub-dir> [--key-file <external-key>] [--json]'
       ,'  cairn compact <id> [--full] [--cwd <dir>]'
       ,'  Hub default: $DSH_HOME/cairn or ~/.cairn; use --store <path> to override. --cwd selects legacy workspace storage.'
       ,'  cairn revert <seq> --scope <user|project> [--project <id>] --reason <text> [--preview] [--store <path>] [--json]'
@@ -77,6 +80,8 @@ export function runCairnCli(
       options: {
         cwd: { type: 'string' },
         store: { type: 'string' },
+        'key-file': { type: 'string' },
+        'extended-task-ids': { type: 'boolean' },
         session: { type: 'string' },
         scope: { type: 'string' },
         project: { type: 'string' },
@@ -108,6 +113,13 @@ export function runCairnCli(
   const asJson = Boolean(values.json);
 
   const useHubStore = values.store !== undefined || (values.cwd === undefined && path.resolve(cwd) === path.resolve(process.cwd()));
+  if (values['extended-task-ids'] && (subcommand !== 'init' || !useHubStore || values.cwd !== undefined)) {
+    stderr('--extended-task-ids requires Hub init'); return 1;
+  }
+  if (values['key-file'] !== undefined && (!['backup', 'restore'].includes(subcommand) || !values['key-file'].trim())) {
+    stderr('--key-file requires backup or restore and an external key file');
+    return 1;
+  }
   if (values.help || !subcommand) {
     printUsage(stdout);
     return values.help ? 0 : 1;
@@ -377,14 +389,15 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
   try {
     if (command === 'backup' || command === 'restore') {
       if (positionals.length !== 2 || !targetArg?.trim() || !values.store?.trim() ||
-          Object.entries(values).some(([key, v]) => v && key !== 'json' && key !== 'store')) {
-        throw new Error('Use cairn ' + command + ' <bundle-dir> --store <hub-dir> [--json]');
+          Object.entries(values).some(([key, v]) => v && !['json', 'store', 'key-file'].includes(key))) {
+        throw new Error('Use cairn ' + command + ' <bundle-dir> --store <hub-dir> [--key-file <external-key>] [--json]');
       }
-      const result = command === 'backup' ? backupHub(hubRoot, targetArg) : restoreHub(targetArg, hubRoot);
+      const options = { keyFile: values['key-file'] };
+      const result = command === 'backup' ? backupHub(hubRoot, targetArg, options) : restoreHub(targetArg, hubRoot, options);
       emit(asJson ? result : 'Verified ' + result.file_count + ' files: ' + (result.backup ?? result.hub));
       return 0;
     }
-    if (command === 'init') { emit(initHubStore(hubRoot)); return 0; }
+    if (command === 'init') { emit(initHubStore(hubRoot, { extendedTaskIds: values['extended-task-ids'] })); return 0; }
     if (command === 'doctor') {
       const report = runHubDoctor({ hubRoot });
       if (asJson) emit(report);
@@ -433,6 +446,15 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
       emit(result); return ['committed', 'nothing_to_commit'].includes(result.reason) ? 0 : 1;
     }
     if (command === 'drop') { emit(dropScopedStaged(hubRoot, { scope, projectId, proposal_id: targetArg })); return 0; }
+    if (command === 'tool-calls') {
+      const turn = positionals[2];
+      if (!/^[1-9]\d*$/u.test(targetArg ?? '') || positionals.length > 3 ||
+          (turn !== undefined && (!values.session || !/^\d+$/u.test(turn) || !Number.isSafeInteger(Number(turn))))) {
+        throw new Error('Use tool-calls <task-id> [<turn> --session <id>]');
+      }
+      emit(readToolTimeline(hubRoot, Number(targetArg), { sessionId: values.session, turn: turn == null ? null : Number(turn) }));
+      return 0;
+    }
     if (command === 'verify-write') {
       if (positionals.length !== 3 || !/^[1-9]\d*$/u.test(targetArg) || values.preview) throw new Error('Use verify-write <task-id> <write-id>');
       const result = verifyFileWrite(hubRoot, Number(targetArg), positionals[2]);
@@ -452,7 +474,7 @@ function runHubCli(command, targetArg, positionals, values, { stdout, stderr, as
       const task = readHubTasksIndex(hubRoot).tasks.find(item => item.id === taskId);
       if (!task) throw new Error(`Task not found: ${taskId}`);
       const checkout = compileHubHandoff({ hubRoot, taskId });
-      if (values.preview) { emit(asJson ? checkout : checkout.text); return 0; }
+      if (values.preview || !checkout.ok) { emit(asJson ? checkout : checkout.text); return checkout.ok ? 0 : 1; }
       if (!sessionId) throw new Error('checkout binding requires --session <id>; use --preview for read-only output');
       if (task.status !== 'active') throw new Error(`task_not_active:${taskId}:${task.status}; run 'cairn reopen ${taskId}' first`);
       const binding = writeSessionBinding(hubRoot, sessionId, { project_id: task.project_id, task_id: taskId, source: 'cli_checkout' });

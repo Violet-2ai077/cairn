@@ -5,9 +5,10 @@ import { isDeepStrictEqual } from 'node:util';
 import { isHubInitialized } from '../kernel/hub-store.mjs';
 import { withHubWriteLock } from '../kernel/hub-write-lock.mjs';
 import { runHubDoctor } from './hub-doctor.mjs';
+import { sealBackup, withOpenBackup } from './hub-backup-crypto.mjs';
 
 const format = 'cairn-cold-hub';
-const lockEntry = name => /^\.write\.lock(?:\.guard(?:\.pending-.+)?)?$/iu.test(name);
+const lockEntry = name => name === '.hub-generation.pending' || /^\.write\.lock(?:\.guard(?:\.pending-.+)?)?$/iu.test(name);
 const inside = (root, child) => {
   const rel = path.relative(root, child);
   return !path.isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + path.sep);
@@ -69,16 +70,25 @@ function healthy(root) {
 }
 const result = (location, entries) => ({ ok: true, ...location, file_count: entries.filter(e => e.type === 'file').length });
 
-export function backupHub(hubRoot, backupDir) {
+export function backupHub(hubRoot, backupDir, { keyFile } = {}) {
   const src = directory(hubRoot), bundle = newDestination(src, backupDir);
   if (!isHubInitialized(src)) throw new Error('backup_requires_initialized_hub');
+  if (keyFile !== undefined) {
+    const entries = withHubWriteLock(src, () => {
+      healthy(src);
+      const inventory = scan(src, { liveSource: true });
+      sealBackup(src, bundle, inventory, keyFile);
+      return inventory;
+    }, { publishGeneration: false });
+    return result({ backup: bundle, encrypted: true }, entries);
+  }
   const data = path.join(bundle, 'data');
   // The operator stops writers first; the normal Hub lock fences a writer that races the copy.
   const entries = withHubWriteLock(src, () => {
     fs.mkdirSync(bundle, { mode: 0o700 });
     fs.mkdirSync(data, { mode: 0o700 });
     return scan(src, { copyTo: data, liveSource: true });
-  });
+  }, { publishGeneration: false });
   verify(scan(data), entries);
   healthy(data);
   const pending = path.join(bundle, '.manifest.pending');
@@ -87,18 +97,27 @@ export function backupHub(hubRoot, backupDir) {
   return result({ backup: bundle }, entries);
 }
 
-export function restoreHub(backupDir, hubRoot) {
+export function restoreHub(backupDir, hubRoot, { keyFile } = {}) {
   const bundle = directory(backupDir), dest = newDestination(bundle, hubRoot);
   const manifest = path.join(bundle, 'manifest.json'), st = fs.lstatSync(manifest);
   if (!st.isFile() || st.nlink !== 1) throw new Error('recovery_invalid_manifest');
-  const { format: kind, version, entries } = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+  const envelope = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+  const { format: kind, version, entries } = envelope;
+  if (kind === format && version === 2) {
+    return withOpenBackup(bundle, dest, envelope, keyFile, (inventory, unpack) => publishRestore(dest, inventory, unpack));
+  }
+  if (keyFile !== undefined) throw new Error('encrypted_backup_required');
   if (kind !== format || version !== 1 || !Array.isArray(entries)) throw new Error('recovery_invalid_manifest');
   const data = directory(path.join(bundle, 'data'));
   verify(scan(data), entries);
+  return publishRestore(dest, entries, staging => verify(scan(data, { copyTo: staging }), entries));
+}
+
+function publishRestore(dest, entries, unpack) {
   // Reserve exclusively, including against a concurrent restore. Never clean or replace a caller's directory.
   fs.mkdirSync(dest, { mode: 0o700 });
   const staging = fs.mkdtempSync(path.join(dest, '.restore-pending-'));
-  verify(scan(data, { copyTo: staging }), entries);
+  unpack(staging);
   verify(scan(staging), entries);
   healthy(staging);
   for (const name of fs.readdirSync(staging)) {

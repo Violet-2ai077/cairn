@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readHubTaskThread, readHubTasksIndex, readScopedHead, readScopedStaged, readSessionBinding, stageScopedOperators } from '../src/kernel/hub-store.mjs';
 import { readTaskThread, replayLedger } from '../src/kernel/store.mjs';
+import { upsertHubTask, readSessionMarkerBank, readTurnReceipts } from '../src/kernel/hub-store.mjs';
 
 const requested = process.argv[2] ?? process.env.DSH_BIN;
 if (!requested) throw new Error('Pass the installed dsh/lib/bin.js path, or set DSH_BIN.');
@@ -120,6 +121,51 @@ function main() {
   assert.equal(spawnSync('git', ['init', '--quiet'], { cwd, windowsHide: true }).status, 0);
   fs.writeFileSync(path.join(cwd, 'csv.test.cjs'), "require('node:test')('csv-header', () => require('node:assert/strict').equal('wrong', 'CSV_HEADER_EXPECTED'));");
   if (process.argv.includes('--marker-only')) return verifyMarkerMatrix();
+  if (process.argv.includes('--marker-bank-only')) {
+    const cli = (args, store = hub) => {
+      const r = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/cairn.mjs', import.meta.url)),
+        ...args, '--store', store, '--json'], { encoding: 'utf8', windowsHide: true });
+      assert.equal(r.status, 0, r.stderr + r.stdout); return JSON.parse(r.stdout);
+    };
+    cli(['init', '--extended-task-ids']);
+    upsertHubTask(hub, { id: 1 }); upsertHubTask(hub, { id: 999 });
+    configure({ storeRoot: hub, autopilot: { enabled: true, midSessionSwitch: { crossProject: true } } });
+    run('bank-first', 'New task: publish a capacity report.');
+    const { sessionId, snapshot } = entries().find(e => e.phase === 'bank-first' && e.snapshot) ?? {};
+    assert.equal(snapshot?.task, 1, 'the real first-turn provider must receive the short alias');
+    assert.equal(readSessionMarkerBank(hub, sessionId), 1);
+    assert.equal(readTurnReceipts(hub, sessionId, 1).task_id, 1000);
+    run('bank-resume', 'Continue task #1000.', sessionId);
+    assert.equal(readHubTaskThread(hub, 1000).length, 4);
+    assert.match(run('bank-cross', 'Continue task #1.', sessionId), /全新 dsh 会话/u);
+    assert.ok(!entries().some(e => e.phase === 'bank-cross' && e.snapshot));
+    assert.equal(readHubTaskThread(hub, 1).length, 0);
+    const bundle = path.join(tmp, 'bank-backup'), restored = path.join(tmp, 'bank-restored');
+    cli(['backup', bundle]); cli(['restore', bundle], restored);
+    const args = ['checkout', '1000', '--preview'];
+    assert.deepEqual(cli(args, restored), cli(args));
+    assert.equal(readSessionMarkerBank(restored, sessionId), 1);
+    console.log('PASS: native fresh session filed short marker 1 into durable task 1000, resumed after restart, rejected bank switch and restored #1000 unchanged.');
+    return;
+  }
+  if (process.argv.includes('--separate-session-only')) {
+    configure({ storeRoot: hub, autopilot: { enabled: true, midSessionSwitch: { historyMode: 'separate-session' } } });
+    run('a', 'Investigate CSV export.\nUse npm\nLocal note: ALPHA_ONLY_CSV_WITNESS');
+    const id = entries().find(e => e.sessionId)?.sessionId;
+    assert.ok(id, 'first business request must reach provider');
+    run('same-task', 'Verify the CSV status.', id);
+    assert.equal(readHubTaskThread(hub, 1).length, 4);
+    const switched = run('switch-blocked', 'New task: change the test runner.', id);
+    assert.match(switched, /全新 dsh 会话/u);
+    assert.ok(!entries().some(e => e.phase === 'switch-blocked' && e.snapshot));
+    assert.equal(readHubTasksIndex(hub).tasks.length, 1);
+    run('fresh-beta', 'New task: change the test runner.\nUse pnpm');
+    assert.equal(readHubTaskThread(hub, 2).length, 2);
+    const witness = entries().find(e => e.phase === 'fresh-beta' && 'oldNativeMessage' in e);
+    assert.equal(witness?.oldNativeMessage, false, 'fresh provider request must not include the old authored note');
+    console.log('PASS: separate-session kept the same task and tool turn, blocked the switch before business completion and accepted a fresh session.');
+    return;
+  }
   configure({ storeRoot: hub, autopilot: { enabled: true } });
   run('a', 'Investigate CSV export.\nUse npm');
   const id = entries().find(e => e.sessionId).sessionId;

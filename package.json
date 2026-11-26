@@ -32,6 +32,8 @@
     "./hosts/dsh/hub-host": "./src/hosts/dsh/hub-host.mjs"
   },
   "scripts": {
-    "test": "node --test test/kernel.node-test.mjs test/file-write.node-test.mjs test/hub-recovery.node-test.mjs test/hub-store.node-test.mjs test/hub-workers.node-test.mjs test/hub-cli.node-test.mjs test/git-project.node-test.mjs test/hub-host.node-test.mjs test/store-cli.node-test.mjs test/workers.node-test.mjs test/dsh-host.node-test.mjs"
+    "test": "node --test",
+    "bench:hub": "node scripts/bench-hub.mjs",
+    "eval:reliability": "node scripts/eval-reliability.mjs"
   }
 }

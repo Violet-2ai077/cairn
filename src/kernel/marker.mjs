@@ -4,6 +4,8 @@
 // Markdown code fence (paired ```) when the tail marker sits on its own trailing line outside the fence,
 // while strictly rejecting markers trapped inside an unclosed code fence.
 
+import { EXTENDED_TASK_CAPACITY } from './hub-task-ids.mjs';
+
 const MARKER_PREFIX_GLOBAL_REGEX = /<\|task:/g;
 const TRAILING_MARKER_EXEC_REGEX = /<\|task:([1-9][0-9]{0,2}|UNRESOLVED)\|>\s*$/;
 const CODE_FENCE_DELIMITER_REGEX = /```/g;
@@ -154,7 +156,7 @@ export function buildLightTaskCatalog(tasks = []) {
 
 export function buildHubTaskCatalog(tasks = []) {
   if (!Array.isArray(tasks)) return '';
-  const cards = buildHubRoutingCards(tasks);
+  const cards = buildHubRoutingCards(tasks).filter(card => card.task_id <= 999);
   if (!cards.length) return '';
   const lines = cards.map(card => {
     const project = card.project_id ? ` [project:${card.project_name}; id:${card.project_id}]` : ' [general]';
@@ -181,6 +183,6 @@ export function buildHubRoutingCards(tasks) {
       project_name: sanitizeHubRoutingText(task.project_name ?? task.project_id ?? 'general').slice(0, 120),
       title: sanitizeHubRoutingText(task.title).slice(0, 200),
       preview: sanitizeHubRoutingText(task.preview).slice(0, 200)
-    })).filter(card => Number.isSafeInteger(card.task_id) && card.task_id >= 1 && card.task_id <= 999)
+    })).filter(card => Number.isSafeInteger(card.task_id) && card.task_id >= 1 && card.task_id <= EXTENDED_TASK_CAPACITY)
     .sort((a, b) => a.task_id - b.task_id);
 }

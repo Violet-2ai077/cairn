@@ -1,5 +1,10 @@
 # Cairn Architecture: Git for Agent Work States
 
+For the current default Hub, see [authority and context consistency](hub-reliability.md),
+[confirmed-turn archives and tool evidence](turn-recovery.md), and
+[cold recovery and extended durable IDs](hub-recovery.md). The original
+workspace adapter and the default Hub share the five primitives, not the same disk layout.
+
 Cairn is a lightweight, local-first work-state and task-continuity engine for AI coding agents. Its design is derived directly from the **five closed-loop primitives** validated across **484 controlled single-factor ablation calls** in ACMI Path 1 ([`docs/reference/acmi-path1-synthesis.md`](reference/acmi-path1-synthesis.md)).
 
 ---

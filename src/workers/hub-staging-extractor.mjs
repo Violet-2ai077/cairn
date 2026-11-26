@@ -1,11 +1,15 @@
-import { buildScopedStagingExtractorPrompt, commitScopedStaged, foldScopedLedger, projectReadOnlyLedger, readScopedHead, stageScopedOperators } from '../kernel/index.mjs';
+import { buildScopedStagingExtractorPrompt, commitScopedStaged, foldScopedLedger, projectReadOnlyLedger, readScopedHead, readScopedStaged, stageScopedOperators } from '../kernel/index.mjs';
 import { distillTurnTrajectory } from './distill.mjs';
 import { createOpenAICompatibleClient } from './llm-client.mjs';
 import { evaluateAutoCommit } from './hub-auto-commit.mjs';
 
-export async function runHubStagingExtractor({ hubRoot, scope = 'user', projectId = null, turnInput = {}, authoredUserText = '', autopilot = null, source_step = null, actor_id = 'default', llmClient = null, signal, project = null } = {}) {
+export async function runHubStagingExtractor({ hubRoot, scope = 'user', projectId = null, turnInput = {}, authoredUserText = '', autopilot = null, source_step = null, actor_id = 'default', llmClient = null, signal, project = null, extraction = null } = {}) {
   if (scope === 'user') projectId = null;
   if (scope === 'project' && !projectId) throw new Error('project_id_required');
+  if (extraction && readScopedStaged(hubRoot, { scope, projectId }).proposals.some(p =>
+    p.extraction?.sessionId === extraction.sessionId && p.extraction.turn === extraction.turn)) {
+    return { ok: true, staged: true, reason: 'previously_staged' };
+  }
   const head = readScopedHead(hubRoot, { scope, projectId });
   const snapshot = projectReadOnlyLedger(head, { includeTombstones: true });
   const distilled = distillTurnTrajectory(turnInput);
@@ -30,7 +34,8 @@ export async function runHubStagingExtractor({ hubRoot, scope = 'user', projectI
     scope, rejectedCount: precheck.rejected_count, ops: accepted, evidence: parsed.evidence,
     authoredUserText, assistantText: turnInput.assistant, autopilot
   });
-  const proposal = stageScopedOperators(hubRoot, { scope, projectId, project, ops: accepted, source_step: source_step ?? `turn_${turnInput.turn ?? 1}`, actor_id, base_revision: head.revision, admission: withEvidence ? admission : null });
+  const proposal = stageScopedOperators(hubRoot, { scope, projectId, project, ops: accepted, source_step: source_step ?? `turn_${turnInput.turn ?? 1}`, actor_id, base_revision: head.revision, admission: withEvidence ? admission : null, extraction });
+  if (!proposal.staged) return { ok: true, staged: false, reason: proposal.reason };
   const autoCommit = admission.eligible
     ? commitScopedStaged(hubRoot, { scope, projectId, proposal_id: proposal.proposal.proposal_id, mode: 'auto' })
     : null;

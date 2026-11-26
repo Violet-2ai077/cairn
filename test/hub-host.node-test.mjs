@@ -203,7 +203,7 @@ test('an independent checkout distinguishes observed results from accepted turns
   assert.equal(pending.turn_status, 'in_progress');
   assert.equal(pending.disposition, 'verify_before_retry');
   assert.equal(pending.request_excerpt, 'check the export');
-  assert.deepEqual(pending.last_tool, { name: 'probe_csv', ok: false, output: 'HEADER_MISSING' });
+  assert.deepEqual(pending.last_tool, { name: 'probe_csv', ok: false, output: 'HEADER_MISSING', call_id: 'c' });
   assert.deepEqual(pending.source, { host: 'dsh', session_id: 'writer', turn: 1, step: 1, journal_seq: 12 });
   assert.equal(live.authority.user.active[0].option_code, 'user_rule');
   assert.equal(live.authority.project.active[0].option_code, 'project_rule');
@@ -227,6 +227,51 @@ test('an independent checkout distinguishes observed results from accepted turns
   await s.slash('checkout 2');
   result(3, 25, 'late result after rebind');
   assert.doesNotMatch(cli(1) + cli(2), /late result after rebind/u);
+});
+
+test('operator tool timeline survives a lost result, excerpt eviction, restart and archive without persisting output or arguments', async t => {
+  const hub = fs.mkdtempSync(path.join(os.tmpdir(), 'cairn-call-facts-'));
+  const config = { storeRoot: hub, autopilot: { enabled: true }, llmClient: { complete: async () => ({ ok: true, content: '{"ops":[]}' }) } };
+  let ctx = mockCtx(), host = await createHubDshHost(ctx, config), s = scopedSession(ctx, 'timeline');
+  t.after(async () => { await host.dispose(); fs.rmSync(hub, { recursive: true, force: true }); });
+  upsertHubTask(hub, { id: 1, title: 'Bound' });
+  upsertHubTask(hub, { id: 2, title: 'Other' });
+  await s.slash('checkout 1');
+  const cli = id => JSON.parse(execFileSync(process.execPath, [fileURLToPath(new URL('../bin/cairn.mjs', import.meta.url)),
+    'tool-calls', String(id), '--store', hub, '--json'], { encoding: 'utf8' }));
+  const send = (type, seq, data, surfaceOp, extra) => ctx.handlers.get('session/event')(s.session, { type, seq, surfaceOp, data, ...extra });
+  const call = (turn, seq, id, surfaceOp) => send('tool/call', seq, { turn, step: 1, callId: id, name: 'probe', args: { password: 'argument-sentinel' } }, surfaceOp);
+  const result = (turn, seq, id, ok, linked) => send('tool/result', seq, { turn, step: 1, message: { toolCallId: id,
+    isError: !ok, content: 'API_KEY=output-sentinel' } }, 'append', { sourceEventSeqs: [linked] });
+  await s.start(1, 'inspect');
+  for (let i = 0; i < 36; i++) {
+    call(1, 10 + 2 * i, 'call-' + i);
+    if (i !== 1) result(1, 11 + 2 * i, 'call-' + i, i !== 2, 10 + 2 * i);
+  }
+  call(1, 90, 'replacement', 'replace');
+  const before = cli(1);
+  assert.equal(before.turns[0].calls.length, 36);
+  assert.equal(before.turns[0].calls[1].result_status, 'unknown');
+  assert.equal(before.turns[0].calls[2].results[0].ok, false);
+  assert.equal(before.turns[0].calls[35].results[0].ok, true);
+  assert.equal(before.turns[0].unmatched_results.length, 0);
+  assert.doesNotMatch(JSON.stringify(before), /argument-sentinel|output-sentinel|replacement/);
+  const pages = path.join(hub, 'tasks', '1', 'tool-timeline');
+  for (const file of fs.readdirSync(pages)) assert.doesNotMatch(fs.readFileSync(path.join(pages, file), 'utf8'), /argument-sentinel|output-sentinel|API_KEY|password/);
+  s.end(1, 'unfinished', 'interrupted');
+  await host.dispose();
+  ctx = mockCtx(); host = await createHubDshHost(ctx, config); s = scopedSession(ctx, 'timeline');
+  assert.deepEqual(cli(1), before);
+  await s.start(2, 'check again');
+  call(2, 96, 'final');
+  result(2, 97, undefined, true, 96);
+  s.end(2, 'filed\n<|task:1|>');
+  assert.equal(cli(1).turns[1].calls[0].results[0].journal_seq, 97);
+  await s.start(3, 'check');
+  await s.slash('checkout 2');
+  call(3, 101, 'late-after-checkout');
+  assert.equal(cli(1).turns.length, 2);
+  assert.equal(cli(2).turns.length, 0);
 });
 
 test('peer writes during a frozen turn are visible at the next authored turn', async t => {

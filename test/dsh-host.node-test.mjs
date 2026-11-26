@@ -420,7 +420,7 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
             content: [
               {
                 type: 'text',
-                text: 'metric: stale_read_14pct observed at p99 latency 840ms'
+                text: 'metric: stale_read_14pct observed at p99 latency 840ms; API_KEY=workspace-probe-secret'
               }
             ]
           }
@@ -477,6 +477,9 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
       assert.ok(thread1[1].raw_content.endsWith('<|task:1|>'));
       assert.equal(thread1[1].meta.tools[0].name, 'bash');
       assert.equal(thread1[1].meta.tools[0].target, 'npm run bench:cache');
+      assert.equal(thread1[1].meta.tools[0].call_id, 'call_bench_1');
+      assert.match(thread1[1].meta.tools[0].output, /API_KEY=<redacted>/);
+      assert.ok(!JSON.stringify(thread1[1]).includes('workspace-probe-secret'));
 
       // Verify out-of-band worker reused observed host provider/model and staged stg_1
       assert.equal(workerStreamCalls.length, 1);
