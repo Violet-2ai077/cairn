@@ -1,3 +1,4 @@
+import '../scripts/fixtures/zh-test-locale.mjs';
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

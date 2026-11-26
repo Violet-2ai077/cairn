@@ -12,9 +12,10 @@ import {
   readTasksIndex,
   readTaskThread,
   readTaskCompaction,
-  writeTaskCompaction,
-  buildStrictCompactorPrompt
+  writeTaskCompaction
 } from '../kernel/index.mjs';
+import { buildStrictCompactorPrompt } from '../i18n/contracts.mjs';
+import { pick } from '../i18n/locale.mjs';
 import { createOpenAICompatibleClient } from './llm-client.mjs';
 import { summarizeBatches } from './compaction-batches.mjs';
 
@@ -41,8 +42,9 @@ export function buildGlobalExclusionWatchlistSection(head) {
   }
 
   const lines = [
-    '### 宿主权威全局账本剔除黑名单（Global Ledger Exclusion Watchlist）',
-    '以下键名（keys）与方案代号（option_codes）属于工作区全局账本（Workspace State Ledger）管辖范围：'
+    pick('### 宿主权威全局账本剔除黑名单（Global Ledger Exclusion Watchlist）', '### Global Ledger Exclusion Watchlist'),
+    pick('以下键名（keys）与方案代号（option_codes）属于工作区全局账本（Workspace State Ledger）管辖范围：',
+      'The following keys and option_codes belong to the Workspace State Ledger:')
   ];
   if (globalKeys.size > 0) {
     lines.push(`- Global Keys: ${Array.from(globalKeys).join(', ')}`);
@@ -51,7 +53,8 @@ export function buildGlobalExclusionWatchlistSection(head) {
     lines.push(`- Global Option Codes: ${Array.from(globalOptions).join(', ')}`);
   }
   lines.push(
-    '无论是从新增任务对话记录中提取，还是在增量合并既有 `previous_compact_note` 时发现残留的上述全局规则或代号描述，都必须彻底剥离，绝不能写入输出的局部交接摘要中。'
+    pick('无论是从新增任务对话记录中提取，还是在增量合并既有 `previous_compact_note` 时发现残留的上述全局规则或代号描述，都必须彻底剥离，绝不能写入输出的局部交接摘要中。',
+      'Strip these global rules and option codes from both new task records and previous_compact_note. Never include them in the task-local handoff note.')
   );
 
   return lines.join('\n');

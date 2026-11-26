@@ -8,25 +8,41 @@ export function normalizeProjectPath(input) {
   return win ? normalized.toLowerCase().replace(/\/$/u, '') : normalized.replace(/\/$/u, '');
 }
 
+function metadataLine(file) {
+  const stat = fs.statSync(file);
+  if (!stat.isFile() || stat.size > 8192) return '';
+  const line = fs.readFileSync(file, 'utf8').trimEnd();
+  return /[\r\n\0]/u.test(line) ? '' : line;
+}
+
+// This is a worktree hint, not object/commit validation. Do not run a Git
+// subprocess on each turn, or inherit GIT_DIR from the host process.
+function hasWorktreeMetadata(root, dotGit) {
+  let gitDir = dotGit;
+  if (!fs.statSync(dotGit).isDirectory()) {
+    const pointer = /^gitdir: (.+)$/u.exec(metadataLine(dotGit));
+    if (!pointer) return false;
+    gitDir = path.resolve(root, pointer[1]);
+  }
+  const head = metadataLine(path.join(gitDir, 'HEAD'));
+  if (!/^(?:ref: refs\/\S+|[a-f\d]{40}|[a-f\d]{64})$/iu.test(head)) return false;
+  const commonFile = path.join(gitDir, 'commondir');
+  let common = gitDir;
+  if (fs.existsSync(commonFile)) {
+    const target = metadataLine(commonFile);
+    if (!target) return false;
+    common = path.resolve(gitDir, target);
+  }
+  return ['objects', 'refs'].every(name => fs.statSync(path.join(common, name)).isDirectory());
+}
+
 function gitRootFromCwd(cwd) {
   if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) return null;
   let current = path.resolve(cwd);
   while (true) {
     const dotGit = path.join(current, '.git');
     if (fs.existsSync(dotGit)) {
-      if (fs.statSync(dotGit).isDirectory()) return current;
-      const match = /^gitdir:\s*(.+)\s*$/imu.exec(fs.readFileSync(dotGit, 'utf8'));
-      if (match) {
-        const gitDir = path.resolve(current, match[1]);
-          if (!fs.existsSync(gitDir) || !fs.statSync(gitDir).isDirectory()) return null;
-        const commonFile = path.join(gitDir, 'commondir');
-        if (fs.existsSync(commonFile)) {
-          const common = path.resolve(gitDir, fs.readFileSync(commonFile, 'utf8').trim());
-          const marker = path.join(common, 'config');
-          if (fs.existsSync(marker)) return current;
-        }
-        return current;
-      }
+      return hasWorktreeMetadata(current, dotGit) ? current : null;
     }
     const parent = path.dirname(current);
     if (parent === current) return null;

@@ -14,8 +14,10 @@ from a registered project with a missing ledger.
 
 Hub writers serialize on the existing interprocess lock and publish an opaque
 generation under that lock. Readers sample it and the writer fence on both sides
-of a synchronous capture; they discard the capture if a writer intervened. After
-five unsuccessful attempts they fail with `hub_snapshot_busy`. No LLM call, Hub
+of a synchronous capture; they discard the capture if a writer intervened.
+Interactive dsh prompt captures return `hub_snapshot_busy` on observing a
+held fence; if only the generation changed, they recapture once without
+sleeping. Standalone CLI readers allow five attempts. No LLM call, Hub
 repair or reader lock occurs inside capture. An abandoned writer fence is not
 silently deleted by a preview. Use the documented recovery flow on the stopped Hub.
 
@@ -44,7 +46,46 @@ prompt sections; `hub-archive-coordinator.mjs` owns the per-session worker queue
 startup replay and recovery diagnostics. The kernel, not the coordinator or
 the model, remains responsible for all durable writes and ledger transitions.
 
+## Interactive contention and recovery
+
+In the default dsh Hub adapter, TurnScope snapshots, both compatibility prompt
+sections and native compaction prompt capture do not sleep on a writer fence.
+In Autopilot, a busy snapshot withholds the primary model and asks for a retry;
+there is no in-progress receipt for model work that never started. A normal
+`turn/end` still attempts to persist the unassigned outcome. The compatibility
+provider propagates the busy error rather than injecting an older checkout.
+
+The slash commands `checkout` (including preview), `close`, `archive`, `reopen`,
+`commit`, `drop`, `undo` and `revert`, and their corresponding tools where
+available, do not sleep to acquire a contended lock. They return
+`hub_write_lock_busy` or `hub_snapshot_busy`; retry the command after the other
+writer finishes. This policy is scoped to that invocation and Hub root, not
+to the entire process or all hosts sharing a root. It changes neither the
+cross-process exclusion protocol nor the generation check.
+
+**Remaining synchronous paths:** session events (notably accepting an answer
+at `turn/end`), receipts, archive replay, background workers and operations not
+listed above keep the original bounded retry. A brief collision must not turn
+an accepted answer into a failed archive just to make the hook return faster.
+A writer that outlasts the deadline can still block archival; if no archive
+intent was persisted there is nothing for startup replay to recover. Inspect
+the native journal and `cairn turns` before assuming the answer was filed.
+Even interactive operations use synchronous filesystem calls, and transient
+generation-publication errors after acquiring the lock retain their short
+retries. This is not a nonblocking filesystem or a latency guarantee.
+
 ## Measurement and continuous integration
+
+`node scripts/bench-hub-contention.mjs` holds the writer fence on a disposable
+Hub in one process while another attempts a snapshot and write. It reports
+the busy outcomes, elapsed call times and when a zero-delay timer actually
+ran, for `interactive` and `default_retry` policies separately. The default
+reader tries five times with 5/10/15/20 ms sleeps between attempts; default
+writer acquisition shares an approximately one-second deadline. The interactive
+probe uses no retry sleeps on the held lock. These are not hard latency limits.
+Uncontended calls do not pay these sleeps. The probe measures a deliberately
+held lock, not the frequency of contention in real sessions. Do not substitute
+an unverified snapshot or delete a live lock to avoid a busy result.
 
 ```sh
 npm test

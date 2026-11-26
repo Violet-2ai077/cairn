@@ -10,9 +10,10 @@ import {
   readHead,
   projectReadOnlyLedger,
   foldLedger,
-  stageOperators,
-  buildStagingExtractorPrompt
+  stageOperators
 } from '../kernel/index.mjs';
+import { buildStagingExtractorPrompt } from '../i18n/contracts.mjs';
+import { pick } from '../i18n/locale.mjs';
 import { createOpenAICompatibleClient } from './llm-client.mjs';
 import { distillTurnTrajectory } from './distill.mjs';
 
@@ -46,7 +47,7 @@ export async function runStagingExtractor({
 
   // 3. Build prompt & call LLM
   const systemPrompt = buildStagingExtractorPrompt(readOnlyHead);
-  const userContent = `### 最新单步对话（latest_step_dialogue）\n${distilled.distilled_text}`;
+  const userContent = pick('### 最新单步对话（latest_step_dialogue）', '### Latest turn (latest_step_dialogue)') + '\n' + distilled.distilled_text;
 
   const client = llmClient ?? createOpenAICompatibleClient();
   const llmRes = await client.complete({

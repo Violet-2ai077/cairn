@@ -1,3 +1,4 @@
+import '../scripts/fixtures/en-test-locale.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

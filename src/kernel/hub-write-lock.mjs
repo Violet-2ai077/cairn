@@ -1,15 +1,27 @@
 import fs from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 const held = new Set();
+const immediateRoot = new AsyncLocalStorage();
 const waiter = new Int32Array(new SharedArrayBuffer(4));
 const machine = createHash('sha256').update(hostname()).digest('hex').slice(0, 16);
 const ownerName = /^([0-9a-f]{16})-([1-9]\d{0,9})-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 const raced = error => ['ENOENT', 'ENOTDIR'].includes(error.code);
 const transientAccess = error => ['EPERM', 'EACCES', 'EBUSY'].includes(error.code);
+
+// Scope the retry policy to one operation, including nested captures and queued
+// command writes. Other callers of the same Hub retain their usual retry budget.
+export function withImmediateHubAccess(root, work) {
+  return immediateRoot.run(path.resolve(root), work);
+}
+
+export function readImmediateHubSnapshot(root, read) {
+  return withImmediateHubAccess(root, () => readConsistentHub(root, read));
+}
 
 function definitelyGone(pid) {
   if (pid <= 0 || pid > 0x7fffffff) return false;
@@ -60,13 +72,14 @@ function underDirectoryLock(lock, deadline, work) {
   let published = false;
   try {
     fs.writeFileSync(path.join(candidate, token), '', { flag: 'wx' });
-    for (;;) {
+    for (let attempt = 0; ; attempt++) {
       try {
         const st = fs.lstatSync(lock, { throwIfNoEntry: false });
         if (!st) { fs.renameSync(candidate, lock); published = true; break; }
         if (st.isDirectory()) reapDirectory(lock);
       } catch (error) { if (!raced(error) && !transientAccess(error) && !['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error; }
-      if (performance.now() >= deadline) throw new Error('hub_write_lock_busy');
+      if (deadline === null && attempt === 0) continue; // A dead owner may just have been reaped.
+      if (deadline === null || performance.now() >= deadline) throw new Error('hub_write_lock_busy');
       Atomics.wait(waiter, 0, 0, 10);
     }
     return work();
@@ -79,7 +92,7 @@ function underDirectoryLock(lock, deadline, work) {
 // Never rename onto the legacy pathname: Windows can replace even a live
 // regular PID file with a directory. mkdir is exclusive for both kinds.
 function acquireLegacyFence(lock, deadline) {
-  for (;;) {
+  for (let attempt = 0; ; attempt++) {
     try { fs.mkdirSync(lock); return; }
     catch (error) { if (error.code !== 'EEXIST' && !transientAccess(error)) throw error; }
     try {
@@ -87,7 +100,8 @@ function acquireLegacyFence(lock, deadline) {
       if (st?.isDirectory() && fs.readdirSync(lock).length === 0) return; // Left by the previous guard owner.
       if (st?.isFile()) reapLegacy(lock);
     } catch (error) { if (!raced(error) && !transientAccess(error) && error.code !== 'EISDIR') throw error; }
-    if (performance.now() >= deadline) throw new Error('hub_write_lock_busy');
+    if (deadline === null && attempt === 0) continue;
+    if (deadline === null || performance.now() >= deadline) throw new Error('hub_write_lock_busy');
     Atomics.wait(waiter, 0, 0, 10);
   }
 }
@@ -108,8 +122,11 @@ export function readConsistentHub(hubRoot, read) {
     catch (e) { if (e.code !== 'ENOENT') throw e; }
     return fs.existsSync(guard) || fs.existsSync(path.join(hubRoot, '.write.lock')) ? null : token;
   }
-  for (let i = 0; i < 5; i++) {
+  const immediate = immediateRoot.getStore() === path.resolve(hubRoot);
+  const attempts = immediate ? 2 : 5;
+  for (let i = 0; i < attempts; i++) {
     const before = stamp();
+    if (before === null && immediate) break;
     if (before !== null) {
       let value, error;
       try { value = read(); } catch (e) { error = e; }
@@ -118,7 +135,7 @@ export function readConsistentHub(hubRoot, read) {
         return value;
       }
     }
-    if (i < 4) Atomics.wait(waiter, 0, 0, 5 * (i + 1));
+    if (!immediate && i + 1 < attempts) Atomics.wait(waiter, 0, 0, 5 * (i + 1));
   }
   throw new Error('hub_snapshot_busy');
 }
@@ -127,7 +144,7 @@ export function withHubWriteLock(hubRoot, work, { publishGeneration = true } = {
   fs.mkdirSync(hubRoot, { recursive: true });
   const lock = path.join(fs.realpathSync.native(hubRoot), '.write.lock');
   if (held.has(lock)) return work();
-  const deadline = performance.now() + 1000;
+  const deadline = immediateRoot.getStore() === path.resolve(hubRoot) ? null : performance.now() + 1000;
   return underDirectoryLock(lock + '.guard', deadline, () => {
     acquireLegacyFence(lock, deadline);
     held.add(lock);

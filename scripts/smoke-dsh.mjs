@@ -20,10 +20,10 @@ const trace = path.join(tmp, 'trace.jsonl');
 const env = Object.fromEntries(Object.entries(process.env).filter(([k]) =>
   /^(?:path|pathext|systemroot|windir|comspec|temp|tmp|home|userprofile|appdata|localappdata|programfiles.*|systemdrive|lang)$/iu.test(k)));
 const entries = () => fs.readFileSync(trace, 'utf8').trim().split('\n').map(s => JSON.parse(s));
-function run(phase, input, sessionId, workdir = cwd, expectedExit = 0) {
+function run(phase, input, sessionId, workdir = cwd, expectedExit = 0, localeEnv = { CAIRN_LOCALE: 'zh' }) {
   const args = [bin, '--profile', 'headless', '--patch', patch, ...(sessionId ? ['--session-id', sessionId] : []), input];
   const res = spawnSync(process.execPath, args, { cwd: workdir, encoding: 'utf8', timeout: 60000, windowsHide: true,
-    env: { ...env, DSH_HOME: path.join(tmp, 'dsh'), CAIRN_DSH_BIN: bin, CAIRN_SMOKE_PHASE: phase, CAIRN_SMOKE_TRACE: trace } });
+    env: { ...env, ...localeEnv, DSH_HOME: path.join(tmp, 'dsh'), CAIRN_DSH_BIN: bin, CAIRN_SMOKE_PHASE: phase, CAIRN_SMOKE_TRACE: trace } });
   assert.equal(res.status, expectedExit, res.error?.message ?? (res.stderr + res.stdout + (phase === 'file-write-crash' ? JSON.stringify(entries().filter(e => e.phase === phase)) : '')));
   return res.stdout;
 }
@@ -97,12 +97,12 @@ function verifyMarkerMatrix() {
     const input = 'Write a two-paragraph progress note.';
     const output = run(phase, input);
     const answer = '  ' + 'Long result '.repeat(9).trimEnd() + '.';
-    assert.match(output, /First paragraph\./u);
+    assert.ok(output.includes('Wrap code in ``` fences.'));
     assert.match(output, /Long result Long result/u);
     assert.doesNotMatch(output, /<\|task:/u);
-    assert.deepEqual(entries().find(e => e.phase === phase && e.markerBlocks)?.markerBlocks, ['First paragraph.', answer]);
+    assert.deepEqual(entries().find(e => e.phase === phase && e.markerBlocks)?.markerBlocks, ['Wrap code in ``` fences.', answer]);
     const thread = mode === 'legacy' ? readTaskThread(cwd, 1) : readHubTaskThread(storeRoot, 1);
-    assert.deepEqual(thread.map(r => r.content), [input, 'First paragraph.\n' + answer]);
+    assert.deepEqual(thread.map(r => r.content), [input, 'Wrap code in ``` fences.\n' + answer]);
     if (mode === 'legacy') assert.equal(replayLedger(cwd).valid, true);
     if (mode === 'hub') {
       const checks = entries().filter(e => e.phase === phase && e.slash).map(e => [e.slash, e.result]);
@@ -121,6 +121,47 @@ function main() {
   assert.equal(spawnSync('git', ['init', '--quiet'], { cwd, windowsHide: true }).status, 0);
   fs.writeFileSync(path.join(cwd, 'csv.test.cjs'), "require('node:test')('csv-header', () => require('node:assert/strict').equal('wrong', 'CSV_HEADER_EXPECTED'));");
   if (process.argv.includes('--marker-only')) return verifyMarkerMatrix();
+  if (process.argv.includes('--project-boundary-only')) {
+    const project = path.join(tmp, 'project-boundary');
+    fs.mkdirSync(path.join(project, '.git'), { recursive: true });
+    configure({ storeRoot: hub, autopilot: { enabled: true } });
+    run('boundary-fake', 'New task: check the first scope.', null, project);
+    assert.equal(readHubTasksIndex(hub).tasks.find(t => t.id === 1)?.project_id, null);
+    assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: project, windowsHide: true }).status, 0);
+    run('boundary-real', 'New task: check the second scope.', null, project);
+    const id = entries().find(e => e.phase === 'boundary-real' && e.snapshot)?.sessionId;
+    assert.ok(id);
+    assert.match(readHubTasksIndex(hub).tasks.find(t => t.id === 2).project_id, /^p_/);
+    const before = readHubTaskThread(hub, 2).length;
+    run('boundary-unclosed', 'Continue task #2.', id, project);
+    assert.equal(readHubTaskThread(hub, 2).length, before);
+    assert.equal(readTurnReceipts(hub, id, 2).status, 'unassigned');
+    console.log('PASS: empty .git stayed general, git init enabled project attribution, and a marker inside an unclosed tilde fence was not archived.');
+    return;
+  }
+  if (process.argv.includes('--locale-only')) {
+    for (const lang of ['en', 'zh']) {
+      const storeRoot = path.join(tmp, 'locale-' + lang);
+      configure({ storeRoot, autopilot: { enabled: true } });
+      const localeEnv = { LANG: lang === 'en' ? 'en_US.UTF-8' : 'zh_CN.UTF-8' };
+      const phase = 'locale-' + lang;
+      const call = (suffix, text, id) => run(phase + suffix, text, id, cwd, 0, localeEnv);
+      call('-create', 'New task: prepare an invoice report.');
+      const records = entries().filter(e => e.phase === phase + '-create');
+      const scope = records.find(e => e.localeScope);
+      assert.deepEqual(scope?.localeScope, { hasHan: lang === 'zh', authority: true,
+        markerEn: lang === 'en', markerZh: lang === 'zh' });
+      assert.ok(records.some(e => e.stagingHan === (lang === 'zh')), 'staging contract: ' + lang);
+      const menu = call('-menu', 'Continue');
+      assert.match(menu, lang === 'en' ? /which task|choose a task/i : /你想继续哪项任务/u);
+      const notice = call('-offer', 'From now on, reply in English by default.', scope.sessionId);
+      assert.match(notice, lang === 'en' ? /memory|preference/i : /长期记忆/u);
+      if (lang === 'en') { assert.doesNotMatch(menu, /\p{Script=Han}/u); assert.doesNotMatch(notice, /\p{Script=Han}/u); }
+      assert.equal(readScopedHead(storeRoot).active.length, 0);
+      console.log('PASS: ' + lang + ' environment selected the expected provider-facing ledger and staging contracts, task picker and uncommitted memory notice.');
+    }
+    return;
+  }
   if (process.argv.includes('--marker-bank-only')) {
     const cli = (args, store = hub) => {
       const r = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/cairn.mjs', import.meta.url)),

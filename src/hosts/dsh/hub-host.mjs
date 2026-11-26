@@ -1,7 +1,9 @@
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { pick } from '../../i18n/locale.mjs';
+import { buildStrictCompactorPrompt } from '../../i18n/contracts.mjs';
 import {
-  buildStrictCompactorPrompt, readHubTasksIndex,
+  readHubTasksIndex,
   readSessionBinding, writeSessionBinding, clearSessionBinding, isHubInitialized,
   readScopedHead, initHubStore, parseTaskMarker,
   transitionHubTaskStatus, revertScopedCommit, bindHubRoutedTask
@@ -10,7 +12,7 @@ import { readScopedStaged, commitScopedStaged, dropScopedStaged } from '../../ke
 import { resolveStoreRoot } from '../../workers/store-root.mjs';
 import { isHubContinuation, runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { captureCompatibilityContext } from './hub-context.mjs';
-import { readConsistentHub } from '../../kernel/hub-write-lock.mjs';
+import { readImmediateHubSnapshot, withImmediateHubAccess } from '../../kernel/hub-write-lock.mjs';
 import { compileHubHandoff } from '../../workers/hub-handoff.mjs';
 import { installFileWriteHook } from './file-write-hook.mjs';
 import { runHubDoctor } from '../../workers/hub-doctor.mjs';
@@ -55,6 +57,16 @@ function stripTrailingSystemReminders(text) {
   return cleaned.trim();
 }
 
+const retryableCommands = new Set(['checkout', 'close', 'archive', 'reopen', 'commit', 'drop', 'undo', 'revert']);
+
+async function interactiveCommand(root, work, busyReply) {
+  try { return await withImmediateHubAccess(root, work); }
+  catch (error) {
+    if (!['hub_snapshot_busy', 'hub_write_lock_busy'].includes(error.message)) throw error;
+    return busyReply(error.message);
+  }
+}
+
 function routingUserPrompt(messages, turnNumber, currentTurn) {
   if (currentTurn?.turn === turnNumber && currentTurn?.authoredUser?.trim()) return currentTurn.authoredUser.trim();
   const message = (messages ?? []).findLast(item => item?.source?.kind === 'user');
@@ -89,7 +101,7 @@ export async function createHubDshHost(ctx, config = {}) {
       const args = memoryReply(text);
       if (!args) return null;
       await sessionJobs.get(sessionId);
-      if (!current()) return '已取消；未确认记忆。';
+      if (!current()) return pick('已取消；未确认记忆。', 'Cancelled; no memory was confirmed.');
       if (args[0] === null) {
         const id = (turn - 1) + '.1';
         const last = turn > 0 && readMemoryReview(hubRoot, sessionId, id);
@@ -251,7 +263,7 @@ export async function createHubDshHost(ctx, config = {}) {
       const stopStream = ctx.on('llm/stream', (request, next) => {
         const entry = turnRuntime?.turns.get(request?.sessionId);
         if (request?.purpose === 'compaction') {
-          const excluded = readConsistentHub(hubRoot, () => {
+          const excluded = readImmediateHubSnapshot(hubRoot, () => {
             const projectId = entry ? entry.scope?.projectId : request.sessionId && readSessionBinding(hubRoot, request.sessionId)?.project_id;
             return exclusionWatchlist(readScopedHead(hubRoot), projectId && readScopedHead(hubRoot, { scope: 'project', projectId }));
           });
@@ -267,10 +279,12 @@ export async function createHubDshHost(ctx, config = {}) {
         const blocked = !request?.purpose && turnRuntime?.blockedReply(request?.sessionId);
         if (blocked) return menuStream(blocked, config.stripMarkerInStream === false);
         if (!request?.purpose && (!entry?.scope || entry.signal !== request.signal) && readHubTasksIndex(hubRoot).task_id_capacity)
-          return menuStream('扩展任务号需要有效 Autopilot TurnScope，本轮不执行或归档。', config.stripMarkerInStream === false);
+          return menuStream(pick('扩展任务号需要有效 Autopilot TurnScope，本轮不执行或归档。',
+            'Extended task IDs require a valid Autopilot TurnScope. This turn will not be executed or archived.'), config.stripMarkerInStream === false);
         if (!request?.purpose && midSession.historyMode === 'separate-session' &&
             (!entry?.scope || entry.signal !== request.signal))
-          return menuStream('无法验证本轮历史。请在新的 dsh 会话中重述请求。', config.stripMarkerInStream === false);
+          return menuStream(pick('无法验证本轮历史。请在新的 dsh 会话中重述请求。',
+            'Could not verify the history for this turn. Restate your request in a new dsh session.'), config.stripMarkerInStream === false);
         const stream = next(request);
         const compat = !turnRuntime && turns.get(request?.sessionId);
         if (!request?.purpose && compat && config.stripMarkerInStream !== false && stream?.[Symbol.asyncIterator]) {
@@ -336,7 +350,8 @@ export async function createHubDshHost(ctx, config = {}) {
       turns.set(sessionId, turn);
       if (event.type !== 'turn/end') return;
       const state = stateFor(sessionId);
-      const marker = parseTaskMarker(turn.assistant.trim());
+      const marker = parseTaskMarker(turn.assistant);
+      if (!marker.valid) marker.display_text = marker.display_text.trim();
       turns.delete(sessionId);
       const receipt = (status, reason, extra) => recordTurnReceipt(hubRoot, sessionId, turn.turn, {
         status, reason, first_seq: turn.firstSeq ?? null, end_seq: event.seq ?? null, ...extra
@@ -398,14 +413,16 @@ export async function createHubDshHost(ctx, config = {}) {
         schema: { type: 'string' },
         render(_args, value) { return [{ type: 'text', text: String(value ?? '') }]; }
       };
+      if (retryableCommands.has(def.name.replace(/^cairn_|_task$/gu, ''))) {
+        const execute = def.execute;
+        def.execute = (...args) => interactiveCommand(hubRoot, () => execute(...args), code => code);
+      }
       const dispose = ctx.tools.register(def);
       if (typeof dispose === 'function') disposers.push(dispose);
     }
   }
   if (commands?.register) {
-    const stop = commands.register({ name: 'cairn', description: 'Manage centralized Cairn Hub state', input: { hint: 'status | turns [turn] | recover <turn> <task-id> | tasks [--all|--status <status>] | inspect | doctor | checkout <id|--clear> [--preview] | undo <user|project [id]> <seq> [--preview] <reason>' }, async handler({ rawInput, agent }) {
-      const args = String(rawInput ?? '').trim().split(/\s+/u).filter(Boolean);
-      if (!args.length) args.push('status');
+    async function runCommand(args, agent) {
       const sessionId = agent?.session?.id;
       if (midSession.enabled && args[0] === 'memory') {
         await sessionJobs.get(sessionId);
@@ -504,6 +521,13 @@ export async function createHubDshHost(ctx, config = {}) {
         return { kind: 'success', text: JSON.stringify(taskList(filter), null, 2) };
       }
       return { kind: 'error', text: 'Unknown Cairn subcommand: ' + args[0] };
+    }
+    const stop = commands.register({ name: 'cairn', description: 'Manage centralized Cairn Hub state', input: { hint: 'status | turns [turn] | recover <turn> <task-id> | tasks [--all|--status <status>] | inspect | doctor | checkout <id|--clear> [--preview] | undo <user|project [id]> <seq> [--preview] <reason>' }, handler({ rawInput, agent }) {
+      const args = String(rawInput ?? '').trim().split(/\s+/u).filter(Boolean);
+      if (!args.length) args.push('status');
+      return retryableCommands.has(args[0])
+        ? interactiveCommand(hubRoot, () => runCommand(args, agent), text => ({ kind: 'error', text }))
+        : runCommand(args, agent);
     } });
     if (typeof stop === 'function') disposers.push(stop);
   }

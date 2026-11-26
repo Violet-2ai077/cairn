@@ -1,4 +1,5 @@
-import { buildScopedStagingExtractorPrompt, commitScopedStaged, foldScopedLedger, projectReadOnlyLedger, readScopedHead, readScopedStaged, stageScopedOperators } from '../kernel/index.mjs';
+import { commitScopedStaged, foldScopedLedger, projectReadOnlyLedger, readScopedHead, readScopedStaged, stageScopedOperators } from '../kernel/index.mjs';
+import { buildScopedStagingExtractorPrompt } from '../i18n/contracts.mjs';
 import { distillTurnTrajectory } from './distill.mjs';
 import { createOpenAICompatibleClient } from './llm-client.mjs';
 import { evaluateAutoCommit } from './hub-auto-commit.mjs';

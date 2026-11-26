@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import { pick } from '../../i18n/locale.mjs';
 import { sanitizeHubRoutingText } from '../../kernel/marker.mjs';
 import { readHubTasksIndex, readSessionChoice, replaceSessionChoice, resolveHubPaths } from '../../kernel/hub-store.mjs';
 import { taskPickerHint } from '../../workers/hub-cold-router.mjs';
 
 const PAGE = 5;
-const other = '都不是，描述另一项任务';
-const more = '更多任务';
-const cancel = '取消';
+const other = ['都不是，描述另一项任务', 'None of these; describe another task'];
+const more = ['更多任务', 'More tasks'];
+const cancel = ['取消', 'Cancel'];
 const norm = text => text.normalize('NFKC').trim().toLowerCase();
 const clean = text => sanitizeHubRoutingText(text).replace(/[\p{Cc}\p{Cf}<>|]/gu, '').slice(0, 100);
 
@@ -22,27 +23,30 @@ function pageOf(root, pending, eligible, projects) {
   const paths = resolveHubPaths(root);
   return pending.ids.slice(pending.offset, pending.offset + PAGE).map((id, index) => {
     const task = eligible.find(t => t.id === id);
-    const title = task ? clean(task.title) || '未命名任务' : '该任务已不可选';
+    const title = task ? clean(task.title) || pick('未命名任务', 'Untitled task') : pick('该任务已不可选', 'Task no longer available');
     let note = '';
     if (task) {
       try { note = taskPickerHint(paths, task); } catch { /* A preview is optional. */ }
     }
     const project = task && clean(projects.get(task.project_id) ?? task.project_id ?? 'general');
     return { id, title, available: Boolean(task), label: `${index + 1}. ${title} (#${id})`,
-      description: task ? [project, note].filter(Boolean).join(' · ') : '请重新选择' };
+      description: task ? [project, note].filter(Boolean).join(' · ') : pick('请重新选择', 'Choose again') };
   });
 }
 
 function question(rows, pending) {
   const options = rows.map(({ label, description }) => ({ label, description }));
-  if (pending.ids.length > PAGE) options.push({ label: more });
-  options.push({ label: other }, { label: cancel });
-  return { id: pending.key, header: '确认任务', question: '你想继续哪项任务？', multiSelect: false, options };
+  if (pending.ids.length > PAGE) options.push({ label: pick(...more) });
+  options.push({ label: pick(...other) }, { label: pick(...cancel) });
+  return { id: pending.key, header: pick('确认任务',
+    'Confirm task'), question: pick('你想继续哪项任务？',
+    'Which task do you want to continue?'), multiSelect: false, options };
 }
 
 function menu(q, notice = '') {
   return [notice, q.question, ...q.options.map(o => o.description ? o.label + ' — ' + o.description : o.label),
-    '回复列表序号、任务名或 #任务号即可。原请求已保留，无需重说。'].filter(Boolean).join('\n');
+    pick('回复列表序号、任务名或 #任务号即可。原请求已保留，无需重说。',
+      'Reply with the list number, task name, or #task-ID. Your original request is saved; you do not need to repeat it.')].filter(Boolean).join('\n');
 }
 
 async function askUntilAborted(ask, request) {
@@ -60,9 +64,9 @@ async function askUntilAborted(ask, request) {
 
 function action(value, rows, pending, eligible) {
   const text = norm(value);
-  if ([cancel, '算了', '算了吧', '不用了', 'cancel', 'never mind'].includes(text)) return { kind: 'cancel' };
-  if ([other, '都不是', 'other'].includes(text)) return { kind: 'other' };
-  if ([more, '更多', 'more'].includes(text) && pending.ids.length > PAGE) return { kind: 'more' };
+  if ([...cancel, '算了', '算了吧', '不用了', 'never mind'].some(v => norm(v) === text)) return { kind: 'cancel' };
+  if ([...other, '都不是', 'other'].some(v => norm(v) === text)) return { kind: 'other' };
+  if ([...more, '更多', 'more'].some(v => norm(v) === text) && pending.ids.length > PAGE) return { kind: 'more' };
   let row = rows.find(r => norm(r.label) === text);
   if (!row && /^\d+$/u.test(text)) row = rows[Number(text) - 1];
   const permitted = eligible.filter(t => pending.ids.includes(t.id));
@@ -84,12 +88,14 @@ export async function pickTask(options) {
   let { pending } = options;
   const reply = (reason, text) => ({ reason, text });
   const save = (key, choice) => replaceSessionChoice(root, sessionId, key, choice);
-  const stale = () => reply('choice_stale', '任务或会话已改变，未执行原请求。请重新指定任务。');
+  const stale = () => reply('choice_stale', pick('任务或会话已改变，未执行原请求。请重新指定任务。',
+    'The task or session has changed. The original request was not executed. Specify the task again.'));
   if (pending && pending.epoch !== expectedEpoch) { save(pending.key, null); return stale(); }
   const answeringText = Boolean(pending && pending.turn !== entry.turn);
   if (!pending) {
     const ids = eligible.filter(t => !candidates?.length || candidates.includes(t.id)).map(t => t.id);
-    if (!ids.length) return reply('no_candidates', '没有可继续的活动任务。请描述要做的事，或明确重开已关闭的任务。');
+    if (!ids.length) return reply('no_candidates', pick('没有可继续的活动任务。请描述要做的事，或明确重开已关闭的任务。',
+      'There are no active tasks to continue. Describe what you want to do or explicitly reopen a closed task.'));
     pending = { key: randomUUID(), epoch: expectedEpoch, turn: entry.turn, input: entry.input, ids,
       eligibleIds: eligible.map(t => t.id), offset: 0 };
     if (!save(null, pending)) return stale();
@@ -107,11 +113,12 @@ export async function pickTask(options) {
     } catch (error) {
       if (payload.signal?.aborted || error?.code === 'ASK_ABORTED') {
         save(pending.key, null);
-        return reply('choice_cancelled', '已取消，未执行原请求。');
+        return reply('choice_cancelled', pick('已取消，未执行原请求。', 'Cancelled. The original request was not executed.'));
       }
       if (['DELEGATED_CALLER', 'CALLER_NOT_LIVE'].includes(error?.code)) {
         save(pending.key, null);
-        return reply('choice_unavailable', '当前 Agent 不能代替用户选择任务；没有执行操作。');
+        return reply('choice_unavailable', pick('当前 Agent 不能代替用户选择任务；没有执行操作。',
+          'This agent cannot select a task on behalf of the user. No action was taken.'));
       }
       // NO_PROVIDER (headless) and disconnected clients use the identical text menu.
     }
@@ -125,17 +132,18 @@ export async function pickTask(options) {
   if (choice.kind === 'select') {
     const live = readHubTasksIndex(root).tasks.filter(t => t.status === 'active' && pending.eligibleIds.includes(t.id));
     if (!live.some(t => t.id === choice.id)) return reply('awaiting_choice',
-      menu(question(pageOf(root, pending, live, projects), pending), '该任务已不可选，请重新选择。'));
+      menu(question(pageOf(root, pending, live, projects), pending), pick('该任务已不可选，请重新选择。', 'That task is no longer available. Choose again.')));
   }
   if (choice.kind === 'select' || choice.kind === 'cancel') {
     if (!save(pending.key, null)) return stale();
-    return choice.kind === 'cancel' ? reply('choice_cancelled', '已取消，未执行原请求。')
+    return choice.kind === 'cancel' ? reply('choice_cancelled', pick('已取消，未执行原请求。', 'Cancelled. The original request was not executed.'))
       : { id: choice.id, input: pending.input, originalTurn: pending.turn };
   }
   if (choice.kind === 'other' || choice.kind === 'more') {
     if (choice.kind === 'other' && pending.ids.length === pending.eligibleIds.length) {
       if (!save(pending.key, null)) return stale();
-      return reply('choice_none', '已退出任务选择，未执行原请求。请描述另一项任务，或指定要继续的任务。');
+      return reply('choice_none', pick('已退出任务选择，未执行原请求。请描述另一项任务，或指定要继续的任务。',
+        'Task selection closed. The original request was not executed. Describe another task or specify the one you want to continue.'));
     }
     const ids = choice.kind === 'other' ? pending.eligibleIds : pending.ids;
     const offset = choice.kind === 'more' && pending.offset + PAGE < ids.length ? pending.offset + PAGE : 0;
@@ -148,7 +156,9 @@ export async function pickTask(options) {
     rows = pageOf(root, pending, eligible, projects);
     q = question(rows, pending);
   }
-  return reply('awaiting_choice', menu(q, choice.kind === 'invalid' ? '未能唯一对应到可选任务；没有执行操作。' : '请选择或输入任务名。'));
+  return reply('awaiting_choice', menu(q, choice.kind === 'invalid' ? pick('未能唯一对应到可选任务；没有执行操作。',
+    'Your reply did not identify a single available task. No action was taken.') : pick('请选择或输入任务名。',
+    'Choose a task or enter its name.')));
 }
 
 export async function* menuStream(text, showMarker) {

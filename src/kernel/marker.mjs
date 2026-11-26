@@ -8,7 +8,26 @@ import { EXTENDED_TASK_CAPACITY } from './hub-task-ids.mjs';
 
 const MARKER_PREFIX_GLOBAL_REGEX = /<\|task:/g;
 const TRAILING_MARKER_EXEC_REGEX = /<\|task:([1-9][0-9]{0,2}|UNRESOLVED)\|>\s*$/;
-const CODE_FENCE_DELIMITER_REGEX = /```/g;
+
+// Scan top-level fenced blocks on the untrimmed input: four leading spaces
+// are significant, as are the opener's character and minimum closing length.
+function scanFences(text) {
+  let open = '', endsWithClosingFence = false;
+  for (const line of text.split(/\r\n|[\r\n]/u)) {
+    if (!line.trim()) continue;
+    endsWithClosingFence = false;
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (!match) continue;
+    const [, run, rest] = match;
+    if (!open) {
+      if (run[0] !== '`' || !rest.includes('`')) open = run;
+    } else if (run[0] === open[0] && run.length >= open.length && /^[ \t]*$/u.test(rest)) {
+      open = '';
+      endsWithClosingFence = true;
+    }
+  }
+  return { open, endsWithClosingFence };
+}
 
 /**
  * Parses and validates an assistant response ending with `<|task:N|>` or `<|task:UNRESOLVED|>`.
@@ -71,10 +90,8 @@ export function parseTaskMarker(content) {
     };
   }
 
-  // Count triple-backtick code fence delimiters before the marker.
-  // An odd count means a code fence was opened before the marker and never closed.
-  const fenceCount = (answer.match(CODE_FENCE_DELIMITER_REGEX) ?? []).length;
-  if (fenceCount % 2 !== 0) {
+  const { open, endsWithClosingFence } = scanFences(rawBeforeMarker);
+  if (open) {
     return {
       valid: false,
       error: 'marker_inside_unclosed_code_fence',
@@ -87,7 +104,6 @@ export function parseTaskMarker(content) {
     };
   }
 
-  const endsWithClosingFence = /```\s*$/.test(answer);
   if (endsWithClosingFence) {
     // When the answer body ends with a closed code fence, the tail marker must occupy
     // its own trailing line (separated by a newline from the closing ``` delimiter).

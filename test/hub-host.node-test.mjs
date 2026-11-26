@@ -1,3 +1,4 @@
+import '../scripts/fixtures/zh-test-locale.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -122,7 +123,7 @@ test('Hub marker stripping keeps full-answer provenance and identical deltas in 
     await s.start(1, 'Write an answer', { signal });
     s.emit('user/message', { turn: 1, message: { source: { kind: 'user' }, content: 'Write an answer' } });
     async function* reply() {
-      for (const [index, text] of ['First paragraph', '  ' + 'x'.repeat(80) + ' '.repeat(90) + '\n<|task:1|>' + ' '.repeat(65)].entries()) {
+      for (const [index, text] of ['Wrap code in ``` fences.', '  ' + 'x'.repeat(80) + ' '.repeat(90) + '\n<|task:1|>' + ' '.repeat(65)].entries()) {
         yield { type: 'block-start', index, blockType: 'text' };
         yield { type: 'text-delta', index, text };
         yield { type: 'block-end', index, block: { type: 'text', text } };
@@ -134,7 +135,7 @@ test('Hub marker stripping keeps full-answer provenance and identical deltas in 
     assert.equal(blocks[1].text, '  ' + 'x'.repeat(80));
     assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), blocks.map(b => b.text).join(''));
     s.end(1, blocks);
-    assert.equal(readHubTaskThread(hub, 1).at(-1)?.content, 'First paragraph\n  ' + 'x'.repeat(80));
+    assert.equal(readHubTaskThread(hub, 1).at(-1)?.content, 'Wrap code in ``` fences.\n  ' + 'x'.repeat(80));
   }
 });
 

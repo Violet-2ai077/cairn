@@ -14,6 +14,7 @@ import {
 } from '../kernel/index.mjs';
 import { createOpenAICompatibleClient } from './llm-client.mjs';
 import { truncateHeadTail } from './distill.mjs';
+import { pick } from '../i18n/locale.mjs';
 
 const VALID_ROUTER_DECISIONS = new Set(['match', 'new', 'ambiguous']);
 
@@ -87,7 +88,7 @@ export function buildColdRouterPrompt(taskCards = []) {
     })
     .sort((a, b) => a.id - b.id);
 
-  return `你是跨会话冷启动任务语义路由器（Cold-Start Task Semantic Router）。
+  const contract = pick(`你是跨会话冷启动任务语义路由器（Cold-Start Task Semantic Router）。
 你的职责是：根据工作区已确立的静态任务目录（established_tasks）与用户在新会话中的首条请求（opening_user_request），判定该请求属于继续某一个既有任务、存在多任务歧义、还是开启一项全新独立任务。
 
 你必须仅输出一个合法的原始 JSON 对象，严禁使用 Markdown 代码围栏（如 \`\`\`json），严禁在 JSON 前后附加任何解释文字。输出格式严格为：
@@ -98,8 +99,18 @@ export function buildColdRouterPrompt(taskCards = []) {
 2. 多任务歧义澄清（"decision": "ambiguous"）：当用户请求仅匹配多个已有任务的共享特征、缺乏唯一区分证据，或在存在多个任务时仅发出泛化延续指令（如“继续上次那个”、“把刚才的改完”）时，严禁按编号大小（Primacy）或任何猜测做默认归属，必须返回 "decision": "ambiguous"，"task_id": null，"candidates": [<所有匹配或候选的任务ID正整数列表>]。
 3. 全新独立任务（"decision": "new"）：当用户请求明确开启一项与既有任务均无关的全新工作目标时，返回 "decision": "new"，"task_id": null，"candidates": []。
 
-### 已确立的静态任务目录（established_tasks，按 ID 升序排列，无时间戳）
-${JSON.stringify(sanitizedCards, null, 2)}`;
+### 已确立的静态任务目录（established_tasks，按 ID 升序排列，无时间戳）`,
+    `You are the Cold-Start Task Semantic Router. Compare the new session's opening_user_request with the static established_tasks catalog and classify the request as a continuation, ambiguous, or new.
+Return exactly one raw JSON object with no Markdown fences or surrounding commentary:
+{"decision":"match"|"new"|"ambiguous","task_id":<positive integer or null>,"candidates":[<candidate task IDs>],"reason":"<brief rationale>"}
+
+### Anti-Recency / Anti-Primacy Cold-Routing Contract
+1. Return "match" only when specific content, an explicit ID, or a unique feature distinguishes one existing task. Set task_id to that ID and candidates to a list containing only that ID.
+2. When the request fits shared features of multiple tasks without distinguishing evidence, or is a generic continuation such as "finish the last one" with multiple possible tasks, do not guess or default by recency or ID order. Return "ambiguous" with task_id null and all matching candidate IDs.
+3. For an explicitly new objective unrelated to all existing tasks, return "new" with task_id null and candidates [].
+
+### Static task catalog (established_tasks, ascending ID, no timestamps)`);
+  return contract + '\n' + JSON.stringify(sanitizedCards, null, 2);
 }
 
 export async function runColdRouter({
@@ -132,7 +143,7 @@ export async function runColdRouter({
     includePreview: includeCompactPreview
   });
   const systemPrompt = buildColdRouterPrompt(sanitizedCards);
-  const userMessage = `### 新会话首条用户请求（opening_user_request）\n${String(userPrompt ?? '').trim()}`;
+  const userMessage = pick('### 新会话首条用户请求（opening_user_request）', '### Opening user request (opening_user_request)') + '\n' + String(userPrompt ?? '').trim();
 
   const client = llmClient ?? createOpenAICompatibleClient();
   const llmRes = await client.complete({

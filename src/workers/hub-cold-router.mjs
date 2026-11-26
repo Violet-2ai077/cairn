@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { pick } from '../i18n/locale.mjs';
 import { readHubTasksIndex, readProjectsIndex, resolveHubPaths } from '../kernel/index.mjs';
 import { buildHubRoutingCards, sanitizeHubRoutingText } from '../kernel/marker.mjs';
 import { resolveTaskHeatPolicy, selectHubTaskPools } from '../kernel/task-heat.mjs';
@@ -103,10 +104,12 @@ export function taskPickerHint(paths, task) {
   const evidence = readRecentRecords(paths, task.id).flatMap(r => r.meta?.tools ?? []);
   const last = evidence.at(-1);
   if (last) {
-    const tool = /^[\w.-]{1,60}$/u.test(last.name) ? last.name : '工具';
-    return `上次工具记录：${tool} ${last.ok === false ? '失败' : '已运行'}`;
+    const tool = /^[\w.-]{1,60}$/u.test(last.name) ? last.name : pick('工具', 'tool');
+    return pick(`上次工具记录：${tool} ${last.ok === false ? '失败' : '已运行'}`,
+      `Last tool: ${tool} ${last.ok === false ? 'failed' : 'ran'}`);
   }
-  return task.has_compact ? '有已保存的任务摘要' : task.turn_count ? '有已保存的任务记录' : '尚无归档记录';
+  if (task.has_compact) return pick('有已保存的任务摘要', 'Saved task summary available');
+  return task.turn_count ? pick('有已保存的任务记录', 'Saved task history available') : pick('尚无归档记录', 'No archived records yet');
 }
 
 const failure = (error_code, llm_called = false) => ({

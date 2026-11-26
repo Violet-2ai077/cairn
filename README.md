@@ -1,6 +1,47 @@
 # Cairn
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 **Git for Agent Work States** — lightweight multi-task continuity, out-of-band asynchronous state staging, deterministic Host ledger folding (with falsification tombstones), and anti-regression handoff for AI coding agents.
+
+## Install and verify from source
+
+**Do not run `npm install cairn`, `npm install cairn@0.1.0`, or `npx cairn`.**
+The public npm package with that name is an unrelated React Native library.
+Use Git and Node.js 22+; this checkout needs no dependency installation or build:
+
+```sh
+git clone https://github.com/Violet-2ai077/cairn.git
+cd cairn
+git remote get-url origin
+node ./bin/cairn.mjs status --json
+npm test
+```
+
+The remote should be the repository above. On a new installation, an
+uninitialized store is expected: `status` is read-only. In the examples below,
+use `node /absolute/path/to/cairn/bin/cairn.mjs` wherever you see `cairn`.
+The CLI alone does **not** activate the dsh plugin. For the verified host
+(`dsh 0.2.2-rc.5` on Node 24.16), copy the [example patch](docs/cairn.patch.example.yml),
+replace its placeholder file URL with the absolute URL of this checkout's
+`src/hosts/dsh/index.mjs`, then start `dsh --profile web --patch <your-patch.yml>`.
+Use `/cairn status` in dsh to verify activation.
+
+For a pinned installation, check out `v0.4.3` after cloning, or download
+`cairn-0.4.3.tgz` and its SHA-256 checksum from the
+[GitHub release](https://github.com/Violet-2ai077/cairn/releases/tag/v0.4.3).
+Install the verified **local file** with `npm install --offline ./cairn-0.4.3.tgz`.
+This does not require resolving the package name from the npm registry.
+
+### Language
+
+Cairn selects the language for its model contracts, task picker and memory
+review at process startup. A Chinese environment uses Chinese; English and
+unrecognized locales use English. To override, set `CAIRN_LOCALE=en` or
+`CAIRN_LOCALE=zh` before starting dsh (PowerShell: `$env:CAIRN_LOCALE='en'`).
+Use `auto` or unset the variable to follow `LC_ALL`, `LC_MESSAGES`, `LANG`
+or the operating system locale, in that order. Stored user content, ledger
+keys, task markers, command names and JSON fields are not translated.
 
 ---
 
@@ -21,30 +62,17 @@ See the verbatim synthesis report in [`docs/reference/acmi-path1-synthesis.md`](
 
 ## Repository Structure
 
-```text
-cairn/
-├── AGENTS.md                         # Engineering constitution & boundaries for coding agents
-├── README.md                         # Project overview & quick start
-├── package.json                      # Zero-dependency single-package Node ESM config
-├── docs/
-│   ├── architecture.md               # .cairn/ disk model & kernel/workers/hosts 3-layer design
-│   ├── dsh-host-interface.md         # Verified DeepSeek Harness (dsh) Cordis hooks & extension spec
-│   └── reference/
-│       └── acmi-path1-synthesis.md   # Verbatim ACMI Path 1 synthesis report (484 ablation calls)
-├── src/
-│   ├── kernel/                       # Pure deterministic, zero-LLM, host-agnostic core primitives
-│   │   ├── ledger.mjs                #   foldLedger (D1../Q1.. handles, tombstones, actor_id, base_revision)
-│   │   ├── marker.mjs                #   parseTaskMarker (closed-fence fix), stripTaskMarker, buildLightTaskCatalog
-│   │   ├── contracts.mjs             #   4 parameterized prompt contract builders
-│   │   └── index.mjs                 #   Unified kernel exports
-│   ├── workers/                      # Routing, staged extraction, compaction and checkout
-│   │   └── index.mjs
-│   └── hosts/
-│       └── dsh/                      # Reference Host #1 (dsh 0.2.2-rc.5): Hub and workspace adapters
-│           └── index.mjs
-└── test/
-    └── *.node-test.mjs               # Kernel, stores, workers, CLI, and dsh integration
-```
+This is an entry-point map, not an exhaustive file list.
+
+| Start here | Responsibility |
+| --- | --- |
+| `bin/cairn.mjs`, `src/commands/run-cairn.mjs` | Executable and shared command dispatch. |
+| `src/kernel/ledger.mjs`, `marker.mjs`, `contracts.mjs` | Deterministic fold, marker parsing and prompt contracts; no LLM or network. |
+| `src/kernel/hub-store.mjs`, `hub-write-lock.mjs` | Default Hub: scoped ledgers, persistence and snapshot consistency. `src/kernel/store.mjs` is the workspace-local compatibility store. |
+| `src/workers/hub-handoff.mjs`, `hub-cold-router.mjs`, `hub-staging-extractor.mjs` | Handoff assembly, routing and scoped staging. |
+| `src/hosts/dsh/index.mjs`, `hub-host.mjs`, `hub-turn-runtime.mjs` | Adapter selection, default Hub integration, and turn attribution. Explicit `workspaceRoot` selects the compatibility adapter. |
+| `test/git-project.node-test.mjs`, `test/kernel.node-test.mjs`, `test/hub-*.node-test.mjs` | Git discovery, kernel contracts and Hub integration/recovery. `npm test` discovers the full suite. |
+| `scripts/smoke-dsh.mjs`, `docs/dsh-host-interface.md` | Installed-host verification and setup; the smoke provider is offline. |
 
 ---
 

@@ -231,11 +231,12 @@ export function createTurnAccumulator({
         }
       }
 
-      const eventText = extractTextFromDshMessage(msg).trim();
+      const sourceText = extractTextFromDshMessage(msg);
+      const eventText = sourceText.trim();
       const stashed = consumeStashedMarker(sessionId);
 
       let rawText = eventText;
-      let parsed = parseTaskMarker(eventText);
+      let parsed = parseTaskMarker(sourceText);
 
       if (stashed?.turn === turnNum && stashed.parsed?.valid && stashed.parsed.display_text === eventText &&
           !event.data?.interrupted) {

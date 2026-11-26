@@ -8,9 +8,10 @@ import {
   readTaskCompaction
 } from '../kernel/index.mjs';
 import { distillTaskThread } from './distill.mjs';
+import { pick } from '../i18n/locale.mjs';
 
-const AUTHORITY_BOUNDARY =
-  '局部历史服从工作区全局 Ledger / Tombstone 权威覆盖；任务记录不得覆盖或推翻全局权威状态。';
+const AUTHORITY_BOUNDARY = pick('局部历史服从工作区全局 Ledger / Tombstone 权威覆盖；任务记录不得覆盖或推翻全局权威状态。',
+  'The workspace ledger and its tombstones override local history. Task records cannot override or overturn authoritative global state.');
 
 export function compileTaskCheckout({
   workspaceRoot = process.cwd(),
@@ -53,10 +54,10 @@ export function compileTaskCheckout({
   const parts = [`# Task Checkout ${id}`, AUTHORITY_BOUNDARY];
 
   if (compactMarkdown) {
-    parts.push(`## 已压缩的任务局部摘要\n${compactMarkdown}`);
+    parts.push(pick('## 已压缩的任务局部摘要', '## Compressed task-local summary') + '\n' + compactMarkdown);
   }
   if (tailText) {
-    parts.push(`## 未压缩的近期任务记录\n${tailText}`);
+    parts.push(pick('## 未压缩的近期任务记录', '## Uncompressed recent task records') + '\n' + tailText);
   }
 
   let status = 'empty';

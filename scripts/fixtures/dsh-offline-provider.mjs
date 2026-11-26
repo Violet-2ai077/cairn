@@ -86,6 +86,17 @@ export function apply(ctx) {
       let text;
       const system = body(req.messages[0]);
       const snapshot = body(req.messages.findLast(m => m.source?.kind === 'runtime-context'));
+      if (phase.startsWith('locale-')) {
+        const context = snapshot.slice(snapshot.lastIndexOf('### Cairn current scope'));
+        const messages = req.messages.map(body).join('\n');
+        if (!req.purpose && context.includes('Required tail marker')) log({ sessionId: req.sessionId,
+          localeScope: { hasHan: /\p{Script=Han}/u.test(context), authority: context.includes('Project Ledger'),
+            markerEn: messages.includes("Answer the user's current request directly."),
+            markerZh: messages.includes('正常、直接地回答用户当前请求') } });
+        if (req.purpose === 'cairn-worker' && system.includes('SUPERSEDE')) {
+          log({ stagingHan: /\p{Script=Han}/u.test(system) });
+        }
+      }
       if (req.purpose === 'compaction') {
         const directive = body(req.messages.at(-1));
         log({ nativeBoundary: directive.includes('Do not merge task progress') && directive.includes('test_runner') });
@@ -106,7 +117,7 @@ export function apply(ctx) {
       else if (phase.startsWith('marker-')) {
         const id = phase === 'marker-compat-continue' ? 2 : 1;
         const answer = '  ' + 'Long result '.repeat(9).trimEnd() + '.';
-        for (const [index, parts] of [['First paragraph.'], [answer, ' '.repeat(90) + '\n<|ta', 'sk:' + id + '|>' + ' '.repeat(70)]].entries()) {
+        for (const [index, parts] of [['Wrap code in ``` fences.'], [answer, ' '.repeat(90) + '\n<|ta', 'sk:' + id + '|>' + ' '.repeat(70)]].entries()) {
           yield { type: 'block-start', index, blockType: 'text' };
           for (const text of parts) yield { type: 'text-delta', index, text };
           yield { type: 'block-end', index, block: { type: 'text', text: parts.join('') } };
@@ -141,7 +152,8 @@ export function apply(ctx) {
           yield { type: 'finish', reason: { kind: 'tool-calls' } };
           return;
         }
-        text = phase === 'compact' ? 'Confirmed with no marker' : (phase === 'b' ? reason : 'Done') + '\n<|task:' + task + '|>';
+        text = phase === 'compact' ? 'Confirmed with no marker' :
+          (phase === 'b' ? reason : phase === 'boundary-unclosed' ? '~~~js\nunfinished' : 'Done') + '\n<|task:' + task + '|>';
       }
       yield { type: 'block-start', index: 0, blockType: 'text' };
       yield { type: 'text-delta', index: 0, text };

@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { buildStrictCompactorPrompt, readHubTasksIndex, readScopedHead, projectReadOnlyLedger, writeHubTaskCompaction } from '../kernel/index.mjs';
+import { readHubTasksIndex, readScopedHead, projectReadOnlyLedger, writeHubTaskCompaction } from '../kernel/index.mjs';
+import { buildStrictCompactorPrompt } from '../i18n/contracts.mjs';
 import { readConsistentHub } from '../kernel/hub-write-lock.mjs';
 import { readCheckoutHistory } from './hub-task-checkout.mjs';
 import { summarizeBatches } from './compaction-batches.mjs';

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { pick } from '../i18n/locale.mjs';
 import {
   readHubTaskCompaction,
   readHubTaskThread,
@@ -7,7 +8,8 @@ import {
 import { distillTaskThread } from './distill.mjs';
 import { readConsistentHub } from '../kernel/hub-write-lock.mjs';
 
-const AUTHORITY_BOUNDARY = 'User Ledger 与适用的 Project Ledger（含 Tombstone）均高于并覆盖 Task 局部历史；项目决策优先于通用 User 默认偏好。';
+const AUTHORITY_BOUNDARY = pick('User Ledger 与适用的 Project Ledger（含 Tombstone）均高于并覆盖 Task 局部历史；项目决策优先于通用 User 默认偏好。',
+  'The User Ledger and applicable Project Ledger, including tombstones, override task-local history. Project decisions take precedence over general User defaults.');
 
 export function readCheckoutHistory(hubRoot, task) {
   const raw = readHubTaskCompaction(hubRoot, task.id);

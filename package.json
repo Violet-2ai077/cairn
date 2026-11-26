@@ -1,6 +1,12 @@
 {
   "name": "cairn",
-  "version": "0.1.0",
+  "version": "0.4.3",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Violet-2ai077/cairn.git"
+  },
+  "files": ["bin/", "src/", "docs/", "scripts/", "test/", "AGENTS.md", "CHANGELOG.md", "README.zh-CN.md"],
   "description": "Git for Agent Work States — lightweight task continuity, asynchronous state staging, deterministic Host ledger folding, and anti-regression handoff",
   "license": "MIT",
   "type": "module",

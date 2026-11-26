@@ -12,6 +12,13 @@ This document records **only verified factual capabilities** of the DeepSeek Har
 
 ## 1. Plugin Loading Format & Runtime Baseline
 
+The marker, extraction, compaction and authority contracts, and the task and
+memory dialogs, support English and Chinese. Set `CAIRN_LOCALE=en|zh` before
+starting dsh to override automatic locale selection; see [language](../README.md#language).
+This setting does not translate stored user text or grant a memory proposal.
+Run the installed-host smoke with `--locale-only` to check both languages
+at the provider and UI boundaries. This does not establish equal live-model accuracy.
+
 ### M4.1 centralized Hub operation
 
 When `workspaceRoot` is omitted, `apply()` selects the centralized Hub adapter; explicit `workspaceRoot` retains the legacy workspace-local adapter for compatibility. `storeRoot` overrides `$DSH_HOME/cairn`, which overrides `~/.cairn`. The Hub adapter resolves `.git` roots from `session.header.cwd` as soft hints only and never writes into the business repository. `resolveGitProjectHint()` is read-only; registration occurs on a task/ledger write.

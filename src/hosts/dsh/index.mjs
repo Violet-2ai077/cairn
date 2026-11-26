@@ -8,6 +8,8 @@
 // - ctx.tools.register & optional ctx.commands.register('/cairn'): human-authority-gated state management
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { pick } from '../../i18n/locale.mjs';
+import { buildAntiRecencyContract, buildAuthorityCheckoutContract, buildStrictCompactorPrompt } from '../../i18n/contracts.mjs';
 import { appendCompactionDirective } from './compaction-directive.mjs';
 import {
   isCairnInitialized,
@@ -15,10 +17,7 @@ import {
   readHead,
   projectReadOnlyLedger,
   readStaged,
-  readTasksIndex,
-  buildAntiRecencyContract,
-  buildAuthorityCheckoutContract,
-  buildStrictCompactorPrompt
+  readTasksIndex
 } from '../../kernel/index.mjs';
 import {
   createOpenAICompatibleClient,
@@ -27,7 +26,7 @@ import {
   runColdRouter,
   createTaskCompactionCoordinator
 } from '../../workers/index.mjs';
-import { runCairnCli } from '../../../bin/cairn.mjs';
+import { runCairnCli } from '../../commands/run-cairn.mjs';
 import { createTurnAccumulator } from './turn-accumulator.mjs';
 import { createHubDshHost } from './hub-host.mjs';
 import { hideHubStreamMarker } from './hub-turn-runtime.mjs';
@@ -555,7 +554,8 @@ export async function createCairnDshHost(ctx, rawConfig = {}) {
       if (!result.ok) { routeStates.set(sessionId, { terminal: true, result: 'error', error_code: result.error_code ?? 'router_error', elapsed_ms: elapsedMs }); return decision; }
       if (result.decision === 'ambiguous') {
         routeStates.set(sessionId, { result: 'ambiguous', opening: state?.opening ?? userText, retried: Boolean(state), lastTurn: payload.turn, elapsed_ms: elapsedMs });
-        routeStates.get(sessionId).clarification = 'Cairn 找到多个可能的既有任务。请用户说明当前请求对应哪个任务；在澄清前不注入任何任务历史。';
+        routeStates.get(sessionId).clarification = pick('Cairn 找到多个可能的既有任务。请用户说明当前请求对应哪个任务；在澄清前不注入任何任务历史。',
+          'Cairn found multiple possible existing tasks. Ask the user which task this request belongs to. Do not inject task history until the user clarifies.');
         return decision;
       }
       routeStates.set(sessionId, { terminal: true, result: result.decision, taskId: result.decision === 'match' ? result.task_id : null, elapsed_ms: elapsedMs });

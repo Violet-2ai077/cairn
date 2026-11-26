@@ -1,3 +1,4 @@
+import '../scripts/fixtures/zh-test-locale.mjs';
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -524,7 +525,7 @@ describe('Cairn Milestone 1 Slice 3: DeepSeek Harness (dsh) Host Adapter (src/ho
         signal: new AbortController().signal
       });
       assert.equal(cmdRes.kind, 'success');
-      assert.ok(cmdRes.text.includes('HEAD is now at revision 1'));
+      assert.ok(cmdRes.text.includes('当前 HEAD 版本为 1'));
       assert.equal(readHead(tmpDir).active[0].id, 'D1');
       assert.equal(readHead(tmpDir).active[0].option_code, 'redis_ttl');
 

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { buildScopedAuthorityContract, projectReadOnlyLedger } from '../kernel/index.mjs';
+import { projectReadOnlyLedger } from '../kernel/index.mjs';
+import { buildScopedAuthorityContract } from '../i18n/contracts.mjs';
 import { readHubTasksIndex, readProjectsIndex, readScopedHead, readTaskObservations } from '../kernel/hub-store.mjs';
 import { compileHubTaskCheckout } from './hub-task-checkout.mjs';
 import { readFileWrites } from '../kernel/file-writes.mjs';

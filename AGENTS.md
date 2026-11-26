@@ -12,32 +12,17 @@ Our goal is to deliver a **fast, lightweight, local-first (`.cairn/`) task-conti
 
 ## 2. Directory & Layer Boundaries
 
-```text
-cairn/
-├── bin/
-│   └── cairn.mjs        # Minimal zero-dependency CLI (init / status / log / commit / drop / tasks)
-├── src/
-│   ├── kernel/          # Layer 1: Deterministic core (ZERO LLM calls, ZERO network, ZERO host imports)
-│   │   ├── ledger.mjs   #   createEmptyLedger, foldLedger (D1../Q1.., actor_id, base_revision), projectReadOnlyLedger
-│   │   ├── marker.mjs   #   parseTaskMarker (closed-fence aware), stripTaskMarker, buildLightTaskCatalog
-│   │   ├── contracts.mjs#   buildAntiRecencyContract, buildStagingExtractorPrompt, buildStrictCompactorPrompt, buildAuthorityCheckoutContract
-│   │   ├── store.mjs    #   .cairn/ persistence, replayLedger verification, batch optimistic concurrency
-│   │   └── index.mjs    #   Kernel barrel export
-│   ├── workers/         # Layer 2: Out-of-band async LLM workers (llm-client, distill, staging-extractor, strict-compactor, cold-router)
-│   └── hosts/
-│       └── dsh/         # Layer 3: Thin runtime host adapter for DeepSeek Harness (dsh 0.2.2-rc.5 / Cordis 4.1.0)
-├── docs/
-│   ├── architecture.md               # .cairn/ disk model & 3-layer design
-│   ├── dsh-host-interface.md         # Factual dsh Cordis hooks & verified integration surface
-│   ├── cairn.patch.example.yml       # Example Cordis --patch config for dsh
-│   └── reference/
-│       └── acmi-path1-synthesis.md   # Read-only empirical proof of the 5 primitives
-└── test/
-    ├── kernel.node-test.mjs          # Millisecond kernel unit tests via `node --test`
-    ├── store-cli.node-test.mjs       # .cairn/ persistence & CLI integration tests via `node --test`
-    ├── workers.node-test.mjs         # Out-of-band workers & trajectory distiller unit tests
-    └── dsh-host.node-test.mjs        # Offline end-to-end dsh Cordis host adapter tests
-```
+This is an entry-point map, not an exhaustive file list.
+
+| Start here | Responsibility |
+| --- | --- |
+| `bin/cairn.mjs`, `src/commands/run-cairn.mjs` | Executable and shared command dispatch. |
+| `src/kernel/ledger.mjs`, `marker.mjs`, `contracts.mjs` | Deterministic fold, marker parsing and prompt contracts; no LLM or network. |
+| `src/kernel/hub-store.mjs`, `hub-write-lock.mjs` | Default Hub: scoped ledgers, persistence and snapshot consistency. `src/kernel/store.mjs` is the workspace-local compatibility store. |
+| `src/workers/hub-handoff.mjs`, `hub-cold-router.mjs`, `hub-staging-extractor.mjs` | Handoff assembly, routing and scoped staging. |
+| `src/hosts/dsh/index.mjs`, `hub-host.mjs`, `hub-turn-runtime.mjs` | Adapter selection, default Hub integration, and turn attribution. Explicit `workspaceRoot` selects the compatibility adapter. |
+| `test/git-project.node-test.mjs`, `test/kernel.node-test.mjs`, `test/hub-*.node-test.mjs` | Git discovery, kernel contracts and Hub integration/recovery. `npm test` discovers the full suite. |
+| `scripts/smoke-dsh.mjs`, `docs/dsh-host-interface.md` | Installed-host verification and setup; the smoke provider is offline. |
 
 ---
 

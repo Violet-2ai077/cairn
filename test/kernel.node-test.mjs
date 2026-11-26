@@ -278,6 +278,23 @@ describe('Cairn Kernel 2: Closed-Fence-Aware Inline Task Marker Parser (src/kern
     assert.equal(pGlued.error, 'marker_not_on_own_line_after_closed_fence');
   });
 
+  test('distinguishes inline mentions from line fences by delimiter, length and indentation', () => {
+    const check = (lines, valid, closed = false) => {
+      const parsed = parseTaskMarker([...lines, '<|task:1|>'].join('\r\n'));
+      assert.equal(parsed.valid, valid, lines.join('\n'));
+      assert.equal(parsed.closed_fence_before_marker, closed);
+    };
+    check(['Wrap code in ``` fences.'], true);
+    check(['    ```'], true);
+    check(['```code`not-info'], true);
+    check(['  ~~~js', 'x', '   ~~~~  '], true, true);
+    check(['~~~js', '```'], false);
+    check(['````md', '```', 'literal inner delimiter'], false);
+    check(['````md', '```', '````', 'more text'], true);
+    check(['~~~', '~~~ not a closer'], false);
+    assert.equal(parseTaskMarker('~~~\nx\n~~~ <|task:1|>').error, 'marker_not_on_own_line_after_closed_fence');
+  });
+
   test('rejects duplicate, leading-zero, out-of-range, or empty-body markers and formats light task catalog', () => {
     assert.equal(parseTaskMarker('<|task:1|>').valid, false);
     assert.equal(parseTaskMarker('text <|task:0|>').valid, false);

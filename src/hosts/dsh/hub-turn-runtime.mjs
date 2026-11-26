@@ -1,13 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { claimSessionMarkerBank } from '../../kernel/hub-store.mjs';
 import { markerAlias, markerBank } from '../../kernel/hub-task-ids.mjs';
-import { buildAntiRecencyContract, buildHubTaskCatalog, parseTaskMarker } from '../../kernel/index.mjs';
+import { pick } from '../../i18n/locale.mjs';
+import { buildAntiRecencyContract } from '../../i18n/contracts.mjs';
+import { buildHubTaskCatalog, parseTaskMarker } from '../../kernel/index.mjs';
 import { checkpointToolResult, finishHubScopedTurn, readHubTasksIndex, readProjectsIndex, readSessionBinding, readSessionChoice, recordTurnReceipt, replaceSessionChoice, turnSourceDigest } from '../../kernel/hub-store.mjs';
 import { textOf, collectToolEvidence, persistToolFact, resumeUserText } from './turn-journal.mjs';
 import { selectHubTaskPools } from '../../kernel/task-heat.mjs';
 import { mentionsCompetingTopic, runHubColdRouter } from '../../workers/hub-cold-router.mjs';
 import { compileHubTaskCheckout } from '../../workers/hub-task-checkout.mjs';
-import { readConsistentHub } from '../../kernel/hub-write-lock.mjs';
+import { readImmediateHubSnapshot } from '../../kernel/hub-write-lock.mjs';
 import { readHandoffInputs, renderHandoffAuthority, renderHandoffObservations, renderFileWrites } from '../../workers/hub-handoff.mjs';
 import { resolveGitProjectHint } from './git-project.mjs';
 import { genericResume, pickTask, resumeIntent } from './task-picker.mjs';
@@ -16,7 +18,8 @@ import { hasSingleTaskHistory, freshSessionReply } from './single-task-session.m
 const SWITCH = /^(?:(?:please\s+)?(?:switch\s+(?:to|topics?)|change\s+(?:topics?|tasks?)|(?:start\s+(?:a\s+)?)?new\s+(?:topic|task))\b|(?:请\s*)?(?:切换|切到|换个话题|另开|新任务|新话题))/iu;
 const EXACT = /(?:\btask\s*#?\s*|任务\s*#?\s*|<\|task:)([1-9]\d*)(?!\d)/giu;
 const EXACT_START = /^(?:(?:please\s+)?(?:continue|resume|revisit|switch to|open|work on)\s+|(?:请\s*)?(?:继续|恢复|切到|切换到|回到|打开)\s*)?(?:task\s*#?\s*|任务\s*#?\s*|<\|task:)[1-9]\d*(?!\d)/iu;
-const clarification = 'Cairn 未确认本轮作用域，请澄清目标。旧作用域不适用于本轮；输出 <|task:UNRESOLVED|>，不要新建或续写任务。';
+const clarification = pick('Cairn 未确认本轮作用域，请澄清目标。旧作用域不适用于本轮；输出 <|task:UNRESOLVED|>，不要新建或续写任务。',
+  'Cairn has not confirmed the scope of this turn. Ask for clarification. The previous scope does not apply; output <|task:UNRESOLVED|> and do not create or continue a task.');
 const RETURN_TO = /^(?:(?:please\s+)?(?:(?:(?:let['’]s|can we)\s+)?(?:go\s+|come\s+|get\s+)?back to\b|(?:return to|revisit|resume|pick up)\s+\S)|(?:请|我们)?(?:再)?(?:回到|接着(?:昨天|之前|上次)|继续(?:昨天|之前|上次)))/iu;
 
 const scopeKey = (sessionId, turn) => createHash('sha256').update(JSON.stringify([sessionId, turn])).digest('hex');
@@ -63,7 +66,7 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
     return entry;
   }
   function makeSnapshot(sessionId, state, target, ticket) {
-    return readConsistentHub(hubRoot, () => {
+    return readImmediateHubSnapshot(hubRoot, () => {
       const currentEpoch = readSessionBinding(hubRoot, sessionId, { includeCleared: true })?.binding_epoch ?? null;
       if (currentEpoch !== state.bindingEpoch) throw new Error('epoch_conflict');
       const index = readHubTasksIndex(hubRoot);
@@ -121,13 +124,15 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       turnKey: entry.turnKey, projectId: null, taskId: null, bindingEpoch: expectedEpoch, expectedEpoch,
       modelSelection, snapshot: Object.freeze({ text: clarification }), newTaskTicket: null, route: Object.freeze(route), ...fields
     });
-    const deny = (reason, display = '未能确认本轮任务。请指定任务名称或任务号；没有执行操作。') =>
+    const deny = (reason, display = pick('未能确认本轮任务。请指定任务名称或任务号；没有执行操作。',
+      'Could not confirm the task for this turn. Specify a task name or ID; no action was taken.')) =>
       scoped({ result: 'clarify', reason }, { display });
     const memory = await handleMemoryInput?.(sessionId, entry.input, entry.turn, () => turns.get(sessionId) === entry && !payload.signal?.aborted);
     if (memory) return deny('memory_command', memory);
     const started = Date.now();
     const index = readHubTasksIndex(hubRoot);
-    if (index.task_id_capacity && /<\|task:/u.test(entry.input)) return deny('use_durable_task_id', '请使用持久任务号（例如“继续任务 #1000”），不要用会话 marker 选择任务。');
+    if (index.task_id_capacity && /<\|task:/u.test(entry.input)) return deny('use_durable_task_id', pick('请使用持久任务号（例如“继续任务 #1000”），不要用会话 marker 选择任务。',
+      'Use a durable task ID (for example, "continue task #1000"), not a session marker, to select a task.'));
     const tasks = index.tasks;
     const { hot, dormant } = selectHubTaskPools(tasks, { policy: taskHeat });
     const projects = new Map(readProjectsIndex(hubRoot).projects.map(item => [item.project_id, item.name]));
@@ -234,8 +239,10 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
         const busy = code === 'hub_snapshot_busy';
         return Object.freeze({ turnKey: entry.turnKey, snapshot: Object.freeze({ text: clarification }),
           route: Object.freeze({ result: 'clarify', reason: invalid ? 'state_integrity' : busy ? code : 'scope_unavailable' }),
-          ...(invalid || busy ? { display: invalid ? 'Cairn 状态校验失败，本轮未交给模型。请运行 cairn doctor 检查。' :
-            'Cairn 暂时无法获取一致快照，本轮未交给模型。请在写入结束后重试。' } : {}) });
+          ...(invalid || busy ? { display: invalid ? pick('Cairn 状态校验失败，本轮未交给模型。请运行 cairn doctor 检查。',
+            'Cairn state validation failed. This turn was not sent to the model. Run cairn doctor to inspect the state.') :
+            pick('Cairn 暂时无法获取一致快照，本轮未交给模型。请在写入结束后重试。',
+              'Cairn could not obtain a consistent snapshot. This turn was not sent to the model. Retry after the write completes.') } : {}) });
       });
     }
     if (entry.pending && !entry.scope) {
@@ -243,6 +250,9 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       if (turns.get(sessionId) === entry && !payload.signal?.aborted) {
         entry.scope = scope;
         stateFor(sessionId).route = scope.route;
+        // No model work can start for this scope. Don't turn a failed read
+        // into a blocking write against the same fence; turn/end records it.
+        if (scope.route.reason === 'hub_snapshot_busy') return;
         recordTurnReceipt(hubRoot, sessionId, turn, { status: 'in_progress', reason: 'awaiting_turn_end', first_seq: entry.firstSeq ?? null,
           ...(scope.markerBank !== undefined && { marker_bank: scope.markerBank }) });
       }
@@ -251,14 +261,16 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
   function blockedReply(id) {
     const entry = turns.get(id);
     const scope = entry?.scope;
-    if (!scope && id && readSessionChoice(hubRoot, id)) return '仍在等待用户选择任务；没有执行操作。';
-    if (scope?.route.result === 'clarify') return scope.display ?? '请指定要继续的任务；没有执行操作。';
+    if (!scope && id && readSessionChoice(hubRoot, id)) return pick('仍在等待用户选择任务；没有执行操作。',
+      'Still waiting for the user to choose a task; no action was taken.');
+    if (scope?.route.result === 'clarify') return scope.display ?? pick('请指定要继续的任务；没有执行操作。',
+      'Specify the task to continue; no action was taken.');
     if (scope?.bindingSource !== 'human_choice') return null;
     const binding = readSessionBinding(hubRoot, id, { includeCleared: true });
     if ((binding?.binding_epoch ?? null) !== scope.expectedEpoch ||
         !readHubTasksIndex(hubRoot).tasks.some(t => t.id === scope.taskId && t.project_id === scope.projectId && t.status === 'active')) {
       entry.invalidatedChoice = true;
-      return '刚选择的任务或会话绑定已改变；请重新选择。';
+      return pick('刚选择的任务或会话绑定已改变；请重新选择。', 'The selected task or session binding has changed. Choose again.');
     }
     return null;
   }
@@ -294,9 +306,11 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       if (Array.isArray(msg.content) && msg.content.some(block => block?.type === 'tool-call')) {
         entry.terminal = null;
       } else {
-        const text = textOf(msg).trim();
+        const text = textOf(msg);
         const hidden = entry.streamMarkers.get(entry.step);
-        entry.terminal = { step: entry.step, seq: event.seq, marker: hidden?.display_text === text ? hidden : parseTaskMarker(text) };
+        const marker = hidden?.display_text === text.trim() ? hidden : parseTaskMarker(text);
+        if (!marker.valid) marker.display_text = marker.display_text.trim();
+        entry.terminal = { step: entry.step, seq: event.seq, marker };
       }
     }
     if (event.type !== 'turn/end') return;
@@ -347,9 +361,11 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
       task.id === scope.taskId && task.project_id === scope.projectId && task.status === 'active')) return clarification;
     const text = scope?.snapshot.text ?? sessions.get(id)?.presentedSnapshot?.text ?? '';
     if (!scope?.humanChoice) return text;
-    const guidance = '\n任务选择只确认归属，不扩大原请求的授权。请接着原请求做；若只有“继续”，先核实历史状态，仅推进此前已经明确的目标。';
+    const guidance = pick('\n任务选择只确认归属，不扩大原请求的授权。请接着原请求做；若只有“继续”，先核实历史状态，仅推进此前已经明确的目标。',
+      '\nTask selection confirms which task the original request belongs to; it does not expand authorization. Proceed with that request. If it only says "continue", first verify the history and pursue only the previously established objective.');
     if (!scope.resumed) return text + guidance;
-    return text + guidance + '\n\n<cairn_resume_request>\n以下是用户先前提出、现在已确认归属的原请求：\n' +
+    return text + guidance + '\n\n<cairn_resume_request>\n' + pick('以下是用户先前提出、现在已确认归属的原请求：',
+      'The user previously made the following request. Its target task is now confirmed:') + '\n' +
       JSON.stringify(scope.resumed.input).replaceAll('<', '\\u003c') + '\n</cairn_resume_request>';
   }
   function userText(entry) {
@@ -359,7 +375,8 @@ export function createHubTurnRuntime({ hubRoot, policy, taskHeat, clientFor, max
 }
 
 export const HUB_TURN_CONTRACT = buildAntiRecencyContract() +
-  '\n用户的本轮表达偏好可用于当前回答，不因此改写长期默认。先完成业务请求；长期偏好的提案、范围确认与生效回执由宿主另行处理，勿声称已保存或代用户确认。';
+  pick('\n用户的本轮表达偏好可用于当前回答，不因此改写长期默认。先完成业务请求；长期偏好的提案、范围确认与生效回执由宿主另行处理，勿声称已保存或代用户确认。',
+    '\nApply preferences expressed for this turn to the current answer without changing long-term defaults. Complete the requested work first. The host separately handles long-term proposals, scope confirmation, and receipts. Do not claim a preference has been saved or confirm it on behalf of the user.');
 
 export async function* hideHubStreamMarker(stream, entry, { strip = true, footer = '' } = {}) {
   const step = entry.step;
